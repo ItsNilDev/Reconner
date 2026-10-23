@@ -2,7 +2,7 @@ import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding,
   Parameter, DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding,
   NucleiFinding, VulnFinding, MonitoringChange, Task, TaskLog, TaskPhase, DashboardStats, AttackPath,
-  NetworkService, IngramCamera, Asset,
+  NetworkService, IngramCamera, Asset, FileBodyResponse,
   BountyProgram, BountySyncState, BountyScopeEvent,
 } from '../types'
 
@@ -302,6 +302,10 @@ export const findings = {
       method: 'POST', body: JSON.stringify({ triage, note }),
     }),
   monitoringChanges: (id: string) => req<MonitoringChange[]>(`/targets/${id}/monitoring-changes`),
+  // Stored capture of a monitored file's body at detection time — NOT a live
+  // fetch. Backs the Changes-tab diff drawer (css_change / js_change rows).
+  fileBody: (id: string, kind: 'css' | 'js', url: string, side: 'current' | 'old' = 'current') =>
+    req<FileBodyResponse>(`/targets/${id}/${kind}-files/body?url=${encodeURIComponent(url)}&side=${side}`),
   ingram: (id: string) => req<IngramCamera[]>(`/targets/${id}/ingram`),
   // Global findings across all of the caller's targets (top-level Findings page).
   all: (params?: Record<string, string>) => {

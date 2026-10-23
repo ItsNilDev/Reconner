@@ -185,7 +185,11 @@ func extractSecuritySnapshot(body, pageHost string) securitySnapshot {
 	}
 	for _, m := range reLinkHref.FindAllStringSubmatch(body, -1) {
 		if ext(m[1]) {
-			add("stylesheet", m[1])
+			// Cache-bust churn (`?ver=`, hashed filenames) flickers the href on
+			// every deploy. Key the diff by path so a version bump on the SAME
+			// resource stops emitting add/remove pairs; the CONTENT truth lives
+			// in css_change rows from css_files content tracking.
+			add("stylesheet", stripResourceQuery(m[1]))
 		}
 	}
 	for _, m := range reAHref.FindAllStringSubmatch(body, -1) {
@@ -226,6 +230,20 @@ func hostOf(rawURL string) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+}
+
+// stripResourceQuery drops the query string and fragment from an asset URL so
+// cache-bust churn (`/app.css?ver=8`) keys as the SAME resource across
+// security-snapshot diffs. The versioned URL is still captured and diffed by
+// content via css_files, so no real change is hidden.
+func stripResourceQuery(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" {
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 func (s securitySnapshot) toJSON() string {
@@ -287,8 +305,13 @@ func securityChangeSeverity(c securityChange) string {
 		switch c.attr.Kind {
 		case "script", "iframe", "form":
 			return "high"
-		case "stylesheet", "hidden":
+		case "hidden":
 			return "medium"
+		case "stylesheet":
+			// Path-keyed now (stripResourceQuery), so stylesheet rows are the
+			// rare genuinely-new/deleted-path case. Content-level truth lives
+			// in css_change rows.
+			return "info"
 		default:
 			return "low"
 		}
