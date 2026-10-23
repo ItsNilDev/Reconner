@@ -2074,7 +2074,14 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		`, finalStatus, finalError, finalProgress, taskID)
 	}
 
-	if taskType == monitorWatchType && finalStatus == "finished" {
+	// A monitor watch pass counts as an attempt for due scheduling when it
+	// finished OR when the operator cancelled it. A cancelled pass used to leave
+	// monitor_last_run stale, so the 1-minute due scheduler kept re-creating the
+	// very scan the operator just stopped: cancel -> <=30 min guard -> re-run ->
+	// cancel again, forever. Graceful-shutdown interruptions are NOT counted —
+	// they keep status 'interrupted' and their auto-resume restart window.
+	// Watchdog timeouts land in 'failed' and keep the short failure backoff.
+	if taskType == monitorWatchType && (finalStatus == "finished" || finalStatus == "cancelled") {
 		_, _ = s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID)
 	}
 	terminalTargetStatus := "idle"
