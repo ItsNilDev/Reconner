@@ -116,6 +116,23 @@ const (
 	ModuleNetworkBruteSMB    = "network_brute_smb"
 )
 
+// DefaultMonitorWatchModules is the built-in pipeline for the automatic
+// periodic monitor task (runDueMonitors). Declared here because
+// monitorWatchModules and its tests need the exact tokens; the order mirrors
+// the historical hardcoded list in runDueMonitors. The snapshot module is
+// hoisted ahead of refresh-capable modules (http_probe/js_analysis)
+// server-side — "monitor" must run before those refresh, or the diff-first
+// baseline would compare against already-refreshed state and real changes
+// would become false negatives.
+var DefaultMonitorWatchModules = []string{
+	ModuleSubdomainEnum,
+	ModuleMonitor,
+	ModuleHTTPProbe,
+	ModuleTakeover,
+	ModuleCORS,
+	ModuleBackupDiscovery,
+}
+
 var AllModules = []string{
 	ModuleSubdomainEnum,
 	ModuleHTTPProbe,
@@ -3003,6 +3020,78 @@ func (s *Scheduler) bountyCatalogScheduler() {
 	}
 }
 
+// monitorWatchModules resolves the pipeline for the automatic periodic monitor
+// task. A non-empty, validated cfg.MonitorModules (System → Scanning page)
+// replaces the built-in watch set; unknown names are logged and skipped so a
+// stale config can't poison future upgrades (or hide a typo silently). If
+// nothing valid remains — list empty after filtering, or empty/unset config —
+// the historical built-in set applies. The snapshot module ("monitor") is
+// ALWAYS hoisted to position 0 server-side: baseline-before-refresh is an
+// invariant of the diff-first watch pipeline, not a UI arrangement detail.
+func (s *Scheduler) monitorWatchModules() []string {
+	cfg := s.cfg
+	suggested := DefaultMonitorWatchModules
+	if cfg != nil && len(cfg.MonitorModules) > 0 {
+		suggested = cfg.MonitorModules
+	}
+	valid := map[string]bool{}
+	for _, m := range AllModules {
+		valid[m] = true
+	}
+	seen := map[string]bool{}
+	var picked []string
+	for _, m := range suggested {
+		if valid[m] && !seen[m] {
+			seen[m] = true
+			picked = append(picked, m)
+			continue
+		}
+		if cfg != nil && len(cfg.MonitorModules) > 0 {
+			s.logger.Warn("Ignoring unknown monitor module in configured watch set",
+				"module", m,
+				"hint", "valid names: scheduler AllModules (System → Scanning page uses fixed checkboxes)")
+		}
+	}
+	if len(picked) == 0 {
+		picked = DefaultMonitorWatchModules
+	}
+	// Baseline-before-refresh invariant: the snapshot module must run BEFORE
+	// the first refresh-capable module, but stays AFTER subdomain_enum so
+	// newly-appearing names land inside the diffed baseline.
+	refreshModule := map[string]bool{ModuleHTTPProbe: true, ModuleJSAnalysis: true}
+	monitorIdx := -1
+	for i, m := range picked {
+		if m == ModuleMonitor {
+			monitorIdx = i
+			break
+		}
+	}
+	if monitorIdx != -1 {
+		for i, m := range picked {
+			// A refresh-capable module sits AHEAD of the snapshot → invariant
+			// violated: hoist the snapshot to sit directly before it.
+			if refreshModule[m] && i < monitorIdx {
+				// Move the snapshot to sit directly before this refresh module.
+				without := append(picked[:monitorIdx:monitorIdx], picked[monitorIdx+1:]...)
+				ins := len(without)
+				for j, m := range without {
+					if refreshModule[m] {
+						ins = j
+						break
+					}
+				}
+				adjusted := make([]string, 0, len(without)+1)
+				adjusted = append(adjusted, without[:ins]...)
+				adjusted = append(adjusted, ModuleMonitor)
+				adjusted = append(adjusted, without[ins:]...)
+				picked = adjusted
+				break
+			}
+		}
+	}
+	return picked
+}
+
 func (s *Scheduler) runDueMonitors() {
 	rows, err := s.db.Query(`
 		SELECT id, domain FROM targets
@@ -3034,20 +3123,10 @@ func (s *Scheduler) runDueMonitors() {
 		// backup/config-file discovery, then the change detector. nuclei + heavy
 		// dir discovery stay OFF this cheap cycle — they run only via
 		// escalateIfChanged when this pass actually turns something up.
-		monitorModules := []string{
-			ModuleSubdomainEnum,
-			// Snapshot BEFORE refresh. Otherwise http_probe/js_analysis overwrite
-			// the old status/title/hash and real changes become false negatives.
-			ModuleMonitor,
-			ModuleHTTPProbe,
-			ModuleTakeover,
-			// CORS is cheap (a few header probes per endpoint) and its config
-			// flips on redeploys, so it's worth re-checking on every watch cycle.
-			ModuleCORS,
-			// Backup/config-file discovery every cycle — a freshly-leaked .env or
-			// db.sql.bak is exactly the kind of thing a periodic watch should catch.
-			ModuleBackupDiscovery,
-		}
+		// The operator-configurable watch pipeline: snapshot ("monitor") is
+		// always first (server-enforced), then refresh + checks in set order.
+		// Empty/invalid config ⇒ the built-in historical set.
+		monitorModules := s.monitorWatchModules()
 		if _, err := s.CreateTaskTyped(id, monitorModules, 3, monitorWatchType); err != nil {
 			s.logger.Error("Failed to create watch task", "target", domain, "error", err)
 			continue

@@ -335,6 +335,7 @@ export interface ScanConfig {
   subdomain_recursion_enabled: boolean
   nuclei_exclude_template_ids: string[]
   nuclei_extra_template_repos: string[]
+  monitor_modules: string[]
   default_dns_resolvers: string[]
   default_nuclei_repos: string[]
 }

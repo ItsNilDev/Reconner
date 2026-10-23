@@ -103,6 +103,7 @@ type scanConfigPayload struct {
 	SubdomainRecursionEnabled bool     `json:"subdomain_recursion_enabled"`
 	NucleiExcludeTemplateIDs  []string `json:"nuclei_exclude_template_ids"`
 	NucleiExtraTemplateRepos  []string `json:"nuclei_extra_template_repos"`
+	MonitorModules            []string `json:"monitor_modules"`
 	// DefaultDNSResolvers / DefaultNucleiRepos are read-only hints so the UI can
 	// show what the built-in defaults are when the operator has set nothing.
 	DefaultDNSResolvers []string `json:"default_dns_resolvers"`
@@ -121,6 +122,7 @@ func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 		SubdomainRecursionEnabled: h.cfg.SubdomainRecursionEnabled,
 		NucleiExcludeTemplateIDs:  h.cfg.NucleiExcludeTemplateIDs,
 		NucleiExtraTemplateRepos:  h.cfg.NucleiExtraTemplateRepos,
+		MonitorModules:            h.cfg.MonitorModules,
 		DefaultDNSResolvers:       config.DefaultDNSResolvers,
 		DefaultNucleiRepos:        scanner.DefaultNucleiExtraRepos(),
 	})
@@ -137,6 +139,7 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		SubdomainRecursionEnabled *bool     `json:"subdomain_recursion_enabled"`
 		NucleiExcludeTemplateIDs  *[]string `json:"nuclei_exclude_template_ids"`
 		NucleiExtraTemplateRepos  *[]string `json:"nuclei_extra_template_repos"`
+		MonitorModules            *[]string `json:"monitor_modules"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid body")
@@ -184,6 +187,12 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		h.cfg.NucleiExtraTemplateRepos = repos
+	}
+	if body.MonitorModules != nil {
+		// Trimmed/deduped here; NAME validation happens in the scheduler
+		// (monitorWatchModules validates against AllModules and logs unknown
+		// tokens), so the API/UI never needs to know the module catalog.
+		h.cfg.MonitorModules = clean(*body.MonitorModules)
 	}
 	if err := h.cfg.Save(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "saved in memory but could not persist to config.json: "+err.Error())

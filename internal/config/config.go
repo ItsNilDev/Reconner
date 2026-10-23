@@ -212,6 +212,20 @@ type Config struct {
 	// (written to config.json) or the RECON_DNS_RESOLVERS env var (comma-separated,
 	// env wins). Set it to a single internal resolver to force the old behavior.
 	DNSResolvers []string `json:"dns_resolvers"`
+	// MonitorModules overrides which pipeline modules the automatic periodic
+	// monitor watch task runs (the scheduled pass creating monitor_watch tasks
+	// in scheduler.runDueMonitors). Names are validated against the scheduler's
+	// AllModules catalog by the scheduler; unknown names are logged and skipped
+	// (never rejected) so neither the API layer nor the UI needs to know the
+	// catalog. If nothing valid remains, the built-in default watch set applies.
+	// The snapshot module ("monitor") is always hoisted ahead of refresh-capable
+	// modules (http_probe/js_analysis) server-side — snapshot-before-refresh is
+	// an invariant, not a form checkbox. Empty
+	// ⇒ the built-in watch set (subdomain_enum, monitor, http_probe, takeover,
+	// cors, backup_discovery). Set via the System → Scanning page (written to
+	// config.json; scheduler picks the list up on its next due check — no
+	// restart needed).
+	MonitorModules []string `json:"monitor_modules"`
 	// SubdomainRecursionDepth controls recursive subdomain enumeration: after the
 	// apex domain is enumerated, each newly-discovered RESOLVING subdomain is itself
 	// enumerated (passive sources + resolution) as a sub-apex, and so on, until this
