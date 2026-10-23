@@ -25,7 +25,7 @@ export default function System() {
   const [drafts, setDrafts] = useState<Record<string,string>>({})
   const [savingKeys, setSavingKeys] = useState(false)
   const [scanCfg, setScanCfg] = useState<ScanConfig | null>(null)
-  const [scanDraft, setScanDraft] = useState<{ resolvers: string; depth: number; excludeIDs: string; repos: string } | null>(null)
+  const [scanDraft, setScanDraft] = useState<{ resolvers: string; depth: number; enabled: boolean; excludeIDs: string; repos: string } | null>(null)
   const [savingScanCfg, setSavingScanCfg] = useState(false)
   const { addToast } = useUIStore()
   const isAdmin = useAuthStore(s => s.user?.role === 'admin')
@@ -46,6 +46,7 @@ export default function System() {
         setScanDraft({
           resolvers: (sc.dns_resolvers || []).join('\n'),
           depth: sc.subdomain_recursion_depth || 4,
+          enabled: sc.subdomain_recursion_enabled !== false,
           excludeIDs: (sc.nuclei_exclude_template_ids || []).join('\n'),
           repos: (sc.nuclei_extra_template_repos || []).join('\n'),
         })
@@ -96,6 +97,7 @@ export default function System() {
       const res = await system.updateScanConfig({
         dns_resolvers: splitLines(scanDraft.resolvers),
         subdomain_recursion_depth: scanDraft.depth,
+        subdomain_recursion_enabled: scanDraft.enabled,
         nuclei_exclude_template_ids: splitLines(scanDraft.excludeIDs),
         nuclei_extra_template_repos: splitLines(scanDraft.repos),
       })
@@ -103,6 +105,7 @@ export default function System() {
       setScanDraft({
         resolvers: (res.dns_resolvers || []).join('\n'),
         depth: res.subdomain_recursion_depth || 4,
+        enabled: res.subdomain_recursion_enabled !== false,
         excludeIDs: (res.nuclei_exclude_template_ids || []).join('\n'),
         repos: (res.nuclei_extra_template_repos || []).join('\n'),
       })
@@ -309,10 +312,17 @@ export default function System() {
                 </div>
                 <div>
                   <label className="text-xs font-medium">Recursive subdomain depth</label>
-                  <input type="number" min={1} max={10} value={scanDraft.depth}
-                    onChange={e => setScanDraft(d => d && ({ ...d, depth: parseInt(e.target.value, 10) || 1 }))}
-                    className="input font-mono text-xs mt-1 w-28" />
-                  <p className="text-[10px] text-text-muted mt-1">After the apex, each resolving subdomain is itself enumerated, down to this many levels (default 4). 1 ⇒ apex only.</p>
+                  <div className="flex items-center gap-3 mt-1">
+                    <input type="number" min={1} max={10} value={scanDraft.depth} disabled={!scanDraft.enabled}
+                      onChange={e => setScanDraft(d => d && ({ ...d, depth: parseInt(e.target.value, 10) || 1 }))}
+                      className="input font-mono text-xs w-28" />
+                    <label className="flex items-center gap-1.5 text-xs font-medium whitespace-nowrap">
+                      <input type="checkbox" className="accent-accent" checked={scanDraft.enabled}
+                        onChange={e => setScanDraft(d => d && ({ ...d, enabled: e.target.checked }))} />
+                      Enable recursive enumeration
+                    </label>
+                  </div>
+                  <p className="text-[10px] text-text-muted mt-1">After the apex, each resolving subdomain is itself enumerated, down to this many levels (default 4). Off or depth 1 ⇒ apex only.</p>
                 </div>
                 <div>
                   <label className="text-xs font-medium">Nuclei — exclude template IDs <span className="text-text-muted">(one per line)</span></label>

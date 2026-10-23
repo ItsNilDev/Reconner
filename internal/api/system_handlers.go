@@ -98,10 +98,11 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 // reflecting over the whole Config) means only these deliberately-safe tunables
 // are reachable from the API — never secrets, paths, or auth settings.
 type scanConfigPayload struct {
-	DNSResolvers             []string `json:"dns_resolvers"`
-	SubdomainRecursionDepth  int      `json:"subdomain_recursion_depth"`
-	NucleiExcludeTemplateIDs []string `json:"nuclei_exclude_template_ids"`
-	NucleiExtraTemplateRepos []string `json:"nuclei_extra_template_repos"`
+	DNSResolvers              []string `json:"dns_resolvers"`
+	SubdomainRecursionDepth   int      `json:"subdomain_recursion_depth"`
+	SubdomainRecursionEnabled bool     `json:"subdomain_recursion_enabled"`
+	NucleiExcludeTemplateIDs  []string `json:"nuclei_exclude_template_ids"`
+	NucleiExtraTemplateRepos  []string `json:"nuclei_extra_template_repos"`
 	// DefaultDNSResolvers / DefaultNucleiRepos are read-only hints so the UI can
 	// show what the built-in defaults are when the operator has set nothing.
 	DefaultDNSResolvers []string `json:"default_dns_resolvers"`
@@ -115,12 +116,13 @@ type scanConfigPayload struct {
 // and resolvers" surface.
 func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 	h.writeSuccess(w, scanConfigPayload{
-		DNSResolvers:             h.cfg.DNSResolvers,
-		SubdomainRecursionDepth:  h.cfg.SubdomainRecursionDepth,
-		NucleiExcludeTemplateIDs: h.cfg.NucleiExcludeTemplateIDs,
-		NucleiExtraTemplateRepos: h.cfg.NucleiExtraTemplateRepos,
-		DefaultDNSResolvers:      config.DefaultDNSResolvers,
-		DefaultNucleiRepos:       scanner.DefaultNucleiExtraRepos(),
+		DNSResolvers:              h.cfg.DNSResolvers,
+		SubdomainRecursionDepth:   h.cfg.SubdomainRecursionDepth,
+		SubdomainRecursionEnabled: h.cfg.SubdomainRecursionEnabled,
+		NucleiExcludeTemplateIDs:  h.cfg.NucleiExcludeTemplateIDs,
+		NucleiExtraTemplateRepos:  h.cfg.NucleiExtraTemplateRepos,
+		DefaultDNSResolvers:       config.DefaultDNSResolvers,
+		DefaultNucleiRepos:        scanner.DefaultNucleiExtraRepos(),
 	})
 }
 
@@ -130,10 +132,11 @@ func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 // which third-party template repos are cloned onto the box.
 func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		DNSResolvers             *[]string `json:"dns_resolvers"`
-		SubdomainRecursionDepth  *int      `json:"subdomain_recursion_depth"`
-		NucleiExcludeTemplateIDs *[]string `json:"nuclei_exclude_template_ids"`
-		NucleiExtraTemplateRepos *[]string `json:"nuclei_extra_template_repos"`
+		DNSResolvers              *[]string `json:"dns_resolvers"`
+		SubdomainRecursionDepth   *int      `json:"subdomain_recursion_depth"`
+		SubdomainRecursionEnabled *bool     `json:"subdomain_recursion_enabled"`
+		NucleiExcludeTemplateIDs  *[]string `json:"nuclei_exclude_template_ids"`
+		NucleiExtraTemplateRepos  *[]string `json:"nuclei_extra_template_repos"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid body")
@@ -163,6 +166,10 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 			d = 10 // a hard ceiling: deeper than this is an explicit code change, not a UI slip
 		}
 		h.cfg.SubdomainRecursionDepth = d
+	}
+	if body.SubdomainRecursionEnabled != nil {
+		// No clamping — a bool is a bool. Omitted ⇒ unchanged, like the other knobs.
+		h.cfg.SubdomainRecursionEnabled = *body.SubdomainRecursionEnabled
 	}
 	if body.NucleiExcludeTemplateIDs != nil {
 		h.cfg.NucleiExcludeTemplateIDs = clean(*body.NucleiExcludeTemplateIDs)

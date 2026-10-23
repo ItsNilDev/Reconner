@@ -332,6 +332,7 @@ export interface ApiKeyState { name: string; label: string; hint: string; set: b
 export interface ScanConfig {
   dns_resolvers: string[]
   subdomain_recursion_depth: number
+  subdomain_recursion_enabled: boolean
   nuclei_exclude_template_ids: string[]
   nuclei_extra_template_repos: string[]
   default_dns_resolvers: string[]

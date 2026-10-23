@@ -369,9 +369,12 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 
 	// Recursive enumeration: run passive discovery + resolution AGAINST each newly
 	// discovered resolving subdomain as its own sub-apex, descending until the
-	// configured depth or until a level finds nothing new. Gated on the same deep-
-	// work toggle as brute/permutation so the fast passive-only scan stays fast.
-	if subdomainBruteEnabled(ctx) {
+	// configured depth or until a level finds nothing new. Gate 1 is the deep-
+	// work toggle that already covers brute/permutation so the fast passive-only
+	// scan stays fast. Gate 2 is the system-wide recursion switch in the System →
+	// Scanning panel: off means apex only, while the remembered depth is kept
+	// for when it is turned back on.
+	if subdomainBruteEnabled(ctx) && s.subdomainRecursionEnabled() {
 		s.recursiveEnum(ctx, targetID, domain, logFn)
 	}
 
@@ -1306,6 +1309,18 @@ func (s *SubdomainScanner) subdomainRecursionDepth() int {
 		return s.cfg.SubdomainRecursionDepth
 	}
 	return 4
+}
+
+// subdomainRecursionEnabled reports whether recursive enumeration runs at all.
+// A nil config (test paths) behaves like the built-in defaults: recursion
+// enabled. Explicit false in config.json wins; the production Config always
+// comes from Load(), which starts from the defaults, so an old config.json
+// without this key never silently disables recursion after an upgrade.
+func (s *SubdomainScanner) subdomainRecursionEnabled() bool {
+	if s.cfg == nil {
+		return true
+	}
+	return s.cfg.SubdomainRecursionEnabled
 }
 
 // recursiveEnum drives recursive subdomain discovery: after the apex is
