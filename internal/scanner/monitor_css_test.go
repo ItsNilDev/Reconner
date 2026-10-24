@@ -301,3 +301,31 @@ func TestSecurityChangeSeverityStylesheetIsInfo(t *testing.T) {
 		}
 	}
 }
+
+// Legacy snapshots (recorded before extraction started stripping ?ver=) must
+// not unleash a one-time add+remove pair per stylesheet on the first diff
+// after an upgrade: the diff key normalizes stylesheet values on both sides.
+// Non-stylesheet kinds keep exact-match keys (script bump → added + removed).
+func TestSecuritySnapshotLegacyQueryKeysDiffSilently(t *testing.T) {
+	old := securitySnapshot{Attrs: []securityAttr{
+		{Kind: "stylesheet", Value: "https://cdn.example.test/s/a.css?ver=1"},
+		{Kind: "script", Value: "https://x.example.test/y.js?h=1"},
+	}}
+	cur := securitySnapshot{Attrs: []securityAttr{
+		{Kind: "stylesheet", Value: "https://cdn.example.test/s/a.css?ver=2"},
+		{Kind: "script", Value: "https://x.example.test/y.js?h=2"},
+	}}
+	got := diffSecuritySnapshots(old, cur)
+	sheetChanges := 0
+	for _, c := range got {
+		if c.attr.Kind == "stylesheet" {
+			sheetChanges++
+		}
+	}
+	if sheetChanges != 0 {
+		t.Fatalf("stylesheet ver-bump diffed as %d change(s), want 0", sheetChanges)
+	}
+	if len(got) != 2 {
+		t.Fatalf("script hash bump produced %d change(s), want exactly 2 (added+removed)", len(got))
+	}
+}

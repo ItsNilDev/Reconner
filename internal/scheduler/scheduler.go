@@ -2330,7 +2330,13 @@ const (
 func (s *Scheduler) escalateIfChanged(targetID, domain string, baselineSubs int, since time.Time) {
 	var nowSubs, changes int
 	_ = s.db.QueryRow(`SELECT COALESCE(subdomain_count,0) FROM targets WHERE id=?`, targetID).Scan(&nowSubs)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND detected_at >= ?`,
+	// Stylesheet signals are observational only: there is no follow-up CSS
+	// module (unlike the JS refresh set below), so a css_change row or an
+	// informative security:stylesheet_* row must never fire a nuclei/
+	// backup-discovery escalation just because a site redeployed its CSS.
+	// The Changes tab still records and diffs all of it.
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND detected_at >= ?
+		AND change_type != 'css_change' AND change_type NOT LIKE 'security:stylesheet%'`,
 		targetID, since.UTC().Format("2006-01-02 15:04:05")).Scan(&changes)
 
 	newSubs := nowSubs - baselineSubs
@@ -2359,6 +2365,11 @@ func (s *Scheduler) escalateIfChanged(targetID, domain string, baselineSubs int,
 		for rows.Next() {
 			var typ string
 			if rows.Scan(&typ) == nil {
+				// Stylesheet signals never choose escalation modules — see the
+				// count query above for the reasoning.
+				if typ == "css_change" || strings.HasPrefix(typ, "security:stylesheet") {
+					continue
+				}
 				types[typ] = true
 			}
 		}

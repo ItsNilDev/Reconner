@@ -264,15 +264,27 @@ type securityChange struct {
 	attr   securityAttr
 }
 
+// securityKey is the diff-set key for one snapshot attribute. Stylesheets key
+// on the query-stripped path so a LEGACY stored snapshot (recorded before
+// extraction started stripping prompts) and a fresh extraction of the same
+// resource share one key — an upgrade to this behavior must not unleash one
+// add+remove pair per stylesheet on the first pass after it ships.
+func securityKey(a securityAttr) string {
+	if a.Kind == "stylesheet" {
+		return a.Kind + "|" + stripResourceQuery(a.Value)
+	}
+	return a.Kind + "|" + a.Value
+}
+
 // diffSecuritySnapshots returns what security attributes were added/removed.
 func diffSecuritySnapshots(old, cur securitySnapshot) []securityChange {
 	oldSet := map[string]securityAttr{}
 	for _, a := range old.Attrs {
-		oldSet[a.Kind+"|"+a.Value] = a
+		oldSet[securityKey(a)] = a
 	}
 	curSet := map[string]securityAttr{}
 	for _, a := range cur.Attrs {
-		curSet[a.Kind+"|"+a.Value] = a
+		curSet[securityKey(a)] = a
 	}
 	var out []securityChange
 	for k, a := range curSet {
