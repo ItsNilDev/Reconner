@@ -61,7 +61,14 @@ async function fetchAllPaged<T>(path: string, extra?: Record<string, string>): P
     const total = (json && typeof json.total === 'number') ? json.total : all.length
     if (data.length === 0 || all.length >= total) break
     page++
-    if (page > 200) break // hard safety stop: 200 * 500 = 100k rows
+    if (page > 200) {
+      // Hard safety stop: 200 * 500 = 100k rows. Never truncate silently — a
+      // short Changes/URLs list must at least be visible in the console.
+      if (all.length < total) {
+        console.warn(`[api] ${path}: stopped at ${all.length}/${total} rows (200-page cap)`)
+      }
+      break
+    }
   }
   return all
 }
@@ -301,10 +308,21 @@ export const findings = {
     req<{ triage: string }>(`/targets/${id}/findings/${fid}/triage`, {
       method: 'POST', body: JSON.stringify({ triage, note }),
     }),
-  // Changes are paged server-side, newest first (500 per page) — pass the
-  // number of rows already loaded to pull the next (older) slice.
-  monitoringChanges: (id: string, offset = 0) =>
-    req<MonitoringChange[]>(`/targets/${id}/monitoring-changes${offset > 0 ? `?offset=${offset}` : ''}`),
+  // Changes use the same page/limit envelope as every other list endpoint, so
+  // fetchAllPaged() loads the complete history up front — no separate
+  // "load older changes" path and no 500-row stop.
+  monitoringChanges: async (id: string) => {
+    const rows = await fetchAllPaged<MonitoringChange>(`/targets/${id}/monitoring-changes`)
+    // Offset pagination can repeat a row when new changes land between page
+    // requests. Drop duplicates by id so React keys stay unique and the raw
+    // count in the footer matches the chips.
+    const seen = new Set<string>()
+    return rows.filter(r => {
+      if (seen.has(r.id)) return false
+      seen.add(r.id)
+      return true
+    })
+  },
   // Stored capture of a monitored file's body at detection time — NOT a live
   // fetch. Backs the Changes-tab diff drawer (css_change / js_change rows).
   fileBody: (id: string, kind: 'css' | 'js', url: string, side: 'current' | 'old' = 'current') =>

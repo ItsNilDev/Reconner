@@ -164,6 +164,7 @@ func RunMigrations(db *DB) error {
 		createWPSitesTable,
 		alterSubdomainsAddCatchall,
 		alterTargetsAddCatchallDetection,
+		createMonitoringChangesTargetTimeIndex,
 	}
 
 	for i, m := range migrations {
@@ -1433,6 +1434,13 @@ CREATE TABLE IF NOT EXISTS monitoring_changes (
 	detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
 );`
+
+// Covering index for the Changes tab history query:
+// WHERE target_id=? ORDER BY detected_at DESC, id DESC. The old target-only
+// index still required a sort of the target's whole change history per page.
+const createMonitoringChangesTargetTimeIndex = `
+CREATE INDEX IF NOT EXISTS idx_monitoring_changes_target_time
+ON monitoring_changes(target_id, detected_at DESC, id DESC);`
 
 const createNotificationsTable = `
 CREATE TABLE IF NOT EXISTS notifications (

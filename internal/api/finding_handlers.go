@@ -614,19 +614,43 @@ func (h *Handler) handleGetJSFileBody(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleListMonitoringChanges(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	// Newest first, 500 per page. `offset` lets the Changes tab walk further
-	// back than the newest page (the tab used to silently stop at 500 rows);
-	// id is the tiebreaker so rows sharing detected_at never shuffle between
-	// pages.
-	offset := 0
-	if n, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && n > 0 {
-		offset = n
+	// Standard pagination envelope, same shape as subdomains/http_services.
+	// The Changes tab uses fetchAllPaged() and walks every page until `total`
+	// is reached, so its footer and counts match the other tabs instead of
+	// stopping at the newest 500 rows.
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	if page < 1 {
+		page = 1
 	}
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := (page - 1) * limit
+
+	var total int
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*) FROM monitoring_changes WHERE target_id = ?`, id).Scan(&total); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+
+	// Newest first; id is the tiebreaker so rows sharing detected_at never
+	// shuffle between pages.
+	// COALESCE the nullable text columns: the schema allows NULL for
+	// old_value/new_value/detected_at, and scanning NULL into a string fails.
+	// A failed Scan used to be swallowed, so `total` counted rows the response
+	// never contained. Report the error instead of silently dropping rows.
 	rows, err := h.db.QueryContext(r.Context(), `
-		SELECT id, target_id, url, change_type, old_value, new_value, COALESCE(severity,'info'), detected_at
+		SELECT id, target_id, url, change_type, COALESCE(old_value,''), COALESCE(new_value,''),
+		       COALESCE(severity,'info'), COALESCE(detected_at,'')
 		FROM monitoring_changes WHERE target_id = ?
-		ORDER BY detected_at DESC, id DESC LIMIT 500 OFFSET ?
-	`, id, offset)
+		ORDER BY detected_at DESC, id DESC LIMIT ? OFFSET ?
+	`, id, limit, offset)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "query failed")
 		return
@@ -646,11 +670,22 @@ func (h *Handler) handleListMonitoringChanges(w http.ResponseWriter, r *http.Req
 	changes := make([]Change, 0)
 	for rows.Next() {
 		var c Change
-		if err := rows.Scan(&c.ID, &c.TargetID, &c.URL, &c.ChangeType, &c.OldValue, &c.NewValue, &c.Severity, &c.DetectedAt); err == nil {
-			changes = append(changes, c)
+		if err := rows.Scan(&c.ID, &c.TargetID, &c.URL, &c.ChangeType, &c.OldValue, &c.NewValue, &c.Severity, &c.DetectedAt); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "scan failed")
+			return
 		}
+		changes = append(changes, c)
 	}
-	h.writeSuccess(w, changes)
+	if err := rows.Err(); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]any{
+		"data":  changes,
+		"total": total,
+		"page":  page,
+		"limit": limit,
+	})
 }
 
 func (h *Handler) handleListVulnFindings(w http.ResponseWriter, r *http.Request) {

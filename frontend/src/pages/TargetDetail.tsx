@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, bounty as bountyApi } from '../lib/api'
 import { useUIStore } from '../store/ui'
@@ -60,6 +60,39 @@ export const changeBadgeVariant = (c: { severity?: string; change_type?: string 
     : ct.startsWith('security') || ct.includes('header') ? 'high'
     : ct === 'tech_change' ? 'low'
     : 'info'
+}
+
+// Changes-tab grouping: one row per (change_type, old_value, new_value), with
+// every occurrence kept for the expandable detail list. The key is stable
+// across refreshes, so an expanded group stays open when a live update makes a
+// newer row the representative.
+export interface MonitorChangeGroup {
+  key: string
+  rep: MonitoringChange
+  items: MonitoringChange[]
+  urls: string[]
+}
+
+// Bounds how many occurrence rows mount at once. A noisy target can repeat the
+// same change thousands of times; expanding all of them in one render freezes
+// the tab. The expansion footer pages through the rest.
+const OCCURRENCE_PAGE_SIZE = 200
+
+export function groupMonitorChanges(rows: MonitoringChange[]): MonitorChangeGroup[] {
+  const groups = new Map<string, MonitorChangeGroup>()
+  for (const c of rows) {
+    const key = `${c.change_type}\u0000${c.old_value}\u0000${c.new_value}`
+    const g = groups.get(key)
+    // Keep every occurrence, not just distinct URLs: the same URL can emit the
+    // same change more than once, and the old "+N more URLs" label hid those
+    // repeats entirely.
+    if (g) g.items.push(c)
+    else groups.set(key, { key, rep: c, items: [c], urls: [] })
+  }
+  for (const g of groups.values()) {
+    g.urls = [...new Set(g.items.map(i => i.url))]
+  }
+  return [...groups.values()]
 }
 
 // Projects created from the WP Scanner page carry this tag (see WPScanner.tsx) —
@@ -519,11 +552,10 @@ export default function TargetDetail() {
   const [evidence, setEvidence] = useState<{ id: string; url: string; type: string } | null>(null)
   // Changes-tab noise filter + the open content-diff drawer (css/js rows).
   const [changeFilter, setChangeFilter] = useState<ChangeFilter>('all')
+  // Changes tab: group key -> how many occurrence rows are currently mounted.
+  // Presence in the map means the group is expanded.
+  const [expandedOccurrences, setExpandedOccurrences] = useState<Map<string, number>>(new Map())
   const [diffView, setDiffView] = useState<{ url: string; kind: 'css' | 'js' } | null>(null)
-  // Changes tab: the endpoint pages 500 rows at a time. Track whether older
-  // history remains server-side and a load flag for the footer button.
-  const [monitorHasMore, setMonitorHasMore] = useState(false)
-  const [monitorLoadingMore, setMonitorLoadingMore] = useState(false)
   const [isScanning, setIsScanning] = useState(false)
   const [monitorSaving, setMonitorSaving] = useState(false)
   const [catchallSaving, setCatchallSaving] = useState(false)
@@ -732,14 +764,46 @@ export default function TargetDetail() {
   // more hooks than during the previous render" invariant (crashed the whole
   // page in production the moment the target finished loading).
   const isVulnTab = tab === 'vulns' || tab === 'candidates'
+  const isMonitorTab = tab === 'monitor'
   const vulnGroups = useMemo(
     () => (isVulnTab ? groupVulnFindings(filteredData as VulnFinding[]) : []),
     [isVulnTab, filteredData]
   )
+  // Changes tab: dedupe the FULL dataset once, not just the windowed rows.
+  // Grouping inside the table meant the chip counts, the "+N more URLs" labels
+  // and the footer disagreed, and they changed as you loaded more rows.
+  const monitorGroups = useMemo(() => {
+    if (!isMonitorTab) return [] as MonitorChangeGroup[]
+    return groupMonitorChanges(data as MonitoringChange[])
+  }, [isMonitorTab, data])
+  // Chip counts: distinct groups (what the table shows) plus raw row counts
+  // (tooltip), so "HTTP 18" and "58 changes" are both visible and explained.
+  const monitorCounts = useMemo(() => {
+    const groups: Record<string, number> = { all: monitorGroups.length }
+    const raw: Record<string, number> = { all: isMonitorTab ? (data as MonitoringChange[]).length : 0 }
+    if (isMonitorTab) {
+      for (const g of monitorGroups) {
+        const k = monitorRowKind(g.rep)
+        groups[k] = (groups[k] || 0) + 1
+      }
+      for (const row of (data as MonitoringChange[])) {
+        const k = monitorRowKind(row)
+        raw[k] = (raw[k] || 0) + 1
+      }
+    }
+    return { groups, raw }
+  }, [isMonitorTab, monitorGroups, data])
+  const monitorFilteredGroups = useMemo(
+    () => (isMonitorTab && changeFilter !== 'all'
+      ? monitorGroups.filter(g => monitorRowKind(g.rep) === changeFilter)
+      : monitorGroups),
+    [isMonitorTab, monitorGroups, changeFilter]
+  )
   const vulnGroupPage = vulnGroups.slice(0, visibleCount)
-  const footerShownCount = isVulnTab ? vulnGroupPage.length : pageData.length
-  const footerTotalCount = isVulnTab ? vulnGroups.length : filteredData.length
-  const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : hasMore
+  const monitorGroupPage = monitorFilteredGroups.slice(0, visibleCount)
+  const footerShownCount = isVulnTab ? vulnGroupPage.length : isMonitorTab ? monitorGroupPage.length : pageData.length
+  const footerTotalCount = isVulnTab ? vulnGroups.length : isMonitorTab ? monitorFilteredGroups.length : filteredData.length
+  const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : isMonitorTab ? monitorFilteredGroups.length > visibleCount : hasMore
 
   const loadTab = async (t: string) => {
     if (!id) return
@@ -776,27 +840,11 @@ export default function TargetDetail() {
         r = all.filter(f => want.has(f.type))
       }
       else if (t === 'cameras') r = await findingsApi.ingram(id)
-      else if (t === 'monitor') {
-        const batch = await findingsApi.monitoringChanges(id)
-        r = batch
-        setMonitorHasMore((batch || []).length >= 500)
-      }
+      else if (t === 'monitor') r = await findingsApi.monitoringChanges(id)
       setData(r || [])
       setVisibleCount(PAGE)
     } catch { setData([]) }
     setTabLoading(false)
-  }
-
-  // Changes tab: pull the next 500-row page of older history.
-  const loadOlderChanges = async () => {
-    if (!id || monitorLoadingMore) return
-    setMonitorLoadingMore(true)
-    try {
-      const batch = await findingsApi.monitoringChanges(id, data.length)
-      setData(prev => [...prev, ...batch])
-      setMonitorHasMore(batch.length >= 500)
-    } catch (e) { console.error(e) }
-    finally { setMonitorLoadingMore(false) }
   }
 
   if (loading) return <div className="flex items-center justify-center h-64"><Spinner /></div>
@@ -1231,11 +1279,11 @@ export default function TargetDetail() {
               {tab === 'monitor' && (
                 <div className="flex items-center gap-1.5 flex-wrap mb-3">
                   {CHANGE_FILTERS.map(f => {
-                    const n = f.id === 'all'
-                      ? data.length
-                      : (data as MonitoringChange[]).filter(row => monitorRowKind(row) === f.id).length
+                    const n = monitorCounts.groups[f.id] || 0
+                    const rawN = monitorCounts.raw[f.id] || 0
                     return (
                       <button key={f.id}
+                        title={`${rawN.toLocaleString()} raw change(s)`}
                         onClick={() => { setChangeFilter(f.id); setVisibleCount(PAGE) }}
                         className={cn('px-2.5 py-1 rounded-full border text-[11px] transition-colors',
                           changeFilter === f.id
@@ -1656,58 +1704,96 @@ export default function TargetDetail() {
                       </tr>
                       )
                     })}
-                    {tab === 'monitor' && (() => {
-                      // Collapse changes that are identical except for the URL (e.g. the
-                      // same header added across 40 hosts) into ONE row with an affected-URL
-                      // count, instead of 40 near-duplicate rows — the Changes view used to
-                      // be an unreadable wall of the same drift repeated per URL.
-                      const groups = new Map<string, { rep: MonitoringChange; urls: string[] }>()
-                      for (const c of (pageData as MonitoringChange[])) {
-                        const key = `${c.change_type}|${c.old_value}|${c.new_value}`
-                        const g = groups.get(key)
-                        if (g) { if (!g.urls.includes(c.url)) g.urls.push(c.url) }
-                        else groups.set(key, { rep: c, urls: [c.url] })
-                      }
-                      return [...groups.values()].map(({ rep: c, urls }) => (
-                      <tr key={c.id} className="table-row align-top">
-                        <td className="table-cell max-w-xs">
-                          <div className="flex items-center gap-1.5">
-                            <a href={c.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
-                            <CopyButton text={c.url} />
-                            {/* Content-capture diff for monitored stylesheets/scripts.
-                                Legacy rows (recorded before capture) open too, but
-                                show the not-captured note + hashes only. */}
-                            {(c.change_type === 'css_change' || c.change_type === 'js_change') && (
-                              <button onClick={() => setDiffView({ url: c.url, kind: c.change_type === 'css_change' ? 'css' : 'js' })}
-                                className="btn-secondary text-[10px] px-1.5 py-0.5 shrink-0">Diff</button>
-                            )}
-                          </div>
-                          {urls.length > 1 && (
-                            <span title={urls.join('\n')} className="mt-0.5 inline-block text-[10px] text-text-muted cursor-help">+{urls.length - 1} more URL{urls.length - 1 === 1 ? '' : 's'}</span>
+                    {tab === 'monitor' && monitorGroupPage.map(g => {
+                      const c = g.rep
+                      const occurrences = g.items.length - 1
+                      const shownCount = expandedOccurrences.get(g.key) ?? 0
+                      const expanded = expandedOccurrences.has(g.key)
+                      return (
+                        <Fragment key={c.id}>
+                          <tr className="table-row align-top">
+                            <td className="table-cell max-w-xs">
+                              <div className="flex items-center gap-1.5">
+                                <a href={c.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
+                                <CopyButton text={c.url} />
+                                {/* Content-capture diff for monitored stylesheets/scripts.
+                                    Legacy rows (recorded before capture) open too, but
+                                    show the not-captured note + hashes only. */}
+                                {(c.change_type === 'css_change' || c.change_type === 'js_change') && (
+                                  <button onClick={() => setDiffView({ url: c.url, kind: c.change_type === 'css_change' ? 'css' : 'js' })}
+                                    className="btn-secondary text-[10px] px-1.5 py-0.5 shrink-0">Diff</button>
+                                )}
+                              </div>
+                              {occurrences > 0 && (
+                                <button
+                                  onClick={() => setExpandedOccurrences(prev => {
+                                    const next = new Map(prev)
+                                    if (next.has(g.key)) next.delete(g.key)
+                                    else next.set(g.key, OCCURRENCE_PAGE_SIZE)
+                                    return next
+                                  })}
+                                  title={g.urls.join('\n')}
+                                  className="mt-0.5 inline-block text-[10px] text-accent hover:underline"
+                                >
+                                  {expanded ? 'Hide occurrences' : `+${occurrences} more change${occurrences === 1 ? '' : 's'} · ${g.urls.length} URL${g.urls.length === 1 ? '' : 's'}`}
+                                </button>
+                              )}
+                            </td>
+                            <td className="table-cell">
+                              <Badge variant={changeBadgeVariant(c)}>{c.change_type}</Badge>
+                            </td>
+                            {/* Old/new values were truncated to 50 chars with no way to read the
+                                rest. Now each value wraps, shows the full text on hover, and has a
+                                copy button, so a full diff is actually inspectable. */}
+                            <td className="table-cell text-xs text-text-muted font-mono break-all whitespace-pre-wrap max-w-sm">
+                              <div className="flex items-start gap-1">
+                                <span title={c.old_value} className="flex-1">{c.old_value || '—'}</span>
+                                {c.old_value && <CopyButton text={c.old_value} />}
+                              </div>
+                            </td>
+                            <td className="table-cell text-xs text-severity-medium font-mono break-all whitespace-pre-wrap max-w-sm">
+                              <div className="flex items-start gap-1">
+                                <span title={c.new_value} className="flex-1">{c.new_value || '—'}</span>
+                                {c.new_value && <CopyButton text={c.new_value} />}
+                              </div>
+                            </td>
+                            <td className="table-cell text-xs whitespace-nowrap">{timeAgo(c.detected_at)}</td>
+                          </tr>
+                          {expanded && g.items.slice(1, 1 + shownCount).map(it => (
+                            <tr key={it.id} className="table-row bg-bg-secondary/30 align-top">
+                              <td colSpan={5} className="table-cell text-[11px]">
+                                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pl-3 text-text-muted">
+                                  <span className="text-accent">↳</span>
+                                  <a href={it.url} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono break-all">{truncate(it.url, 80)}</a>
+                                  <CopyButton text={it.url} />
+                                  <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>
+                                  <span className="whitespace-nowrap">{timeAgo(it.detected_at)}</span>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                          {expanded && occurrences > shownCount && (
+                            <tr key={`more-${g.key}`} className="table-row bg-bg-secondary/30">
+                              <td colSpan={5} className="table-cell text-[11px]">
+                                <div className="flex flex-wrap items-center gap-3 pl-3 text-text-muted">
+                                  <span>Showing {shownCount.toLocaleString()} of {occurrences.toLocaleString()} occurrence{occurrences === 1 ? '' : 's'}</span>
+                                  <button
+                                    onClick={() => setExpandedOccurrences(prev => {
+                                      const next = new Map(prev)
+                                      next.set(g.key, (next.get(g.key) ?? 0) + OCCURRENCE_PAGE_SIZE)
+                                      return next
+                                    })}
+                                    className="text-accent hover:underline"
+                                  >
+                                    Show {Math.min(OCCURRENCE_PAGE_SIZE, occurrences - shownCount).toLocaleString()} more
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
                           )}
-                        </td>
-                        <td className="table-cell">
-                          <Badge variant={changeBadgeVariant(c)}>{c.change_type}</Badge>
-                        </td>
-                        {/* Old/new values were truncated to 50 chars with no way to read the
-                            rest. Now each value wraps, shows the full text on hover, and has a
-                            copy button, so a full diff is actually inspectable. */}
-                        <td className="table-cell text-xs text-text-muted font-mono break-all whitespace-pre-wrap max-w-sm">
-                          <div className="flex items-start gap-1">
-                            <span title={c.old_value} className="flex-1">{c.old_value || '—'}</span>
-                            {c.old_value && <CopyButton text={c.old_value} />}
-                          </div>
-                        </td>
-                        <td className="table-cell text-xs text-severity-medium font-mono break-all whitespace-pre-wrap max-w-sm">
-                          <div className="flex items-start gap-1">
-                            <span title={c.new_value} className="flex-1">{c.new_value || '—'}</span>
-                            {c.new_value && <CopyButton text={c.new_value} />}
-                          </div>
-                        </td>
-                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(c.detected_at)}</td>
-                      </tr>
-                      ))
-                    })()}
+                        </Fragment>
+                      )
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1717,21 +1803,17 @@ export default function TargetDetail() {
           <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
             <span className="text-text-muted">
               Showing {footerShownCount.toLocaleString()} of {footerTotalCount.toLocaleString()}
-              {isVulnTab ? ' distinct issue(s)' : ''}
+              {isVulnTab
+                ? ' distinct issue(s)'
+                : isMonitorTab
+                ? ` distinct change group(s) · ${filteredData.length.toLocaleString()} change(s)`
+                : ''}
             </span>
             <button onClick={() => setVisibleCount(c => c + PAGE)} className="btn-secondary text-xs">
               Load {Math.min(PAGE, footerTotalCount - visibleCount).toLocaleString()} more
             </button>
-            <button onClick={() => setVisibleCount(data.length)} className="text-accent hover:underline">
+            <button onClick={() => setVisibleCount(footerTotalCount)} className="text-accent hover:underline">
               Show all
-            </button>
-          </div>
-        )}
-        {tab === 'monitor' && !tabLoading && monitorHasMore && !footerHasMore && (
-          <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
-            <span className="text-text-muted">Showing newest {data.length.toLocaleString()} changes</span>
-            <button onClick={loadOlderChanges} disabled={monitorLoadingMore} className="btn-secondary text-xs">
-              {monitorLoadingMore ? 'Loading…' : 'Load older changes'}
             </button>
           </div>
         )}
