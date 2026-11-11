@@ -35,8 +35,11 @@ const CHANGE_FILTERS: { id: ChangeFilter; label: string }[] = [
 // Bucket order matters: the stylesheet/script markers win before the generic
 // "security:" prefix, so a security:stylesheet_* row lands in Stylesheets (not
 // Security), a security:script_* row in Scripts, and header removals in Headers.
-const monitorRowKind = (c: MonitoringChange): ChangeFilter => {
-  const ct = c.change_type
+export const monitorRowKind = (c: MonitoringChange): ChangeFilter => {
+  // One render can hold rows from the PREVIOUS tab while the next tab's fetch
+  // is in flight (data is replaced only after the request resolves). Never
+  // assume the row really is a monitoring_changes row.
+  const ct = typeof c?.change_type === 'string' ? c.change_type : ''
   if (ct === 'css_change' || ct.includes('stylesheet')) return 'css'
   if (ct === 'js_change' || ct.includes('script')) return 'scripts'
   if (ct.includes('header')) return 'headers'
@@ -47,12 +50,15 @@ const monitorRowKind = (c: MonitoringChange): ChangeFilter => {
 
 // Badge color follows the stored severity (rows written since the severity
 // column carry one); older rows without it keep the old type-based estimate.
-const changeBadgeVariant = (c: { severity?: string; change_type: string }): 'high' | 'medium' | 'low' | 'info' => {
+export const changeBadgeVariant = (c: { severity?: string; change_type?: string }): 'high' | 'medium' | 'low' | 'info' => {
   const sev = (c.severity || '').toLowerCase()
   if (sev === 'high' || sev === 'medium' || sev === 'low' || sev === 'info') return sev
-  return c.change_type === 'js_change' ? 'medium'
-    : c.change_type.startsWith('security') || c.change_type.includes('header') ? 'high'
-    : c.change_type === 'tech_change' ? 'low'
+  // Same stale-row hazard as monitorRowKind: the badge must render even when a
+  // previous tab's row is briefly shown under the Changes tab.
+  const ct = typeof c.change_type === 'string' ? c.change_type : ''
+  return ct === 'js_change' ? 'medium'
+    : ct.startsWith('security') || ct.includes('header') ? 'high'
+    : ct === 'tech_change' ? 'low'
     : 'info'
 }
 
@@ -514,6 +520,10 @@ export default function TargetDetail() {
   // Changes-tab noise filter + the open content-diff drawer (css/js rows).
   const [changeFilter, setChangeFilter] = useState<ChangeFilter>('all')
   const [diffView, setDiffView] = useState<{ url: string; kind: 'css' | 'js' } | null>(null)
+  // Changes tab: the endpoint pages 500 rows at a time. Track whether older
+  // history remains server-side and a load flag for the footer button.
+  const [monitorHasMore, setMonitorHasMore] = useState(false)
+  const [monitorLoadingMore, setMonitorLoadingMore] = useState(false)
   const [isScanning, setIsScanning] = useState(false)
   const [monitorSaving, setMonitorSaving] = useState(false)
   const [catchallSaving, setCatchallSaving] = useState(false)
@@ -766,11 +776,27 @@ export default function TargetDetail() {
         r = all.filter(f => want.has(f.type))
       }
       else if (t === 'cameras') r = await findingsApi.ingram(id)
-      else if (t === 'monitor') r = await findingsApi.monitoringChanges(id)
+      else if (t === 'monitor') {
+        const batch = await findingsApi.monitoringChanges(id)
+        r = batch
+        setMonitorHasMore((batch || []).length >= 500)
+      }
       setData(r || [])
       setVisibleCount(PAGE)
     } catch { setData([]) }
     setTabLoading(false)
+  }
+
+  // Changes tab: pull the next 500-row page of older history.
+  const loadOlderChanges = async () => {
+    if (!id || monitorLoadingMore) return
+    setMonitorLoadingMore(true)
+    try {
+      const batch = await findingsApi.monitoringChanges(id, data.length)
+      setData(prev => [...prev, ...batch])
+      setMonitorHasMore(batch.length >= 500)
+    } catch (e) { console.error(e) }
+    finally { setMonitorLoadingMore(false) }
   }
 
   if (loading) return <div className="flex items-center justify-center h-64"><Spinner /></div>
@@ -1092,7 +1118,18 @@ export default function TargetDetail() {
             {gi > 0 && <span className="mx-1.5 my-2 w-px bg-border" />}
             <span className="pl-2 pr-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/60 self-center select-none">{g.group}</span>
             {g.tabs.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} title={t.desc}
+              <button key={t.id} onClick={() => {
+                if (t.id === tab) return
+                // The next render runs with the PREVIOUS tab's rows still in
+                // `data` (the fetch resolves later). Clear them and show the
+                // skeleton now, so the new tab never renders another tab's row
+                // shape — that crashed the page (undefined change_type) when
+                // switching to Changes.
+                setTabLoading(true)
+                setData([])
+                setVisibleCount(PAGE)
+                setTab(t.id)
+              }} title={t.desc}
                 className={cn(
                   'px-3 py-2.5 text-sm font-medium whitespace-nowrap border-b-2 transition-all',
                   tab === t.id ? 'border-accent text-accent' : 'border-transparent text-text-muted hover:text-text-secondary'
@@ -1150,7 +1187,9 @@ export default function TargetDetail() {
       </div>
       )}
 
-      <ErrorBoundary>
+      {/* key={tab}: a caught render error belongs to one tab's row shape; do
+          not leave the fallback stuck when the operator switches tabs. */}
+      <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
         {tabLoading
           ? <div className="py-2"><SkeletonRows rows={8} cols={5} /></div>
@@ -1669,6 +1708,14 @@ export default function TargetDetail() {
             </button>
             <button onClick={() => setVisibleCount(data.length)} className="text-accent hover:underline">
               Show all
+            </button>
+          </div>
+        )}
+        {tab === 'monitor' && !tabLoading && monitorHasMore && !footerHasMore && (
+          <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
+            <span className="text-text-muted">Showing newest {data.length.toLocaleString()} changes</span>
+            <button onClick={loadOlderChanges} disabled={monitorLoadingMore} className="btn-secondary text-xs">
+              {monitorLoadingMore ? 'Loading…' : 'Load older changes'}
             </button>
           </div>
         )}
