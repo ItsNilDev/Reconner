@@ -205,6 +205,9 @@ type Notifier interface {
 	// NotifyScopeLanded delivers the grouped scope-landed alert. The scheduler
 	// owns the event key, so the outbox deduplicates the whole window.
 	NotifyScopeLanded(eventKey, summary string, hosts []string)
+	// NotifyNewHosts delivers the grouped "first seen alive" alert for one watch
+	// round. The scheduler owns the event key, so the outbox dedupes the window.
+	NotifyNewHosts(eventKey, summary string, hosts []string, targetID string)
 }
 
 type Scheduler struct {
@@ -270,12 +273,6 @@ type Scheduler struct {
 	// taskTypes mirrors running with the task type, so admission can count the
 	// deep lane and the watch lane separately.
 	taskTypes map[string]string
-	// watchRootFails counts consecutive FAILED watch rounds on the SAME root of
-	// a project. It is the poison-root escape (plan §3): after two failures on
-	// the same root the rotation advances anyway, so one broken domain cannot
-	// stop the chain for every healthy root. watch_fail_count stays per project
-	// in the database; this counter is deliberately in memory.
-	watchRootFails map[string]int
 	// throttleLog dedupes the severe-pressure cooldown warning so a loaded box
 	// logs it once, not every 2s drain tick.
 	throttleLog atomic.Bool
@@ -304,21 +301,20 @@ func New(db *database.DB, hub *websocket.Hub, cfg *config.Config, log *logger.Lo
 	exec := tools.NewExecutor(cfg, log)
 
 	s := &Scheduler{
-		db:             db,
-		hub:            hub,
-		cfg:            cfg,
-		logger:         log,
-		executor:       exec,
-		queue:          make(chan string, 100),
-		cancelMap:      make(map[string]context.CancelFunc),
-		skipCancel:     make(map[string]context.CancelFunc),
-		skipReq:        make(map[string]bool),
-		running:        make(map[string]bool),
-		taskTargets:    make(map[string]string),
-		taskTypes:      make(map[string]string),
-		watchRootFails: make(map[string]int),
-		stopCh:         make(chan struct{}),
-		paused:         make(map[string]bool),
+		db:          db,
+		hub:         hub,
+		cfg:         cfg,
+		logger:      log,
+		executor:    exec,
+		queue:       make(chan string, 100),
+		cancelMap:   make(map[string]context.CancelFunc),
+		skipCancel:  make(map[string]context.CancelFunc),
+		skipReq:     make(map[string]bool),
+		running:     make(map[string]bool),
+		taskTargets: make(map[string]string),
+		taskTypes:   make(map[string]string),
+		stopCh:      make(chan struct{}),
+		paused:      make(map[string]bool),
 	}
 
 	// Wrapped broadcast: fan out to websocket clients AND route high-signal
@@ -2057,13 +2053,8 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	}
 
 	// Watch rounds write a cheap before/after diff for their two modules. The
-	// closure only captures snapshots; the outer loop inserts rows after
-	// finishPhase() confirms the phase really ran.
-	var beforeHTTP, afterHTTP map[string]watchHTTPSnapshot
-	var beforeHosts, afterHosts map[string]bool
-	var watchDiffModule string
-	var watchDiffReady bool
-	var httpCapped, hostsCapped bool
+	// Watch detail snapshots are no longer diffed after each phase. The host
+	// lifecycle emitter is the single source of default-feed events.
 
 	runPlannedModule := func(moduleCtx context.Context, module string) error {
 		moduleCtx = scanner.WithCoverageReporter(moduleCtx, func(metric scanner.CoverageMetric, delta int64) {
@@ -2081,36 +2072,6 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			_, _ = s.db.Exec(`UPDATE task_phases SET `+column+`=`+column+`+?,updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND module=?`, delta, taskID, module)
 		})
 
-		if taskType == watchScanType {
-			watchDiffModule = module
-			watchDiffReady = false
-			httpCapped, hostsCapped = false, false
-			switch module {
-			case ModuleHTTPProbe:
-				snap, err := snapshotWatchHTTP(moduleCtx, s.db, targetID)
-				if err != nil {
-					s.logger.Warn("watch changes: before HTTP snapshot failed", "error", err)
-				} else {
-					beforeHTTP = snap
-					if len(snap) == watchSnapshotCap {
-						httpCapped = true
-						s.logger.Warn("watch changes: HTTP snapshot capped; diffing the common window", "target_id", targetID, "cap", watchSnapshotCap)
-					}
-				}
-			case ModuleSubdomainEnum:
-				snap, err := snapshotWatchHosts(moduleCtx, s.db, targetID)
-				if err != nil {
-					s.logger.Warn("watch changes: before host snapshot failed", "error", err)
-				} else {
-					beforeHosts = snap
-					if len(snap) == watchSnapshotCap {
-						hostsCapped = true
-						s.logger.Warn("watch changes: host snapshot capped; diffing the common window", "target_id", targetID, "cap", watchSnapshotCap)
-					}
-				}
-			}
-		}
-
 		var err error
 		switch module {
 		case ModuleSubdomainEnum:
@@ -2125,34 +2086,6 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			err = s.runModule(moduleCtx, module, targetID, domainFor(module), logFn)
 		}
 
-		if taskType == watchScanType && err == nil {
-			switch module {
-			case ModuleHTTPProbe:
-				snap, snapErr := snapshotWatchHTTP(moduleCtx, s.db, targetID)
-				if snapErr != nil {
-					s.logger.Warn("watch changes: after HTTP snapshot failed", "error", snapErr)
-				} else if beforeHTTP != nil {
-					afterHTTP = snap
-					if len(snap) == watchSnapshotCap {
-						httpCapped = true
-						s.logger.Warn("watch changes: HTTP snapshot capped after probe; diffing the common window", "target_id", targetID, "cap", watchSnapshotCap)
-					}
-					watchDiffReady = true
-				}
-			case ModuleSubdomainEnum:
-				snap, snapErr := snapshotWatchHosts(moduleCtx, s.db, targetID)
-				if snapErr != nil {
-					s.logger.Warn("watch changes: after host snapshot failed", "error", snapErr)
-				} else if beforeHosts != nil {
-					afterHosts = snap
-					if len(snap) == watchSnapshotCap {
-						hostsCapped = true
-						s.logger.Warn("watch changes: host snapshot capped after probe; diffing the common window", "target_id", targetID, "cap", watchSnapshotCap)
-					}
-					watchDiffReady = true
-				}
-			}
-		}
 		return err
 	}
 
@@ -2405,26 +2338,16 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		if forced {
 			logFn("warn", "scheduler", fmt.Sprintf("Phase %q did not stop within %s after cancellation; force-released scheduler ownership.", module, phaseStopGrace))
 		}
-		// finishPhase cancels modCtx. Capture its state before teardown, or every
-		// clean phase looks cancelled and the diff hook never runs.
-		modCtxErr := modCtx.Err()
+		_ = modCtx.Err()
 		skipped, timedOut := finishPhase()
 		phaseStatus, phaseReason := phaseOutcome(err, skipped, timedOut, ctx.Err())
-		// On force-release the worker may still be writing the snapshot vars.
-		// Do not read them; a forced phase never produces a diff anyway.
-		writeDiff := !forced && shouldWriteWatchDiff(taskType, skipped, timedOut, err, modCtxErr, watchDiffReady)
-		if writeDiff {
-			switch watchDiffModule {
-			case ModuleHTTPProbe:
-				hostDiffRan := beforeHosts != nil && afterHosts != nil
-				s.insertWatchRoundChanges(ctx, taskID, targetID, diffWatchHTTP(beforeHTTP, afterHTTP, hostDiffRan, httpCapped))
-			case ModuleSubdomainEnum:
-				s.insertWatchRoundChanges(ctx, taskID, targetID, diffWatchHosts(beforeHosts, afterHosts, hostsCapped))
-			}
+		// The single new-host event is emitted once, after a successful HTTP
+		// probe phase. Snapshot diffs and per-phase reset are gone: they made
+		// suppression impossible and produced three events per host.
+		if taskType == watchScanType && module == ModuleHTTPProbe && err == nil && !forced && !skipped && !timedOut {
+			s.emitWatchNewHosts(ctx, taskID, targetID)
 		}
-		if !forced {
-			beforeHTTP, afterHTTP, beforeHosts, afterHosts, watchDiffModule, watchDiffReady, httpCapped, hostsCapped = nil, nil, nil, nil, "", false, false, false
-		}
+
 		s.finishTaskPhase(taskID, module, phaseStatus, phaseReason, time.Since(phaseStartedAt))
 		if s.notifier != nil && taskType != watchScanType {
 			s.notifier.NotifyPhaseFinished(taskID, targetID, target.Domain, module, phaseStatus, time.Since(phaseStartedAt), s.terminalTaskPhaseCount(taskID), len(modules))
@@ -3590,6 +3513,15 @@ func (s *Scheduler) notifyScanDone(taskID, targetID, domain, taskType, status st
 		"verified":   vulns + nuclei + backups + redirects + jsFindings,
 	}
 	if taskType == watchScanType {
+		// Round health: how many first-seen-alive hosts this round announced,
+		// and how many eligible scope hosts landed. Both come from the round's
+		// own audit rows, not from a global count.
+		var newHosts, landed int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE task_id=? AND change_type='new_subdomain'`, taskID).Scan(&newHosts)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_scope_events WHERE target_id=? AND detected_at>=?`,
+			targetID, startedAt.UTC().Format("2006-01-02 15:04:05")).Scan(&landed)
+		stats["new_hosts"] = newHosts
+		stats["landed"] = landed
 		// The bell stays quiet on a normal round. It only shows specific
 		// changes: scope landed and watch rounds stopped. Telegram still gets
 		// the grouped round result through NotifyWatchScanFinished.

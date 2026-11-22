@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -194,6 +195,8 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 
 			if err := s.storeHTTPService(targetID, out); err != nil {
 				s.logger.Error("Failed to store HTTP service", "error", err)
+			} else if watchMode {
+				_, _ = s.db.Exec(`UPDATE http_services SET probe_tier='watch' WHERE target_id=? AND url=?`, targetID, out.URL)
 			}
 
 			if err := s.updateSubdomainAlive(targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
@@ -254,31 +257,15 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	// only hosts that came back from the probe are considered. A round with no
 	// HTTP result lands nothing.
 	if watchMode {
+		recordWatchMisses(ctx, s.db, targetID, probedHosts, hosts, logFn)
 		if probed == 0 {
 			logFn("info", "watch_scope", "HTTP phase produced no result: nothing landed this round")
 		} else {
-			landed := LandWatchScopeHosts(ctx, s.db, targetID, probedHosts, logFn)
-			if len(landed) > 0 {
-				// One bell row per watch round that landed something. It is written
-				// WITHOUT the notification_created broadcast, so it never reaches
-				// the Telegram "Monitor change" template; the scheduler sends the
-				// grouped scope-landed message instead.
-				cap := 20
-				if s.cfg != nil && s.cfg.WatchNotifyHostCap > 0 {
-					cap = s.cfg.WatchNotifyHostCap
-				}
-				names := landed
-				extra := 0
-				if len(names) > cap {
-					extra = len(names) - cap
-					names = names[:cap]
-				}
-				body := fmt.Sprintf("%d new eligible host(s): %s", len(landed), strings.Join(names, ", "))
-				if extra > 0 {
-					body += fmt.Sprintf(" (+%d more)", extra)
-				}
-				notify(s.db, targetID, "scope_landed", "New eligible scope", body, "/targets/"+targetID, "medium")
-			}
+			// Landing is a silent audit write now. The host becomes approved
+			// scope, but no bell, feed row, Telegram message or socket event is
+			// produced here; those belong to the new-host emitter after this
+			// phase and to real program scope changes.
+			LandWatchScopeHosts(ctx, s.db, targetID, probedHosts, logFn)
 		}
 	}
 
@@ -387,7 +374,9 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 
 func (s *HTTPScanner) storeHTTPService(targetID string, out httpxOutput) error {
 	id := uuid.New().String()
-	techs := models.StringSliceToJSON(out.Technologies)
+	sortedTechs := append([]string(nil), out.Technologies...)
+	sort.Strings(sortedTechs)
+	techs := models.StringSliceToJSON(sortedTechs)
 
 	var subID string
 	_ = s.db.QueryRow("SELECT id FROM subdomains WHERE target_id = ? AND subdomain = ?",
@@ -395,8 +384,8 @@ func (s *HTTPScanner) storeHTTPService(targetID string, out httpxOutput) error {
 
 	_, err := s.db.Exec(`
 		INSERT INTO http_services 
-			(id, target_id, subdomain_id, url, status_code, title, server, content_type, content_length, redirect_url, technologies, response_time_ms, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			(id, target_id, subdomain_id, url, status_code, title, server, content_type, content_length, redirect_url, technologies, response_time_ms, probe_tier, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'deep', CURRENT_TIMESTAMP)
 		ON CONFLICT(target_id, url) DO UPDATE SET
 			status_code = excluded.status_code,
 			title = excluded.title,
@@ -405,6 +394,7 @@ func (s *HTTPScanner) storeHTTPService(targetID string, out httpxOutput) error {
 			content_length = excluded.content_length,
 			redirect_url = excluded.redirect_url,
 			technologies = excluded.technologies,
+			probe_tier = excluded.probe_tier,
 			last_seen = CURRENT_TIMESTAMP
 	`, id, targetID, subID, out.URL, out.StatusCode, out.Title, out.WebServer,
 		out.ContentType, out.ContentLength, out.RedirectURL, techs, 0)
@@ -439,20 +429,70 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 		hasHTTP = 1
 	}
 
-	techsJSON := models.StringSliceToJSON(techs)
+	sortedTechs := append([]string(nil), techs...)
+	sort.Strings(sortedTechs)
+	techsJSON := models.StringSliceToJSON(sortedTechs)
 	_, err := s.db.Exec(`
-		UPDATE subdomains SET 
+		UPDATE subdomains SET
 			is_alive = 1,
 			status_code = ?,
 			technologies = ?,
 			server = ?,
 			has_https = ?,
-			has_http = ?
+			has_http = ?,
+			first_alive_at = COALESCE(first_alive_at, CURRENT_TIMESTAMP),
+			last_alive_at = CURRENT_TIMESTAMP,
+			alive_misses = 0
 		WHERE target_id = ? AND subdomain = ?
 	`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, host)
+	if err != nil {
+		_ = rows
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO watch_hosts(target_id,host,first_seen_at,first_alive_at,last_alive_at,alive_misses)
+		VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)
+		ON CONFLICT(target_id,host) DO UPDATE SET
+			first_alive_at=COALESCE(watch_hosts.first_alive_at,excluded.first_alive_at),
+			last_alive_at=excluded.last_alive_at,
+			alive_misses=0
+	`, targetID, host)
 
 	_ = rows
 	return err
+}
+
+// recordWatchMisses advances the liveness state of hosts that were probed but
+// produced no HTTP response. A single miss is state only; two consecutive
+// misses flip is_alive off. This keeps a flaky response from toggling the feed.
+func recordWatchMisses(ctx context.Context, db *database.DB, targetID string, probed []string, all []string, logFn LogFunc) {
+	if len(all) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(probed))
+	for _, h := range probed {
+		seen[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	missed := 0
+	for _, raw := range all {
+		host := strings.ToLower(strings.TrimSpace(raw))
+		if host == "" || seen[host] {
+			continue
+		}
+		res, err := db.ExecContext(ctx, `
+			UPDATE subdomains SET alive_misses=alive_misses+1,
+				is_alive=CASE WHEN alive_misses+1>=2 THEN 0 ELSE is_alive END
+			WHERE target_id=? AND subdomain=?`, targetID, host)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				missed++
+			}
+			_, _ = db.ExecContext(ctx, `UPDATE watch_hosts SET alive_misses=alive_misses+1 WHERE target_id=? AND host=?`, targetID, host)
+		}
+	}
+	if missed > 0 {
+		logFn("info", "http_probe", fmt.Sprintf("%d probed host(s) gave no HTTP response; liveness state updated", missed))
+	}
 }
 
 type dbRow = interface{}

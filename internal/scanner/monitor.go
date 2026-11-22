@@ -666,8 +666,8 @@ func notificationTitle(changeType string) string {
 		return "Monitored project page changed"
 	case "tech_change":
 		return "Technology / server changed"
-	case "new_subdomain":
-		return "New subdomain discovered"
+	case "new_subdomain", "new_host":
+		return "New host discovered"
 	case "header_regression", "security_header_removed":
 		return "Security header removed"
 	default:

@@ -59,19 +59,20 @@ func (b *TelegramBot) handleUpdate(ctx context.Context, token string, update tgU
 
 func (b *TelegramBot) authorizedChat(ctx context.Context, chatID string) (TelegramChat, bool) {
 	var c TelegramChat
-	var enabled, a, p, f, findings, monitoring, ws, wf, sl int
+	var enabled, a, p, f, findings, monitoring, ws, wf, sl, nh int
 	err := b.h.db.QueryRowContext(ctx, `SELECT id,chat_id,label,role,enabled,
 		notify_scan_started,notify_phase_finished,notify_scan_finished,notify_findings,notify_monitoring,
-		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,
+		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host,
 		created_at,updated_at FROM telegram_chats WHERE chat_id=?`, chatID).
 		Scan(&c.ID, &c.ChatID, &c.Label, &c.Role, &enabled, &a, &p, &f, &findings, &monitoring,
-			&ws, &wf, &sl, &c.CreatedAt, &c.UpdatedAt)
+			&ws, &wf, &sl, &nh, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil || enabled != 1 {
 		return c, false
 	}
 	c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = true, a == 1, p == 1
 	c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = f == 1, findings == 1, monitoring == 1
 	c.NotifyWatchScanStarted, c.NotifyWatchScanFinished, c.NotifyScopeLanded = ws == 1, wf == 1, sl == 1
+	c.NotifyNewHost = nh == 1
 	return c, true
 }
 

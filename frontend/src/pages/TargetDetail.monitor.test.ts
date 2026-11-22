@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { changeBadgeVariant, monitorRowKind } from './TargetDetail'
+import { changeBadgeVariant, monitorRowKind } from '../components/changes/changesModel'
 import type { MonitoringChange } from '../types'
 
 // Regression: clicking the Changes tab used to render the PREVIOUS tab's rows
@@ -20,10 +20,13 @@ describe('Changes tab row helpers tolerate foreign rows', () => {
     const js = { change_type: 'js_change', severity: 'medium' } as MonitoringChange
     const sheet = { change_type: 'security:stylesheet_added', severity: 'info' } as MonitoringChange
     const header = { change_type: 'security:header_removed', severity: 'high' } as MonitoringChange
-    expect(monitorRowKind(css)).toBe('css')
+    // Stylesheets and scripts share the Scripts chip in the shared taxonomy.
+    expect(monitorRowKind(css)).toBe('scripts')
     expect(monitorRowKind(js)).toBe('scripts')
-    expect(monitorRowKind(sheet)).toBe('css')
+    expect(monitorRowKind(sheet)).toBe('scripts')
     expect(monitorRowKind(header)).toBe('headers')
+    expect(monitorRowKind({ change_type: 'scope_modified' } as MonitoringChange)).toBe('assets')
+    expect(monitorRowKind({ change_type: 'bounty_scope_change' } as MonitoringChange)).toBe('alerts')
     expect(changeBadgeVariant(css)).toBe('info')
     expect(changeBadgeVariant(js)).toBe('medium')
     expect(changeBadgeVariant(header)).toBe('high')

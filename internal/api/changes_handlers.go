@@ -46,15 +46,15 @@ type WatchRound struct {
 // order in the frontend.
 func changeCategoryExpr(col string) string {
 	return `CASE
-		WHEN ` + col + ` IN ('status_change','http_change','http_service_removed','new_http_service','page_change') THEN 'http'
+		WHEN ` + col + ` IN ('status_change','http_change','redirect_change','page_change') THEN 'http'
 		WHEN ` + col + ` IN ('js_change','css_change')
 		     OR ` + col + ` LIKE 'security:script_%'
 		     OR ` + col + ` LIKE 'security:stylesheet_%' THEN 'scripts'
 		WHEN ` + col + ` LIKE '%header%' THEN 'headers'
 		WHEN ` + col + ` LIKE 'security:%' THEN 'security'
 		WHEN ` + col + ` = 'tech_change' THEN 'tech'
-		WHEN ` + col + ` IN ('new_subdomain','subdomain_removed','host_status_change','scope_landed','scope_re_eligible') THEN 'assets'
-		WHEN ` + col + ` IN ('watch_failed','watch_kind_conflict','monitor_failed','monitor_escalation_started','scan_auto_paused') THEN 'alerts'
+		WHEN ` + col + ` IN ('new_subdomain','new_host','scope_landed','scope_modified','scope_removed') THEN 'assets'
+		WHEN ` + col + ` IN ('watch_failed','watch_kind_conflict','monitor_failed','monitor_escalation_started','scan_auto_paused','bounty_scope_change') THEN 'alerts'
 		ELSE 'http' END`
 }
 
@@ -115,20 +115,23 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		COALESCE(wc.severity,'info') AS severity, COALESCE(wc.old_value,'') AS old_value,
 		COALESCE(wc.new_value,'') AS new_value, COALESCE(wc.metadata,'{}') AS metadata,
 		COALESCE(wc.detected_at,'') AS detected_at
-		FROM watch_round_changes wc JOIN targets t ON t.id=wc.target_id WHERE 1=1`
+		FROM watch_round_changes wc JOIN targets t ON t.id=wc.target_id
+		WHERE wc.change_type='new_subdomain'`
 	if !isAdmin {
 		sourceWatch += ` AND t.owner_id=?`
 		args = append(args, uid)
 	}
 
-	scopeType := `CASE WHEN se.event_type='landed' THEN 'scope_landed'
-		WHEN se.event_type='re_eligible' THEN 'scope_re_eligible'
+	scopeType := `CASE WHEN se.event_type='added' THEN 'scope_landed'
+		WHEN se.event_type='modified' THEN 'scope_modified'
+		WHEN se.event_type='removed' THEN 'scope_removed'
 		ELSE COALESCE(se.event_type,'') END`
-	sourceScope := `SELECT se.id, 'scope' AS source, se.target_id, COALESCE(t.domain,'') AS target_name, '' AS task_id,
+	sourceScope := `SELECT se.id, 'bounty' AS source, se.target_id, COALESCE(t.domain,'') AS target_name, '' AS task_id,
 		COALESCE(se.identifier,'') AS url, ` + scopeType + ` AS change_type, ` + changeCategoryExpr(scopeType) + ` AS category,
-		'info' AS severity, '' AS old_value, COALESCE(se.identifier,'') AS new_value,
-		COALESCE(se.metadata,'{}') AS metadata, COALESCE(se.detected_at,'') AS detected_at
-		FROM watch_scope_events se JOIN targets t ON t.id=se.target_id WHERE 1=1`
+		'info' AS severity, COALESCE(se.old_json,'') AS old_value, COALESCE(se.new_json,'') AS new_value,
+		COALESCE(se.new_json,'{}') AS metadata, COALESCE(se.detected_at,'') AS detected_at
+		FROM bounty_scope_events se JOIN targets t ON t.id=se.target_id
+		WHERE se.event_type IN ('added','modified','removed')`
 	if !isAdmin {
 		sourceScope += ` AND t.owner_id=?`
 		args = append(args, uid)
@@ -141,7 +144,8 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		COALESCE(n.severity,'info') AS severity, '' AS old_value, COALESCE(n.body,'') AS new_value,
 		COALESCE(n.metadata,'{}') AS metadata, COALESCE(n.created_at,'') AS detected_at
 		FROM notifications n LEFT JOIN targets t ON t.id=n.target_id
-		WHERE COALESCE(n.type,'') <> 'scope_landed'`
+		WHERE COALESCE(n.type,'') IN ('watch_failed','watch_kind_conflict','monitor_failed',
+			'monitor_escalation_started','scan_auto_paused','bounty_scope_change')`
 	if !isAdmin {
 		// Keep target-less notices visible, as the bell does.
 		sourceNotification += ` AND (COALESCE(n.target_id,'')='' OR t.owner_id=?)`

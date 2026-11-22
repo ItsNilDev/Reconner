@@ -8,13 +8,37 @@ import type { ChangeEntry, WatchRound } from '../types'
 const changeRows: ChangeEntry[] = [
   {
     id: 'c1', source: 'watch', target_id: 't1', target_name: 'alpha.test',
+    task_id: 'round-1', url: 'alpha.test', change_type: 'new_subdomain',
+    category: 'assets', severity: 'info', seen: false,
+    old_value: '', new_value: '1 new subdomain(s) found on alpha.test',
+    metadata: { hosts: ['new.alpha.test'], total: 1 },
+    detected_at: '2026-01-02 10:00:00',
+  },
+  {
+    id: 'c2', source: 'bounty', target_id: 't2', target_name: 'beta.test',
+    task_id: '', url: 'beta.test/scope', change_type: 'scope_modified',
+    category: 'assets', severity: 'info', seen: false,
+    old_value: 'old.scope', new_value: 'new.scope',
+    detected_at: '2026-01-01 09:00:00',
+  },
+  {
+    id: 'c3', source: 'notification', target_id: 't1', target_name: 'alpha.test',
+    task_id: '', url: '', change_type: 'watch_failed',
+    category: 'alerts', severity: 'high', seen: false,
+    old_value: '', new_value: 'Watch round failed',
+    detected_at: '2026-01-01 08:00:00',
+  },
+  // Kept in the fixture so explicit category chips still exercise the wider
+  // history; both rows are hidden from the default real-events view.
+  {
+    id: 'c4', source: 'watch', target_id: 't1', target_name: 'alpha.test',
     task_id: 'round-1', url: 'https://alpha.test', change_type: 'status_change',
     category: 'http', severity: 'medium', seen: false,
     old_value: 'status=403 title=Forbidden', new_value: 'status=200 title=OK',
     detected_at: '2026-01-02 10:00:00',
   },
   {
-    id: 'c2', source: 'monitor', target_id: 't2', target_name: 'beta.test',
+    id: 'c5', source: 'monitor', target_id: 't2', target_name: 'beta.test',
     task_id: '', url: 'https://beta.test/app.js', change_type: 'js_change',
     category: 'scripts', severity: 'medium', seen: false,
     old_value: 'hash=aaa', new_value: 'hash=bbb',
@@ -86,20 +110,22 @@ describe('global Changes page', () => {
     render(<MemoryRouter><Changes /></MemoryRouter>)
 
     await screen.findByRole('heading', { name: 'Changes' })
-    expect(await screen.findByText('STATUS CODE')).toBeInTheDocument()
-    expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument()
+    expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
+    expect(screen.getByText('SCOPE MODIFIED')).toBeInTheDocument()
+    expect(screen.getByText('WATCH FAILED')).toBeInTheDocument()
     expect(screen.getAllByText('Watch').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('Deep').length).toBeGreaterThan(0)
-    expect(screen.getByText('403')).toBeInTheDocument()
-    expect(screen.getByText('200')).toBeInTheDocument()
-    expect(screen.getByText('https://alpha.test')).toBeInTheDocument()
+    expect(screen.getAllByText('Bounty').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Bell').length).toBeGreaterThan(0)
+    expect(screen.getByTitle(/Old: old\.scope/)).toBeInTheDocument()
+    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
+    expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument()
   })
 
   it('filters the feed by category chips with multi-select', async () => {
     const user = userEvent.setup()
     mockApi()
     render(<MemoryRouter><Changes /></MemoryRouter>)
-    await waitFor(() => expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: 'HTTP' }))
     await waitFor(() => expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument())
@@ -118,7 +144,7 @@ describe('global Changes page', () => {
     const user = userEvent.setup()
     const fetchMock = mockApi()
     render(<MemoryRouter><Changes /></MemoryRouter>)
-    await waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     const roundButton = screen.getByRole('button', { name: /alpha\.test.*finished/ })
     fetchMock.mockClear()
@@ -134,7 +160,7 @@ describe('global Changes page', () => {
     const user = userEvent.setup()
     const fetchMock = mockApi()
     render(<MemoryRouter><Changes /></MemoryRouter>)
-    await waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: 'Mark all read' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([input]) =>

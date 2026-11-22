@@ -102,9 +102,14 @@ Existing installs keep their current next-round time. After the next finished
 round, the new 12-hour interval applies. To get 24-hour rounds, set
 `watch_round_interval_hours` to `24` in System → Scanning.
 
-A normal watch round no longer writes a bell row. The bell shows only specific
-breadth changes: new eligible scope and a stopped watch chain. Telegram still
-sends the grouped round result when that chat option is on.
+The default Changes feed now shows one event per host first seen alive by an
+HTTP probe. Enumeration-only names, repeated resolves, and detail changes stay
+out of the feed. The first finished watch round is a baseline and announces
+nothing. `scope_landed`, `scope_modified`, and `scope_removed` now describe
+linked bounty program scope changes and keep the approval workflow. Watch-tier
+scope landings write only the silent audit trail. One grouped "New hosts" bell
+and Telegram message is sent per round for in-scope hosts. The new "New hosts"
+chat switch is on by default.
 
 The global ceiling is `min(MaxConcurrentScans, NumCPU, effectiveMaxConcurrent+1)`.
 The deep lane is capped by the memory guard; the watch lane takes only the slots

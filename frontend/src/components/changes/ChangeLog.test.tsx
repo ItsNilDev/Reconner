@@ -4,25 +4,39 @@ import ChangeLog from './ChangeLog'
 import { ws } from '../../lib/websocket'
 import type { ChangeEntry } from '../../types'
 
-const rowsA: ChangeEntry[] = [
-  {
-    id: 'a1', source: 'watch', target_id: 't1', target_name: 'alpha.test',
-    task_id: 'round-1', url: 'https://alpha.test', change_type: 'status_change',
-    category: 'http', severity: 'medium', seen: false,
-    old_value: 'status=403 title=Forbidden', new_value: 'status=200 title=OK',
-    detected_at: '2026-01-02 10:00:00',
-  },
-]
+// Real default-feed rows: a watch host discovery, an alert notification and a
+// program-scope row from the bounty feed.
+const watchHost: ChangeEntry = {
+  id: 'a1', source: 'watch', target_id: 't1', target_name: 'alpha.test',
+  task_id: 'round-1', url: 'alpha.test', change_type: 'new_subdomain',
+  category: 'assets', severity: 'info', seen: false,
+  old_value: '', new_value: '1 new subdomain(s) found on alpha.test',
+  metadata: { hosts: ['new.alpha.test'], total: 1 },
+  detected_at: '2026-01-02 10:00:00',
+}
 
-const rowsB: ChangeEntry[] = [
-  {
-    id: 'b1', source: 'notification', target_id: 't1', target_name: 'alpha.test',
-    task_id: '', url: '', change_type: 'new_subdomain',
-    category: 'assets', severity: 'medium', seen: false,
-    old_value: '', new_value: '1 new subdomain(s) found on alpha.test',
-    metadata: { hosts: ['new.alpha.test'], total: 1 },
-    detected_at: '2026-01-03 10:00:00',
-  },
+const alertRow: ChangeEntry = {
+  id: 'b1', source: 'notification', target_id: 't1', target_name: 'alpha.test',
+  task_id: '', url: 'https://alpha.test/alert', change_type: 'watch_failed',
+  category: 'alerts', severity: 'medium', seen: false,
+  old_value: '', new_value: 'Watch round failed',
+  detected_at: '2026-01-03 10:00:00',
+}
+
+const bountyScope: ChangeEntry = {
+  id: 'c1', source: 'bounty', target_id: 't2', target_name: 'beta.test',
+  task_id: '', url: 'beta.test/scope', change_type: 'scope_modified',
+  category: 'assets', severity: 'info', seen: false,
+  old_value: 'old.example', new_value: 'new.example',
+  detected_at: '2026-01-04 10:00:00',
+}
+
+// None of these belong in the default view.
+const noiseRows: ChangeEntry[] = [
+  { ...watchHost, id: 'n1', change_type: 'status_change', category: 'http', url: 'https://alpha.test', metadata: undefined, new_value: 'status=200' },
+  { ...alertRow, id: 'n2', change_type: 'finding', new_value: 'Finding text' },
+  { ...watchHost, id: 'n3', source: 'monitor', change_type: 'tech_change', category: 'tech', task_id: '', metadata: undefined },
+  { ...alertRow, id: 'n4', change_type: 'scan_deep' },
 ]
 
 function envelope(data: unknown[]) {
@@ -43,18 +57,25 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+function callsFor(fetchMock: ReturnType<typeof vi.fn>, prefix: string) {
+  return fetchMock.mock.calls.filter(([input]) => String(input).startsWith(prefix))
+}
+
 function changesCount(fetchMock: ReturnType<typeof vi.fn>) {
-  return fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/changes?')).length
+  return callsFor(fetchMock, '/api/changes?').length
+}
+
+function lastUrl(fetchMock: ReturnType<typeof vi.fn>, prefix: string): string {
+  const calls = callsFor(fetchMock, prefix)
+  return decodeURIComponent(String(calls[calls.length - 1][0]))
 }
 
 function lastChangesUrl(fetchMock: ReturnType<typeof vi.fn>): string {
-  const calls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/changes?'))
-  return decodeURIComponent(String(calls[calls.length - 1][0]))
+  return lastUrl(fetchMock, '/api/changes?')
 }
 
 function lastSeenAllUrl(fetchMock: ReturnType<typeof vi.fn>): string {
-  const calls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/changes/seen-all?'))
-  return decodeURIComponent(String(calls[calls.length - 1][0]))
+  return lastUrl(fetchMock, '/api/changes/seen-all?')
 }
 
 function installFetch(options?: { rows?: ChangeEntry[]; firstChanges?: Promise<Response> }) {
@@ -64,7 +85,7 @@ function installFetch(options?: { rows?: ChangeEntry[]; firstChanges?: Promise<R
     if (url.startsWith('/api/changes?')) {
       changesCalls++
       if (changesCalls === 1 && options?.firstChanges) return options.firstChanges
-      return envelope(options?.rows ?? rowsA)
+      return envelope(options?.rows ?? [watchHost])
     }
     if (url.startsWith('/api/watch/rounds?')) return envelope([])
     if (url.startsWith('/api/targets?')) return success([])
@@ -100,7 +121,7 @@ describe('ChangeLog loading and refresh', () => {
   it('renders cards and clears the skeleton after the first load', async () => {
     installFetch()
     render(<ChangeLog />)
-    expect(await screen.findByText('STATUS CODE')).toBeInTheDocument()
+    expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
     await vi.waitFor(() => {
       expect(document.querySelectorAll('.skeleton').length).toBe(0)
     })
@@ -109,36 +130,41 @@ describe('ChangeLog loading and refresh', () => {
   it('coalesces a refresh triggered during the first load and still clears the skeleton', async () => {
     vi.useFakeTimers()
     const first = deferred<Response>()
-    const fetchMock = installFetch({ firstChanges: first.promise, rows: rowsB })
+    const fetchMock = installFetch({ firstChanges: first.promise, rows: [alertRow] })
     const wsMock = captureWs()
     render(<ChangeLog />)
 
     expect(document.querySelectorAll('.skeleton').length).toBeGreaterThan(0)
-    wsMock.fire('task_progress')
+    wsMock.fire('task_finished')
     await vi.advanceTimersByTimeAsync(2500)
     // The refresh was folded into the in-flight load; no extra query yet.
     expect(changesCount(fetchMock)).toBe(1)
 
-    first.resolve(envelope(rowsA))
+    first.resolve(envelope([watchHost]))
     // The follow-up refresh runs once the first load finishes.
     await vi.waitFor(() => expect(changesCount(fetchMock)).toBe(2))
-    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('WATCH FAILED')).toBeInTheDocument())
     await vi.waitFor(() => {
       expect(document.querySelectorAll('.skeleton').length).toBe(0)
     })
   })
 
-  it('collapses a burst of WS events into one follow-up fetch', async () => {
+  it('reloads only on feed-write events, not on task_progress or scope_landed', async () => {
     vi.useFakeTimers()
     const fetchMock = installFetch()
     const wsMock = captureWs()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     const before = changesCount(fetchMock)
     wsMock.fire('task_progress')
     wsMock.fire('scope_landed')
-    wsMock.fire('notification_created')
+    await vi.advanceTimersByTimeAsync(2500)
+    expect(changesCount(fetchMock)).toBe(before)
+
+    wsMock.fire('task_finished')
+    wsMock.fire('changes_written')
+    wsMock.fire('bounty_scope_change')
     await vi.advanceTimersByTimeAsync(2500)
     await vi.waitFor(() => expect(changesCount(fetchMock)).toBe(before + 1))
 
@@ -151,11 +177,41 @@ describe('ChangeLog loading and refresh', () => {
     const fetchMock = installFetch()
     captureWs()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     const before = changesCount(fetchMock)
     await vi.advanceTimersByTimeAsync(60_000)
     expect(changesCount(fetchMock)).toBe(before)
+  })
+
+  it('requests at most 20 watch rounds', async () => {
+    const fetchMock = installFetch()
+    render(<ChangeLog />)
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+    expect(lastUrl(fetchMock, '/api/watch/rounds?')).toContain('limit=20')
+  })
+})
+
+describe('ChangeLog default feed', () => {
+  it('hides findings, deep notices and routine monitor diffs', async () => {
+    installFetch({ rows: [...noiseRows, bountyScope] })
+    render(<ChangeLog />)
+
+    expect(await screen.findByText('SCOPE MODIFIED')).toBeInTheDocument()
+    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
+    expect(screen.queryByText('TECHNOLOGIES')).not.toBeInTheDocument()
+    expect(screen.queryByText('FINDING')).not.toBeInTheDocument()
+    expect(screen.queryByText('SCAN DEEP')).not.toBeInTheDocument()
+  })
+
+  it('only renders http(s) links and promotes bare hosts', async () => {
+    installFetch({ rows: [bountyScope, { ...alertRow, url: 'javascript:alert(1)' }] })
+    render(<ChangeLog />)
+    expect(await screen.findByText('SCOPE MODIFIED')).toBeInTheDocument()
+
+    const hostLink = screen.getByText('beta.test/scope').closest('a')
+    expect(hostLink).toHaveAttribute('href', 'https://beta.test/scope')
+    expect(document.querySelector('a[href^="javascript:"]')).toBeNull()
   })
 })
 
@@ -163,7 +219,7 @@ describe('ChangeLog filter controls', () => {
   it('multi-selects categories and All resets the selection', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=scripts'))
@@ -178,7 +234,7 @@ describe('ChangeLog filter controls', () => {
   it('sends status-only, class, exact codes and search as query params', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: 'Status changes only' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_only=1'))
@@ -196,7 +252,7 @@ describe('ChangeLog filter controls', () => {
   it('drops invalid status codes instead of truncating them', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     fireEvent.change(screen.getByPlaceholderText('200,403'), { target: { value: '20,2000,abc,403' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_code=403'))
@@ -209,7 +265,7 @@ describe('ChangeLog filter controls', () => {
   it('passes the new filters through to mark-all-read', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=scripts'))
@@ -227,7 +283,7 @@ describe('ChangeLog filter controls', () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
     await vi.advanceTimersByTimeAsync(0)
-    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     // Type and click within the 300ms debounce window. The seen-all request
     // must carry the raw text, not the still-empty debounced value.

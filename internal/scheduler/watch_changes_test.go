@@ -70,18 +70,20 @@ func TestDiffWatchHTTPOtherChanges(t *testing.T) {
 	redirect := base
 	redirect.RedirectURL = "https://b.example"
 	got = diffWatchHTTP(map[string]watchHTTPSnapshot{base.URL: base}, map[string]watchHTTPSnapshot{base.URL: redirect}, true, false)
-	if len(got) != 1 || got[0].ChangeType != "http_change" {
-		t.Fatalf("redirect change: got %+v, want one http_change", got)
+	if len(got) != 1 || got[0].ChangeType != "redirect_change" || got[0].Severity != "low" {
+		t.Fatalf("redirect change: got %+v, want one low redirect_change", got)
 	}
 
+	// Removal is liveness state, not a detail row. diffWatchHTTP must stay silent.
 	got = diffWatchHTTP(map[string]watchHTTPSnapshot{base.URL: base}, map[string]watchHTTPSnapshot{}, true, false)
-	if len(got) != 1 || got[0].ChangeType != "http_service_removed" || got[0].Severity != "medium" {
-		t.Fatalf("removed url: got %+v, want medium http_service_removed", got)
+	if len(got) != 0 {
+		t.Fatalf("removed url: got %+v, want no rows (no http_service_removed)", got)
 	}
 
+	// A new URL on a brand-new host is owned by the host emitter.
 	got = diffWatchHTTP(map[string]watchHTTPSnapshot{}, map[string]watchHTTPSnapshot{base.URL: base}, true, false)
 	if len(got) != 0 {
-		t.Fatalf("new url on brand-new host: got %+v, want no rows", got)
+		t.Fatalf("new url: got %+v, want no rows (no new_http_service)", got)
 	}
 }
 
@@ -93,31 +95,25 @@ func TestDiffWatchHTTPNewServiceOnKnownHost(t *testing.T) {
 	after := map[string]watchHTTPSnapshot{base.URL: base, newPort.URL: newPort}
 
 	got := diffWatchHTTP(before, after, true, false)
-	if len(got) != 1 || got[0].ChangeType != "new_http_service" || got[0].Severity != "medium" {
-		t.Fatalf("new service on known host: got %+v, want one medium new_http_service", got)
-	}
-	if got[0].NewValue != newPort.URL || got[0].OldValue != "" {
-		t.Fatalf("new service values: got old=%q new=%q", got[0].OldValue, got[0].NewValue)
+	if len(got) != 0 {
+		t.Fatalf("new service on known host: got %+v, want no rows", got)
 	}
 }
 
-func TestDiffWatchHosts(t *testing.T) {
-	before := map[string]bool{"a.example": true, "gone.example": true}
-	after := map[string]bool{"a.example": true, "new.example": true}
+func TestDiffWatchHTTPIgnoresHostDiffAndCappedFlags(t *testing.T) {
+	old := watchHTTPSnapshot{URL: "https://a.example", StatusCode: 403, Title: "Same"}
+	cur := watchHTTPSnapshot{URL: "https://a.example", StatusCode: 200, Title: "Same"}
+	added := watchHTTPSnapshot{URL: "https://new.example", StatusCode: 200, Title: "New"}
+	evicted := watchHTTPSnapshot{URL: "https://zzz.example", StatusCode: 200, Title: "Old"}
 
-	got := diffWatchHosts(before, after, false)
-	if len(got) != 2 {
-		t.Fatalf("got %d changes, want 2", len(got))
-	}
-	types := map[string]bool{}
-	for _, c := range got {
-		types[c.ChangeType] = true
-		if c.Severity != "medium" {
-			t.Errorf("%s severity = %q, want medium", c.ChangeType, c.Severity)
+	before := map[string]watchHTTPSnapshot{old.URL: old, evicted.URL: evicted}
+	after := map[string]watchHTTPSnapshot{cur.URL: cur, added.URL: added}
+
+	for _, flags := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {
+		got := diffWatchHTTP(before, after, flags[0], flags[1])
+		if len(got) != 1 || got[0].ChangeType != "status_change" {
+			t.Fatalf("flags %v: got %+v, want one status_change", flags, got)
 		}
-	}
-	if !types["new_subdomain"] || !types["subdomain_removed"] {
-		t.Fatalf("types = %v, want new_subdomain and subdomain_removed", types)
 	}
 }
 
@@ -141,16 +137,32 @@ func TestSnapshotsFromDatabase(t *testing.T) {
 		t.Fatalf("snapshotWatchHTTP: %v", err)
 	}
 	got, ok := httpSnap["https://a.example"]
-	if !ok || got.StatusCode != 403 || got.Title != "Forbidden" || got.Server != "nginx" || got.Technologies != "react, jquery" {
+	if !ok || got.StatusCode != 403 || got.Title != "Forbidden" || got.Server != "nginx" || got.Technologies != "jquery, react" {
 		t.Fatalf("http snapshot = %+v", got)
 	}
 
-	hosts, err := snapshotWatchHosts(ctx, s.db, "t1")
-	if err != nil {
-		t.Fatalf("snapshotWatchHosts: %v", err)
+	svc := watchHTTPServiceForHost(ctx, s.db, "t1", "a.example")
+	if svc.URL != "https://a.example" || svc.StatusCode != 403 || svc.Title != "Forbidden" || svc.Technologies != "jquery, react" {
+		t.Fatalf("watchHTTPServiceForHost = %+v", svc)
 	}
-	if hosts["a.example"] != true {
-		t.Fatalf("host snapshot = %v, want a.example alive", hosts)
+	if unknown := watchHTTPServiceForHost(ctx, s.db, "t1", "unknown.example"); unknown.URL != "" {
+		t.Fatalf("unknown host service = %+v, want empty", unknown)
+	}
+
+	fp := watchFingerprint(svc)
+	if fp == "" {
+		t.Fatal("watchFingerprint is empty")
+	}
+	// URL and technologies are not part of the grouping fingerprint.
+	clone := svc
+	clone.URL = "https://other.example"
+	clone.Technologies = "vue"
+	if watchFingerprint(clone) != fp {
+		t.Fatal("fingerprint changed with URL/technologies")
+	}
+	clone.Server = "apache"
+	if watchFingerprint(clone) == fp {
+		t.Fatal("fingerprint did not change with server")
 	}
 }
 
@@ -222,55 +234,182 @@ func TestPruneWatchChangeRowsUsesGlobalWindow(t *testing.T) {
 	}
 }
 
-func TestDiffWatchHTTPCappedKeepsStatusFlip(t *testing.T) {
-	old := watchHTTPSnapshot{URL: "https://a.example", StatusCode: 403, Title: "Forbidden"}
-	cur := watchHTTPSnapshot{URL: "https://a.example", StatusCode: 200, Title: "OK"}
-	evicted := watchHTTPSnapshot{URL: "https://zzz.example", StatusCode: 200, Title: "Old"}
-
-	before := map[string]watchHTTPSnapshot{old.URL: old, evicted.URL: evicted}
-	after := map[string]watchHTTPSnapshot{cur.URL: cur}
-
-	got := diffWatchHTTP(before, after, true, true)
-	types := map[string]bool{}
-	for _, c := range got {
-		types[c.ChangeType] = true
-		if c.ChangeType == "http_service_removed" {
-			t.Fatal("capped snapshot must not report evicted URLs as removals")
+func TestEmitWatchNewHostsBaselineMarksWithoutFeedRows(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+	stmts := []string{
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','a.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','b.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at) VALUES ('t1','never-alive.example','2026-01-01 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-a','t1','a.example',1)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-b','t1','b.example',1)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
 		}
 	}
-	if !types["status_change"] {
-		t.Fatalf("types = %v, want status_change from the common window", types)
-	}
-}
 
-func TestDiffWatchHTTPNewServiceWithoutHostDiff(t *testing.T) {
-	svc := watchHTTPSnapshot{URL: "https://brand-new.example", StatusCode: 200, Title: "OK"}
-	before := map[string]watchHTTPSnapshot{}
-	after := map[string]watchHTTPSnapshot{svc.URL: svc}
-
-	got := diffWatchHTTP(before, after, false, false)
-	if len(got) != 1 || got[0].ChangeType != "new_http_service" {
-		t.Fatalf("without host diff: got %+v, want one new_http_service", got)
-	}
-
-	got = diffWatchHTTP(before, after, true, false)
+	// No other finished watch_scan task: this round is the baseline.
+	got := s.emitWatchNewHosts(ctx, "round-1", "t1")
 	if len(got) != 0 {
-		t.Fatalf("with host diff: got %+v, want no rows", got)
+		t.Fatalf("baseline emitted %+v, want no events", got)
+	}
+
+	var pending int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_hosts WHERE target_id='t1'
+		AND first_alive_at IS NOT NULL AND announced_at IS NULL`).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending alive hosts = %d, err = %v, want 0", pending, err)
+	}
+	var marked int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_hosts WHERE target_id='t1'
+		AND host='never-alive.example' AND announced_at IS NOT NULL`).Scan(&marked); err != nil || marked != 0 {
+		t.Fatalf("baseline marked never-alive host: count = %d, err = %v", marked, err)
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("baseline feed rows = %d, err = %v, want 0", rows, err)
 	}
 }
 
-func TestDiffWatchHostsCappedSuppressesRemovals(t *testing.T) {
-	before := map[string]bool{"a.example": true, "zzz.example": true}
-	after := map[string]bool{"a.example": true, "new.example": true}
-
-	got := diffWatchHosts(before, after, true)
-	for _, c := range got {
-		if c.ChangeType == "subdomain_removed" {
-			t.Fatal("capped host snapshot must not report evicted hosts as removals")
+func TestEmitWatchNewHostsEmitsOnceAndMarksAnnounced(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	stmts := []string{
+		`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`,
+		// A previous finished round makes the current round a non-baseline.
+		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
+			VALUES ('round-0','t1','watch_scan','finished',1,'[]',1)`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','a.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','never-alive.example','2026-01-01 00:00:00',NULL)`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','offline.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at,announced_at) VALUES ('t1','announced.example','2026-01-01 00:00:00','2026-01-02 00:00:00','2026-01-03 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-a','t1','a.example',1)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-never','t1','never-alive.example',1)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-offline','t1','offline.example',0)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-announced','t1','announced.example',1)`,
+		`INSERT INTO http_services (id,target_id,url,status_code,title,server,technologies)
+			VALUES ('h1','t1','https://a.example',200,'OK','nginx','["react"]')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
 		}
 	}
-	if len(got) != 1 || got[0].ChangeType != "new_subdomain" {
-		t.Fatalf("got %+v, want one new_subdomain", got)
+
+	got := s.emitWatchNewHosts(ctx, "round-1", "t1")
+	if len(got) != 1 {
+		t.Fatalf("emitted %d events, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.ChangeType != "new_subdomain" || c.NewValue != "a.example" || c.Severity != "medium" {
+		t.Fatalf("event = %+v, want medium new_subdomain for a.example", c)
+	}
+	if c.URL != "https://a.example" {
+		t.Errorf("event url = %q, want https://a.example", c.URL)
+	}
+	var meta struct {
+		Host   string   `json:"host"`
+		Hosts  []string `json:"hosts"`
+		Source string   `json:"source"`
+		Status int      `json:"status"`
+		Total  int      `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(c.Metadata), &meta); err != nil {
+		t.Fatalf("metadata is not JSON: %v", err)
+	}
+	if meta.Host != "a.example" || len(meta.Hosts) != 1 || meta.Hosts[0] != "a.example" {
+		t.Errorf("metadata hosts = %+v, want [a.example]", meta)
+	}
+	if meta.Source != "watch" || meta.Status != 200 || meta.Total != 1 {
+		t.Errorf("metadata = %+v, want source=watch status=200 total=1", meta)
+	}
+
+	// The event row and the announced marker are written together.
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE target_id='t1'
+		AND task_id='round-1' AND change_type='new_subdomain'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("feed rows = %d, err = %v, want 1", count, err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_hosts WHERE target_id='t1'
+		AND first_alive_at IS NOT NULL AND announced_at IS NULL`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("unannounced alive hosts = %d, err = %v, want 0", count, err)
+	}
+
+	// A second round must not announce the same host twice.
+	again := s.emitWatchNewHosts(ctx, "round-2", "t1")
+	if len(again) != 0 {
+		t.Fatalf("second round emitted %+v, want no events", again)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE target_id='t1'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("feed rows after second round = %d, err = %v, want 1", count, err)
+	}
+}
+
+func TestEmitWatchNewHostsGroupsIdenticalFingerprints(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	stmts := []string{
+		`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`,
+		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
+			VALUES ('round-0','t1','watch_scan','finished',1,'[]',1)`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','a.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','b.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-a','t1','a.example',1)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-b','t1','b.example',1)`,
+		`INSERT INTO http_services (id,target_id,url,status_code,title,server)
+			VALUES ('h1','t1','https://a.example',200,'OK','nginx')`,
+		`INSERT INTO http_services (id,target_id,url,status_code,title,server)
+			VALUES ('h2','t1','https://b.example',200,'OK','nginx')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	got := s.emitWatchNewHosts(ctx, "round-1", "t1")
+	if len(got) != 1 {
+		t.Fatalf("emitted %d events, want one grouped event: %+v", len(got), got)
+	}
+	var meta struct {
+		Hosts []string `json:"hosts"`
+		Total int      `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(got[0].Metadata), &meta); err != nil {
+		t.Fatalf("metadata is not JSON: %v", err)
+	}
+	if len(meta.Hosts) != 2 || meta.Hosts[0] != "a.example" || meta.Hosts[1] != "b.example" || meta.Total != 2 {
+		t.Fatalf("grouped hosts = %+v, want [a.example b.example] with total 2", meta)
+	}
+}
+
+func TestFlushScopeLandingsClosesAuditSilently(t *testing.T) {
+	s := newTestScheduler(t)
+	if _, err := s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO watch_scope_events
+		(id,target_id,identifier,event_type,announced) VALUES ('we-1','t1','a.example','landed',0)`); err != nil {
+		t.Fatalf("insert scope event: %v", err)
+	}
+
+	s.flushScopeLandings()
+
+	var announced int
+	if err := s.db.QueryRow(`SELECT announced FROM watch_scope_events WHERE id='we-1'`).Scan(&announced); err != nil || announced != 1 {
+		t.Fatalf("announced = %d, err = %v, want 1", announced, err)
+	}
+	var bells int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM notifications`).Scan(&bells); err != nil || bells != 0 {
+		t.Fatalf("notifications = %d, err = %v, want 0 (landing writes no bell)", bells, err)
+	}
+	var feedRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes`).Scan(&feedRows); err != nil || feedRows != 0 {
+		t.Fatalf("watch feed rows = %d, err = %v, want 0", feedRows, err)
 	}
 }
 
@@ -285,11 +424,11 @@ func TestPruneOrphanChangeSeen(t *testing.T) {
 			VALUES ('mc-1','t1','https://a.example','status_change','` + now + `')`,
 		`INSERT INTO watch_round_changes
 			(id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-			VALUES ('wc-1','t1','round-1','https://a.example','status_change','old','new','medium','{}','` + now + `')`,
+			VALUES ('wc-1','t1','round-1','https://a.example','new_subdomain','','a.example','medium','{}','` + now + `')`,
 		`INSERT INTO watch_scope_events (id,target_id,identifier,event_type,detected_at)
 			VALUES ('we-1','t1','a.example','landed','` + now + `')`,
 		`INSERT INTO notifications (id,target_id,type,title,created_at)
-			VALUES ('n-1','t1','scope_landed','Landed','` + now + `')`,
+			VALUES ('n-1','t1','watch_failed','Round failed','` + now + `')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {

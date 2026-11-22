@@ -44,6 +44,7 @@ type TelegramChat struct {
 	NotifyWatchScanStarted  bool   `json:"notify_watch_scan_started"`
 	NotifyWatchScanFinished bool   `json:"notify_watch_scan_finished"`
 	NotifyScopeLanded       bool   `json:"notify_scope_landed"`
+	NotifyNewHost           bool   `json:"notify_new_host"`
 	CreatedAt               string `json:"created_at"`
 	UpdatedAt               string `json:"updated_at"`
 }
@@ -203,7 +204,7 @@ func (b *TelegramBot) State(ctx context.Context) (TelegramState, error) {
 
 	rows, err := b.h.db.QueryContext(ctx, `SELECT id,chat_id,label,role,enabled,
 		notify_scan_started,notify_phase_finished,notify_scan_finished,notify_findings,notify_monitoring,
-		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,
+		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host,
 		created_at,updated_at FROM telegram_chats ORDER BY created_at`)
 	if err != nil {
 		return state, err
@@ -211,14 +212,15 @@ func (b *TelegramBot) State(ctx context.Context) (TelegramState, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var c TelegramChat
-		var enabled, a, p, f, findings, monitoring, ws, wf, sl int
+		var enabled, a, p, f, findings, monitoring, ws, wf, sl, nh int
 		if err := rows.Scan(&c.ID, &c.ChatID, &c.Label, &c.Role, &enabled, &a, &p, &f, &findings, &monitoring,
-			&ws, &wf, &sl, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&ws, &wf, &sl, &nh, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return state, err
 		}
 		c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = enabled == 1, a == 1, p == 1
 		c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = f == 1, findings == 1, monitoring == 1
 		c.NotifyWatchScanStarted, c.NotifyWatchScanFinished, c.NotifyScopeLanded = ws == 1, wf == 1, sl == 1
+		c.NotifyNewHost = nh == 1
 		state.Chats = append(state.Chats, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -327,12 +329,12 @@ func (b *TelegramBot) AddChat(ctx context.Context, c TelegramChat) (TelegramChat
 	c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = true, true, true
 	c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = true, true, true
 	c.NotifyWatchScanStarted, c.NotifyWatchScanFinished = false, false
-	c.NotifyScopeLanded = true
+	c.NotifyScopeLanded, c.NotifyNewHost = true, true
 	_, err := b.h.db.ExecContext(ctx, `INSERT INTO telegram_chats(id,chat_id,label,role,enabled,
 		notify_scan_started,notify_phase_finished,notify_scan_finished,notify_findings,notify_monitoring,
-		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed)
-		VALUES(?,?,?,?,1,1,1,1,1,1,?,?,?)`, c.ID, c.ChatID, c.Label, c.Role,
-		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded))
+		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host)
+		VALUES(?,?,?,?,1,1,1,1,1,1,?,?,?,?)`, c.ID, c.ChatID, c.Label, c.Role,
+		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return c, fmt.Errorf("that chat id is already configured")
@@ -362,11 +364,11 @@ func (b *TelegramBot) UpdateChat(ctx context.Context, id string, c TelegramChat)
 	}
 	res, err := b.h.db.ExecContext(ctx, `UPDATE telegram_chats SET label=?,role=?,enabled=?,
 		notify_scan_started=?,notify_phase_finished=?,notify_scan_finished=?,notify_findings=?,notify_monitoring=?,
-		notify_watch_scan_started=?,notify_watch_scan_finished=?,notify_scope_landed=?,
+		notify_watch_scan_started=?,notify_watch_scan_finished=?,notify_scope_landed=?,notify_new_host=?,
 		updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		c.Label, c.Role, boolInt(c.Enabled), boolInt(c.NotifyScanStarted), boolInt(c.NotifyPhaseFinished),
 		boolInt(c.NotifyScanFinished), boolInt(c.NotifyFindings), boolInt(c.NotifyMonitoring),
-		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), id)
+		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost), id)
 	if err != nil {
 		return err
 	}
@@ -633,7 +635,7 @@ func (b *TelegramBot) enqueue(category, eventKey, text string, keyboard *tgInlin
 		// Watch-tier categories. They map to their own per-chat switches, so the
 		// deep alerts and the breadth alerts never mix in one channel.
 		"watch_scan_started": "notify_watch_scan_started", "watch_scan_finished": "notify_watch_scan_finished",
-		"scope_landed": "notify_scope_landed",
+		"scope_landed": "notify_scope_landed", "new_host": "notify_new_host",
 	}[category]
 	if preference == "" {
 		return
@@ -724,8 +726,9 @@ func (b *TelegramBot) NotifyWatchScanStarted(taskID, targetID, domain string) {
 // host counts it produced. It stays off by default per chat: with many watch
 // projects this message repeats every round.
 func (b *TelegramBot) NotifyWatchScanFinished(taskID, targetID, domain, status string, duration time.Duration, stats map[string]int, skippedSummary string) {
-	text := fmt.Sprintf("Watch round %s\nTarget: %s\nDuration: %s\nHosts seen: %d · Alive: %d",
-		status, displayDomain(domain), shortDuration(duration), stats["subdomains"], stats["alive"])
+	text := fmt.Sprintf("Watch round %s\nTarget: %s\nDuration: %s\nHosts seen: %d · Alive: %d\nNew hosts: %d · Scope landed: %d",
+		status, displayDomain(domain), shortDuration(duration), stats["subdomains"], stats["alive"],
+		stats["new_hosts"], stats["landed"])
 	if skippedSummary != "" {
 		text += "\n" + skippedSummary
 	}
@@ -741,6 +744,17 @@ func (b *TelegramBot) NotifyScopeLanded(eventKey, summary string, hosts []string
 		text += "\n" + strings.Join(hosts, "\n")
 	}
 	b.enqueue("scope_landed", eventKey, text, nil)
+}
+
+// NotifyNewHosts delivers the grouped first-seen-alive alert for one watch
+// round. It is ON by default per chat; the separate per-chat switch lets an
+// operator mute this one high-volume signal without losing scope alerts.
+func (b *TelegramBot) NotifyNewHosts(eventKey, summary string, hosts []string, targetID string) {
+	text := "New hosts up\n" + summary
+	if len(hosts) > 0 {
+		text += "\n" + strings.Join(hosts, "\n")
+	}
+	b.enqueue("new_host", eventKey, text, b.scanKeyboard(targetID))
 }
 
 // Some first-class finding stores (verified Nuclei, backup exposure and open

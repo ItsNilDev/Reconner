@@ -1,7 +1,6 @@
 package scheduler
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -318,74 +317,19 @@ func (s *Scheduler) applyWatchTerminalRules(targetID, status string) {
 // recovery cancelled (a zombie from a crash). Without it the project stays due
 // in the past and the round restarts immediately after every restart.
 func (s *Scheduler) recoverWatchTask(targetID string) {
-	_, _ = s.db.Exec(`UPDATE targets SET watch_fail_count=COALESCE(watch_fail_count,0)+1,
-		watch_next_run=datetime('now','+' || ? || ' minutes')
-		WHERE id=? AND watch_only=1 AND COALESCE(watch_paused,0)=0`, s.watchGapMinutes(), targetID)
-}
-
-// watchRoundRoot narrows the enumeration roots of a watch round to ONE root.
-// A project with N domain assets costs N sequential enumeration rounds, so a
-// watch round rotates the root instead of sweeping all of them.
-func (s *Scheduler) watchRoundRoot(ctx context.Context, targetID, scope string, roots []string) []string {
-	if len(roots) == 0 {
-		return roots
-	}
-	var index int
-	_ = s.db.QueryRow(`SELECT COALESCE(watch_root_index,0) FROM targets WHERE id=?`, targetID).Scan(&index)
-	if index < 0 {
-		index = 0
-	}
-	idx := index % len(roots)
-	return []string{roots[idx]}
-}
-
-// advanceWatchRootIndex moves the rotation pointer after a round finished. It
-// is called only on a FINISHED round: a failed round keeps the same root, so
-// one network hiccup cannot skip a root for a full rotation. Two consecutive
-// failures on the SAME root advance it anyway, so one broken root cannot stop
-// the chain for every healthy root.
-func (s *Scheduler) advanceWatchRootIndex(ctx context.Context, targetID, scope string) {
-	// The task context is usually already cancelled at this point (the round
-	// just finished), so the lookup runs on a fresh context.
-	roots := s.loadSubdomainRoots(context.Background(), targetID, scope, "")
-	if len(roots) == 0 {
+	_, _ = s.db.Exec(`UPDATE targets SET watch_fail_count=COALESCE(watch_fail_count,0)+1
+		WHERE id=? AND watch_only=1 AND COALESCE(watch_paused,0)=0`, targetID)
+	var fails int
+	_ = s.db.QueryRow(`SELECT COALESCE(watch_fail_count,0) FROM targets WHERE id=?`, targetID).Scan(&fails)
+	if fails >= s.watchFailLimit() {
+		_, _ = s.db.Exec(`UPDATE targets SET watch_paused=1, watch_next_run=NULL
+			WHERE id=? AND watch_only=1`, targetID)
+		s.insertNotification(targetID, "watch_failed", "Watch rounds stopped",
+			fmt.Sprintf("%d consecutive watch rounds failed. Watching is paused for this project.", fails), "high")
 		return
 	}
-	var index int
-	_ = s.db.QueryRow(`SELECT COALESCE(watch_root_index,0) FROM targets WHERE id=?`, targetID).Scan(&index)
-	next := (index + 1) % len(roots)
-	_, _ = s.db.Exec(`UPDATE targets SET watch_root_index=? WHERE id=?`, next, targetID)
-}
-
-// watchRootFailLimit is how many consecutive FAILED rounds on the SAME root
-// trigger the poison-root escape (plan §3).
-const watchRootFailLimit = 2
-
-// recordWatchRootFailure counts one failed round on the current root of a
-// project and reports whether the rotation must advance now.
-//
-// The counter is per project and in memory: it exists only to stop a single
-// permanently broken domain from blocking every other root, so it does not need
-// to survive a restart. watch_fail_count keeps counting per project in the DB.
-func (s *Scheduler) recordWatchRootFailure(targetID string) bool {
-	s.mu.Lock()
-	fails := s.watchRootFails[targetID] + 1
-	if fails < watchRootFailLimit {
-		s.watchRootFails[targetID] = fails
-		s.mu.Unlock()
-		return false
-	}
-	delete(s.watchRootFails, targetID)
-	s.mu.Unlock()
-	return true
-}
-
-// resetWatchRootFailures clears the per-root counter. A finished round (or any
-// other terminal state that ends the chain) starts the next attempt fresh.
-func (s *Scheduler) resetWatchRootFailures(targetID string) {
-	s.mu.Lock()
-	delete(s.watchRootFails, targetID)
-	s.mu.Unlock()
+	_, _ = s.db.Exec(`UPDATE targets SET watch_next_run=datetime('now','+' || ? || ' minutes')
+		WHERE id=? AND watch_only=1 AND COALESCE(watch_paused,0)=0`, s.watchGapMinutes(), targetID)
 }
 
 // resumeTypeTag keeps the ORIGINAL task type when a task is resumed.

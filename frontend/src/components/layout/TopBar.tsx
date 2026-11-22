@@ -134,7 +134,13 @@ export const TopBar = () => {
     const load = async () => {
       try {
         const r = await notifApi.list(bucket)
-        if (alive) { setItems(r.notifications || []); setUnread(r.unread || 0) }
+        if (alive) {
+          // The server maps each bucket to its stored notification types. The
+          // bell shows every row it returns; the Changes feed has its own
+          // allow-list for routine diffs.
+          setItems(r.notifications || [])
+          setUnread(r.unread || 0)
+        }
       } catch { /* ignore */ }
     }
     load()
@@ -148,6 +154,7 @@ export const TopBar = () => {
       ws.on('notification_created', load),
       ws.on('task_finished', load),
       ws.on('scope_landed', load),
+      ws.on('bounty_scope_change', load),
       ws.on('bounty_catalog_sync', load),
       onNotificationsChanged(load),
     ]

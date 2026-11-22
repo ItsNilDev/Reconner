@@ -110,6 +110,7 @@ func (h *Handler) handleUpdateTelegramChat(w http.ResponseWriter, r *http.Reques
 		NotifyWatchScanStarted  *bool   `json:"notify_watch_scan_started"`
 		NotifyWatchScanFinished *bool   `json:"notify_watch_scan_finished"`
 		NotifyScopeLanded       *bool   `json:"notify_scope_landed"`
+		NotifyNewHost           *bool   `json:"notify_new_host"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid body")
@@ -147,6 +148,9 @@ func (h *Handler) handleUpdateTelegramChat(w http.ResponseWriter, r *http.Reques
 	}
 	if patch.NotifyScopeLanded != nil {
 		current.NotifyScopeLanded = *patch.NotifyScopeLanded
+	}
+	if patch.NotifyNewHost != nil {
+		current.NotifyNewHost = *patch.NotifyNewHost
 	}
 	if err := bot.UpdateChat(r.Context(), id, *current); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

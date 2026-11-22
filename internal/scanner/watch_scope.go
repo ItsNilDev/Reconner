@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,6 +15,13 @@ import (
 	"github.com/recon-platform/internal/database"
 	"golang.org/x/net/idna"
 )
+
+// watchScopeDB lets a landing write its asset row and audit event on the same
+// transaction. A DB and a Tx both satisfy it.
+type watchScopeDB interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
 
 // WatchScopeEntry is one eligible program asset identifier.
 //
@@ -236,6 +244,26 @@ func matchWatchHost(entries []WatchScopeEntry, host WatchScopeHost) (WatchScopeE
 // operator audit trail, announced=0 until the grouped message is sent).
 //
 // Returns the newly landed host values (empty when nothing was landed).
+// IsWatchScopeHostEligible reports whether a discovered host is inside the
+// eligible program scope of a project. It returns the owning program and asset
+// ids so the watch host lifecycle can store the match without repeating the
+// lookup. A project with no linked program has no eligible scope.
+func IsWatchScopeHostEligible(ctx context.Context, db *database.DB, targetID, rawHost string) (bool, string, string) {
+	entries, hasProgram, err := LoadWatchEligibleScope(ctx, db, targetID)
+	if err != nil || !hasProgram || len(entries) == 0 {
+		return false, "", ""
+	}
+	host, ok := normalizeWatchHost(rawHost)
+	if !ok {
+		return false, "", ""
+	}
+	entry, ok := matchWatchHost(entries, host)
+	if !ok {
+		return false, "", ""
+	}
+	return true, entry.ProgramID, entry.AssetID
+}
+
 func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, hosts []string, logFn LogFunc) []string {
 	if len(hosts) == 0 {
 		return nil
@@ -288,7 +316,13 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 // out-of-scope flag is cleared, a NEW event row is written and it is announced
 // again.
 func landWatchHost(ctx context.Context, db *database.DB, targetID string, host WatchScopeHost, entry WatchScopeEntry) (bool, error) {
-	assetID, source, metadata, found := lookupWatchAsset(ctx, db, targetID, host.Value)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	assetID, source, metadata, found := lookupWatchAsset(ctx, tx, targetID, host.Value)
 	if found {
 		if source != "watch:scope" {
 			return false, nil // owned by another source (program import): never rewritten
@@ -297,10 +331,10 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 			return false, nil // already known and in scope
 		}
 		// Re-eligible: clear the flag and announce it again with a new event.
-		if err := reactivateWatchAsset(ctx, db, targetID, assetID, host, entry); err != nil {
+		if err := reactivateWatchAsset(ctx, tx, targetID, assetID, host, entry); err != nil {
 			return false, err
 		}
-		return true, nil
+		return true, tx.Commit()
 	}
 
 	eventID := uuid.New().String()
@@ -311,20 +345,20 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 		"out_of_scope":  0,
 	}
 	metaJSON, _ := json.Marshal(meta)
-	if err := insertWatchScopeEvent(ctx, db, targetID, entry.ProgramID, host.Value, "landed", assetID, metaJSON); err != nil {
+	if err := insertWatchScopeEvent(ctx, tx, targetID, entry.ProgramID, host.Value, "landed", assetID, metaJSON); err != nil {
 		return false, err
 	}
 	// assets has UNIQUE(target_id, value): a row that already exists is left
 	// alone. The stored value is lowercased, because SQLite compares text with
 	// BINARY collation and "Example.com" would otherwise be a second row.
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status,monitor_enabled,metadata,updated_at)
 		VALUES(?,?,?,?, 'web','subdomain','watch:scope',?,'approved',0,?,CURRENT_TIMESTAMP)
 		ON CONFLICT(target_id,value) DO NOTHING`,
 		assetID, targetID, host.Value, host.Value, eventID, string(metaJSON)); err != nil {
 		return false, err
 	}
-	return true, nil
+	return true, tx.Commit()
 }
 
 // lookupWatchAsset finds the assets row for a host.
@@ -334,7 +368,7 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 // be two rows in the same project. Both paths must be able to REACTIVATE an
 // out-of-scope watch:scope row, otherwise a host that was landed with different
 // casing never comes back into scope.
-func lookupWatchAsset(ctx context.Context, db *database.DB, targetID, value string) (id, source, metadata string, found bool) {
+func lookupWatchAsset(ctx context.Context, db watchScopeDB, targetID, value string) (id, source, metadata string, found bool) {
 	err := db.QueryRowContext(ctx,
 		`SELECT id, COALESCE(source,''), COALESCE(metadata,'') FROM assets WHERE target_id = ? AND value = ?`,
 		targetID, value).Scan(&id, &source, &metadata)
@@ -353,7 +387,7 @@ func lookupWatchAsset(ctx context.Context, db *database.DB, targetID, value stri
 
 // reactivateWatchAsset clears the out-of-scope flag on a landed host and writes
 // a NEW audit event, so the grouped message announces it again.
-func reactivateWatchAsset(ctx context.Context, db *database.DB, targetID, assetID string, host WatchScopeHost, entry WatchScopeEntry) error {
+func reactivateWatchAsset(ctx context.Context, db watchScopeDB, targetID, assetID string, host WatchScopeHost, entry WatchScopeEntry) error {
 	meta := map[string]any{
 		"program_id":    entry.ProgramID,
 		"program_asset": entry.AssetID,
@@ -370,7 +404,7 @@ func reactivateWatchAsset(ctx context.Context, db *database.DB, targetID, assetI
 
 // insertWatchScopeEvent writes the audit row for a landing. announced stays 0
 // until the grouped message has claimed and sent it.
-func insertWatchScopeEvent(ctx context.Context, db *database.DB, targetID, programID, identifier, eventType, assetID string, metadata []byte) error {
+func insertWatchScopeEvent(ctx context.Context, db watchScopeDB, targetID, programID, identifier, eventType, assetID string, metadata []byte) error {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO watch_scope_events(id,target_id,program_id,identifier,event_type,asset_id,detected_at,announced,metadata)
 		VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,0,?)`,

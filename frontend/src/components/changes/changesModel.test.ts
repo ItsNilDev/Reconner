@@ -5,7 +5,9 @@ import {
   changeHosts,
   groupMonitorChanges,
   inlineDiffPieces,
+  isDefaultFeedRow,
   monitorRowKind,
+  NOTIFICATION_ALLOWED_TYPES,
   parseStatusTransition,
 } from './changesModel'
 import type { MonitoringChange } from '../../types'
@@ -16,6 +18,19 @@ describe('categoryForChangeType', () => {
     expect(categoryForChangeType('page_change')).toBe('http')
     expect(categoryForChangeType('new_subdomain')).toBe('assets')
     expect(categoryForChangeType('scope_landed')).toBe('assets')
+    expect(categoryForChangeType('scope_modified')).toBe('assets')
+    expect(categoryForChangeType('scope_removed')).toBe('assets')
+  })
+
+  it('maps alert change types to the alerts category', () => {
+    for (const type of NOTIFICATION_ALLOWED_TYPES) {
+      expect(categoryForChangeType(type)).toBe('alerts')
+    }
+    expect(categoryForChangeType('new_host')).toBe('assets')
+  })
+
+  it('maps redirect_change to http', () => {
+    expect(categoryForChangeType('redirect_change')).toBe('http')
   })
 
   it('routes stylesheets and scripts to scripts, not css', () => {
@@ -34,6 +49,31 @@ describe('categoryForChangeType', () => {
   it('falls back to http for unknown or missing types', () => {
     expect(categoryForChangeType('')).toBe('http')
     expect(categoryForChangeType('something_new')).toBe('http')
+  })
+})
+
+describe('isDefaultFeedRow', () => {
+  it('keeps watch host discoveries and bounty scope rows', () => {
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain' })).toBe(true)
+    for (const type of ['scope_landed', 'scope_modified', 'scope_removed']) {
+      expect(isDefaultFeedRow({ source: 'bounty', change_type: type })).toBe(true)
+    }
+  })
+
+  it('keeps only allow-listed alert notifications', () => {
+    for (const type of NOTIFICATION_ALLOWED_TYPES) {
+      expect(isDefaultFeedRow({ source: 'notification', change_type: type })).toBe(true)
+    }
+    expect(isDefaultFeedRow({ source: 'notification', change_type: 'finding' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'notification', change_type: 'scan_deep' })).toBe(false)
+  })
+
+  it('drops routine monitor and watch noise', () => {
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'tech_change' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain_extra' })).toBe(false)
+    expect(isDefaultFeedRow({ change_type: 'new_subdomain' })).toBe(false)
   })
 })
 

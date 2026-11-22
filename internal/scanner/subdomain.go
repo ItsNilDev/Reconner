@@ -313,7 +313,7 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 		afterNames := s.existingSubdomainSet(ctx, targetID)
 		newNames := newSubdomainNames(beforeNames, afterNames)
 		if n := len(newNames); n > 0 {
-			notifyWithMetadata(s.db, targetID, "new_subdomain", notificationTitle("new_subdomain"),
+			notifyWithMetadata(s.db, targetID, "new_host", notificationTitle("new_host"),
 				fmt.Sprintf("%d new subdomain(s) found on %s", n, domain), domain, "medium",
 				newSubdomainMetadata(newNames, n))
 		}
@@ -750,7 +750,7 @@ func (s *SubdomainScanner) vhostScan(ctx context.Context, targetID, domain strin
 				discovered++
 				logFn("warn", "vhost", fmt.Sprintf("Virtual host found: %s on %s (status %d, len %d vs baseline band %d–%d)", m.host, ip, m.probe.status, m.probe.length, minNorm, maxNorm))
 				if s.broadcast != nil {
-					s.broadcast("new_subdomain", map[string]any{"target_id": targetID, "subdomain": m.host, "ip": ip, "source": "vhost"})
+					s.broadcast("subdomain_resolved", map[string]any{"target_id": targetID, "subdomain": m.host, "ip": ip, "source": "vhost"})
 				}
 			}
 		}
@@ -1175,7 +1175,7 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	// Admission writes are COLLECTED and flushed in a single transaction after the
 	// resolution pass instead of one autocommit INSERT per name — on a target with
 	// hundreds/thousands of names the per-name commit was a real serial cost. The
-	// live "new_subdomain" broadcast still fires during resolution so the dashboard
+	// live "subdomain_resolved" broadcast still fires during resolution so the dashboard
 	// streams discoveries; only the DB write is batched.
 	type resolvedRow struct{ name, ip, source string }
 	var rows []resolvedRow
@@ -1206,7 +1206,7 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	}
 
 	// admit appends one classified name to the batched write set. Only names
-	// absent from `preexisting` stream the live "new_subdomain" event, and only
+	// absent from `preexisting` stream the live "subdomain_resolved" event, and only
 	// when they carry an A/AAAA answer (CNAME-only rows stay silent, ip == "").
 	admit := func(name, ip, source string) {
 		cmu.Lock()
@@ -1214,7 +1214,7 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 		isNew := !preexisting[name]
 		cmu.Unlock()
 		if isNew && ip != "" && s.broadcast != nil {
-			s.broadcast("new_subdomain", map[string]any{
+			s.broadcast("subdomain_resolved", map[string]any{
 				"target_id": targetID,
 				"subdomain": name,
 				"ip":        ip,

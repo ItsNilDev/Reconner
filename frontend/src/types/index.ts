@@ -330,7 +330,8 @@ export type ChangeCategory =
 
 export interface ChangeEntry {
   id: string
-  source: 'monitor' | 'watch' | 'scope' | 'notification'
+  // bounty holds program-scope rows written by the bounty feed (read-only).
+  source: 'monitor' | 'watch' | 'scope' | 'notification' | 'bounty'
   target_id: string
   target_name: string
   task_id?: string

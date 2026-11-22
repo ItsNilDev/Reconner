@@ -57,6 +57,22 @@ export function truncate(str: string | null | undefined, max: number): string {
   return str.length <= max ? str : str.slice(0, max) + '…'
 }
 
+// safeHref keeps feed links on http(s). Stored change rows can contain a bare
+// host ("example.test/path") or a hostile scheme ("javascript:..."). Return
+// undefined for anything unsafe so the caller can render plain text instead.
+export function safeHref(value: string | null | undefined): string | undefined {
+  const raw = (value || '').trim()
+  if (!raw) return undefined
+  if (/^https?:\/\//i.test(raw)) return raw
+  // Any explicit non-http scheme is unsafe. A bare host or //host is safe to
+  // promote to https; a relative path is not a feed link.
+  // A colon before digits is a port on a bare host, not a URL scheme.
+  if (/^[a-z][a-z\d+.-]*:(?!\d)/i.test(raw)) return undefined
+  const host = raw.replace(/^\/\//, '')
+  if (!host || host.startsWith('/') || /[\s<>"']/.test(host)) return undefined
+  return `https://${host}`
+}
+
 export function statusCodeColor(code: number): string {
   if (code >= 200 && code < 300) return 'text-severity-low'
   if (code >= 300 && code < 400) return 'text-accent'

@@ -181,36 +181,11 @@ func (s *Scheduler) flushScopeLandings() {
 		return
 	}
 
-	summary, hosts := s.summarizeScopeLandings(claimed)
-	if len(hosts) == 0 && summary == "" {
-		s.releaseScopeLandings(claimed)
-		return
-	}
-
-	// The event key is owned by the scheduler and is unique per window, so the
-	// Telegram outbox dedupes a retry of the same window.
-	sent := false
-	if s.notifier != nil {
-		eventKey := "scope_landed:" + claimed[0].EventID
-		s.notifier.NotifyScopeLanded(eventKey, summary, hosts)
-		sent = true
-	}
-	// The claim is closed either way: the in-app bell already has a row for
-	// every landing, and the hub event is what makes it appear live. Skipping
-	// the close when no Telegram bot is configured would leave the rows at
-	// announced=2 forever (and re-broadcast the same window every tick).
+	// Landing is an audit trail only. It carries no bell, feed row, Telegram
+	// message or socket event; the new-host emitter and real program scope
+	// changes own those channels now. Close the claim so it cannot be replayed.
 	s.markScopeLandingsSent(claimed)
-	if s.hub != nil {
-		s.hub.Broadcast("scope_landed", map[string]any{
-			"target_id": claimed[0].TargetID,
-			"count":     len(claimed),
-		})
-	}
-	if sent {
-		s.logger.Info("Sent grouped scope-landed message", "count", len(claimed), "hosts", len(hosts))
-	} else {
-		s.logger.Info("Broadcast scope-landed (no notifier configured)", "count", len(claimed), "hosts", len(hosts))
-	}
+	s.logger.Info("Closed silent watch landing audit rows", "count", len(claimed))
 }
 
 // claimScopeLandings marks the given rows as in flight and returns the ones it

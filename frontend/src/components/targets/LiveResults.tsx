@@ -11,7 +11,7 @@ interface LiveEvent {
 }
 
 const typeLabel: Record<string, { label: string; color: string }> = {
-  new_subdomain:      { label: 'Subdomain',    color: 'text-severity-low' },
+  subdomain_resolved:      { label: 'Subdomain',    color: 'text-severity-low' },
   new_js_finding:     { label: 'JS Secret',    color: 'text-severity-high' },
   new_reflected_param:{ label: 'Reflected',    color: 'text-severity-medium' },
   new_vuln_finding:   { label: 'Finding',      color: 'text-severity-critical' },
@@ -113,10 +113,10 @@ export const LiveResults = ({ targetId, active }: { targetId: string; active: bo
     if (!active) return
 
     const unsubs = [
-      ws.on('new_subdomain', (payload) => {
+      ws.on('subdomain_resolved', (payload) => {
         const p = payload as Record<string, string>
         if (p.target_id !== targetId) return
-        setEvents(prev => [{ id: counter++, type: 'new_subdomain', data: p, ts: Date.now() }, ...prev.slice(0, 199)])
+        setEvents(prev => [{ id: counter++, type: 'subdomain_resolved', data: p, ts: Date.now() }, ...prev.slice(0, 199)])
       }),
       ws.on('new_js_finding', (payload) => {
         const p = payload as Record<string, string>
@@ -192,7 +192,7 @@ export const LiveResults = ({ targetId, active }: { targetId: string; active: bo
                 <div key={ev.id} className="flex items-start gap-2 px-3 py-1.5 border-b border-border/50 last:border-0 hover:bg-surface-3/50 transition-colors">
                   <span className={cn('text-xs font-semibold shrink-0 w-20', meta.color)}>{meta.label}</span>
                   <span className="font-mono text-xs text-text-primary truncate">
-                    {ev.type === 'new_subdomain' && ev.data.subdomain}
+                    {ev.type === 'subdomain_resolved' && ev.data.subdomain}
                     {ev.type === 'new_js_finding' && `[${ev.data.type}] ${ev.data.value}`}
                     {ev.type === 'new_reflected_param' && `${ev.data.parameter} in ${ev.data.url}`}
                     {ev.type === 'new_vuln_finding' && `${ev.data.type}${ev.data.parameter ? ' (' + ev.data.parameter + ')' : ''} — ${ev.data.url || ''}`}

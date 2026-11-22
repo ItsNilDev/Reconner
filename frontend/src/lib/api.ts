@@ -398,8 +398,10 @@ export interface PagedResult<T> {
 // fetchPage returns one server page with its total. The global Changes view
 // uses this so a filter change or WS event costs one request, not a full walk
 // of every page. The per-target view still uses fetchAllPaged.
-async function fetchPage<T>(path: string, extra?: Record<string, string>): Promise<PagedResult<T>> {
-  const qs = new URLSearchParams({ ...(extra || {}) })
+async function fetchPage<T>(path: string, extra?: Record<string, string | number>): Promise<PagedResult<T>> {
+  const params: Record<string, string> = {}
+  for (const [key, value] of Object.entries(extra || {})) params[key] = String(value)
+  const qs = new URLSearchParams(params)
   const res = await fetch(`${BASE}${path}?${qs.toString()}`, {
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
@@ -437,7 +439,9 @@ export const changes = {
 }
 
 export const watchApi = {
-  rounds: (params?: Record<string, string>) => fetchAllPaged<WatchRound>('/watch/rounds', params),
+  // One page only. The rounds strip shows at most 20 rounds; walking every
+  // historical round just to slice(0, 20) in the UI wasted a full paged scan.
+  rounds: (params?: Record<string, string | number>) => fetchPage<WatchRound>('/watch/rounds', params),
 }
 
 export interface AllFinding {
@@ -508,7 +512,7 @@ export interface TelegramChat {
   id: string; chat_id: string; label: string; role: TelegramRole; enabled: boolean
   notify_scan_started: boolean; notify_phase_finished: boolean; notify_scan_finished: boolean
   notify_findings: boolean; notify_monitoring: boolean
-  notify_watch_scan_started: boolean; notify_watch_scan_finished: boolean; notify_scope_landed: boolean
+  notify_watch_scan_started: boolean; notify_watch_scan_finished: boolean; notify_scope_landed: boolean; notify_new_host: boolean
   created_at: string; updated_at: string
 }
 export interface TelegramState {

@@ -255,7 +255,6 @@ All watch numbers live in `internal/config/config.go` and are editable under
 | `WatchRoundIntervalHours` | 12 h | Normal wait between finished rounds of one project |
 | `WatchRoundsMinGap` | 30 min | Retry gap after a failed or interrupted round |
 
-A watch round covers all approved web roots. Root rotation is no longer used.
 | `WatchSourceTimeoutMinutes` | 5 | Per-discovery-source timeout; no shared round budget |
 | `WatchEnumerationSources` | `subfinder,assetfinder,chaos,findomain` | Enabled watch discovery sources (toggle each in the UI) |
 | `Limits.WatchHTTPThreads` | 10 | httpx threads per watch round (deep keeps `Workers.HTTPProbing`) |
@@ -264,6 +263,8 @@ A watch round covers all approved web roots. Root rotation is no longer used.
 | `WatchScopeEventsRetentionDays` | 180 days | Prune the scope landing audit trail |
 | `WatchNotifyHostCap` | 20 | Host names listed per grouped scope alert |
 | `WatchFailLimit` | 3 | Consecutive failed rounds before the chain pauses |
+
+A watch round covers all approved web roots. Root rotation is no longer used.
 
 The three concurrency values set under **System → Toolchain → Scanning** are
 authoritative. They are stored and returned exactly as entered. Each lane has a
@@ -296,6 +297,28 @@ with one log line.
   subdomains, HTTP services, and scope events age out by the retention knobs.
   Deep-tier data and finding tables are never pruned.
 
+### Watch Changes feed
+
+The default Changes feed shows one event per newly probed, online host: a
+subdomain first seen responding to HTTP. Enumeration and DNS records are state,
+not default-feed events. The first finished watch round is a baseline and
+announces nothing. A host that resolves but does not answer HTTP stays silent
+until a later round probes it online.
+
+New hosts are emitted after the `http_probe` phase. Any HTTP response counts,
+including redirects and error status codes. Identical responses are folded into
+one event with a fleet host list. At most `WatchNotifyHostCap` groups reach the
+feed. One aggregate event reports the number of hosts left out. Hosts outside
+linked program scope stay in audit tables but do not reach the feed or the bell.
+Status, page, technology, and redirect changes stay in the detail tier. They
+never enter the default feed.
+
+`scope_landed`, `scope_modified`, and `scope_removed` now mean changes in linked
+bounty program scope. They come from program sync and keep the approve/reject
+workflow. Watch-tier scope landings only write the silent audit trail used by
+Promote to Deep. Each finished round health message reports the number of new
+hosts and landed scope hosts.
+
 ## Telegram operations
 
 Configure the bot under **System → Integrations → Telegram**. Chats are
@@ -304,11 +327,12 @@ scan start, each terminal phase status, final results, monitoring changes, and
 validated findings.
 
 Watch rounds use separate templates and preferences: "Watch start", "Watch
-result", and "New scope". Watch start and result are off by default; "New scope"
-is on. Scope landings are grouped into one message per watch tick across all
-projects, with per-program counts and up to `WatchNotifyHostCap` host names. A
-tick with no new eligible scope sends nothing. Watch rounds never emit the deep
-scan start or phase messages.
+result", "New scope", and "New hosts". Watch start and result are off by default;
+"New scope" and "New hosts" are on. "New hosts" sends one grouped message per
+finished round with the in-scope hosts that answered HTTP. Watch-tier scope
+landings no longer send Telegram; they stay in the silent audit trail. Program
+scope changes still follow the "New scope" preference. Watch rounds never emit
+the deep scan start or phase messages.
 
 The bot uses long polling and a durable per-chat outbox. Operator actions are
 audited. Admin target deletion always requires inline confirmation.

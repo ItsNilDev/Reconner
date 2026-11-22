@@ -14,26 +14,52 @@ export const CHANGE_FILTERS: { id: ChangeFilter; label: string }[] = [
   { id: 'alerts', label: 'Alerts' },
 ]
 
+// Exact mirror of changeCategoryExpr in internal/api/changes_handlers.go.
+// Keep both lists in sync: the feed ships a `category` column computed there.
 export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   status_change: 'http',
   http_change: 'http',
-  http_service_removed: 'http',
-  new_http_service: 'http',
+  redirect_change: 'http',
   page_change: 'http',
   js_change: 'scripts',
   css_change: 'scripts',
   tech_change: 'tech',
   new_subdomain: 'assets',
-  subdomain_removed: 'assets',
-  host_status_change: 'assets',
+  new_host: 'assets',
   scope_landed: 'assets',
-  scope_re_eligible: 'assets',
-  security_header_removed: 'headers',
+  scope_modified: 'assets',
+  scope_removed: 'assets',
   watch_failed: 'alerts',
   watch_kind_conflict: 'alerts',
   monitor_failed: 'alerts',
   monitor_escalation_started: 'alerts',
   scan_auto_paused: 'alerts',
+  bounty_scope_change: 'alerts',
+}
+
+// The default feed and the bell deliberately show a small allow-list. Go
+// mirrors these lists in the feed query, so the API and the UI agree on what
+// counts as a real event. Findings, scan_deep and routine monitor diffs stay
+// out of the default view.
+export const NOTIFICATION_ALLOWED_TYPES = [
+  'watch_failed', 'watch_kind_conflict', 'monitor_failed',
+  'monitor_escalation_started', 'scan_auto_paused', 'bounty_scope_change',
+] as const
+
+export const BOUNTY_SCOPE_TYPES = ['scope_landed', 'scope_modified', 'scope_removed'] as const
+
+const notificationTypes: ReadonlySet<string> = new Set(NOTIFICATION_ALLOWED_TYPES)
+const bountyScopeTypes: ReadonlySet<string> = new Set(BOUNTY_SCOPE_TYPES)
+
+// isDefaultFeedRow keeps the default view free of routine monitor noise even
+// when the server sends a wider feed. Category chips opt out of this filter so
+// an operator can still inspect deep changes explicitly.
+export function isDefaultFeedRow(row: { source?: string; change_type?: string }): boolean {
+  const type = row.change_type || ''
+  if (row.source === 'watch') return type === 'new_subdomain'
+  if (row.source === 'bounty') return bountyScopeTypes.has(type)
+  if (row.source === 'notification') return notificationTypes.has(type)
+  return false
 }
 
 export function categoryForChangeType(changeType: string): ChangeCategory {

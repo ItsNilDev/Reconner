@@ -280,7 +280,7 @@ func (h *Handler) handleWatchScopeEvents(w http.ResponseWriter, r *http.Request)
 		h.writeError(w, http.StatusInternalServerError, "failed to read watch scope events")
 		return
 	}
-	h.writeSuccess(w, out)
+	h.writeSuccess(w, map[string]any{"events": out})
 }
 
 // handlePromoteWatchScope upgrades landed hosts to deep-tier seeds.

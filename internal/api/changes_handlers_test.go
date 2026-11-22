@@ -52,9 +52,9 @@ func TestListChangesScopedToOwner(t *testing.T) {
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-admin','t-admin','https://a','http_change','status=403 title=Forbidden','status=200 title=OK','high',CURRENT_TIMESTAMP)`)
 	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-bob','t-bob','round-1','https://b','status_change','403 title=Forbidden','200 title=OK','medium','{"old_code":403,"new_code":200}',CURRENT_TIMESTAMP)`)
+		VALUES ('wc-bob','t-bob','round-1','','new_subdomain','','b.example','medium','{"hosts":["b.example"]}',CURRENT_TIMESTAMP)`)
 	h.db.Exec(`INSERT INTO notifications (id,target_id,type,title,body,severity)
-		VALUES ('n-global',NULL,'catalog_sync','Catalog synced','ok','info')`)
+		VALUES ('n-global',NULL,'watch_failed','Round failed','ok','info')`)
 
 	rec := serveChanges(t, h, bobSID, "/api/changes", nil, h.handleListChanges)
 	if rec.Code != http.StatusOK {
@@ -72,7 +72,7 @@ func TestListChangesScopedToOwner(t *testing.T) {
 		t.Error("member saw another owner's monitoring change")
 	}
 	if !ids["wc-bob"] {
-		t.Error("member did not see own watch change")
+		t.Error("member did not see own new_subdomain")
 	}
 	if !ids["n-global"] {
 		t.Error("member did not see target-less notice")
@@ -86,7 +86,7 @@ func TestListChangesNotificationMetadataRoundTrip(t *testing.T) {
 	h, adminID := newIsoHandler(t)
 	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, adminID)
 	h.db.Exec(`INSERT INTO notifications (id,target_id,type,title,body,severity,metadata,created_at)
-		VALUES ('n-new-hosts','t1','new_subdomain','New host','2 new subdomain(s) found on one.example','medium',
+		VALUES ('n-scope','t1','bounty_scope_change','Scope changed','2 assets changed on one.example','medium',
 		'{"hosts":["a.example","b.example"],"truncated":false,"total":2}','2026-03-01 00:00:00')`)
 	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
 	if err != nil {
@@ -174,8 +174,10 @@ func TestListChangesFiltersAndPagination(t *testing.T) {
 	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, adminID)
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc1','t1','https://1','http_change','status=403 title=Forbidden','status=200 title=OK','high','2026-01-01 00:00:00')`)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('mc-js','t1','https://j','js_change','a','b','medium','2026-02-02 00:00:00')`)
 	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc1','t1','round-1','https://2','js_change','a','b','medium','{}','2026-02-01 00:00:00')`)
+		VALUES ('wc1','t1','round-1','','new_subdomain','','new.example','medium','{"hosts":["new.example"]}','2026-02-01 00:00:00')`)
 	h.db.Exec(`INSERT INTO notifications (id,target_id,type,title,body,severity,created_at)
 		VALUES ('n1','t1','watch_failed','Round failed','oops','high','2026-03-01 00:00:00')`)
 	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
@@ -189,10 +191,11 @@ func TestListChangesFiltersAndPagination(t *testing.T) {
 		want []string
 	}{
 		{"category http", "/api/changes?category=http", []string{"mc1"}},
-		{"category scripts", "/api/changes?category=scripts", []string{"wc1"}},
+		{"category scripts", "/api/changes?category=scripts", []string{"mc-js"}},
+		{"category assets", "/api/changes?category=assets", []string{"wc1"}},
 		{"category alerts", "/api/changes?category=alerts", []string{"n1"}},
 		{"severity high", "/api/changes?severity=high", []string{"mc1", "n1"}},
-		{"source monitor", "/api/changes?source=monitor", []string{"mc1"}},
+		{"source monitor", "/api/changes?source=monitor", []string{"mc1", "mc-js"}},
 		{"source watch", "/api/changes?source=watch", []string{"wc1"}},
 		{"source notification", "/api/changes?source=notification", []string{"n1"}},
 		{"task id", "/api/changes?task_id=round-1", []string{"wc1"}},
@@ -220,14 +223,14 @@ func TestListChangesFiltersAndPagination(t *testing.T) {
 		})
 	}
 
-	// Pagination: page 2 must skip the first row and the total must stay 3.
+	// Pagination: page 2 must skip the first row and the total must stay 4.
 	rec := serveChanges(t, h, sid, "/api/changes?page=2&limit=1", nil, h.handleListChanges)
 	var env changesEnvelope
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatal(err)
 	}
-	if env.Total != 3 || len(env.Data) != 1 {
-		t.Fatalf("page 2: total = %d, rows = %d, want 3 and 1", env.Total, len(env.Data))
+	if env.Total != 4 || len(env.Data) != 1 {
+		t.Fatalf("page 2: total = %d, rows = %d, want 4 and 1", env.Total, len(env.Data))
 	}
 	if env.Data[0].ID == "mc1" {
 		t.Error("page 2 repeated the first row")
@@ -365,18 +368,19 @@ func TestListChangesNewFilters(t *testing.T) {
 	// Deep status flip: http_change with status=NNN text, no metadata.
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-deep','t1','https://deep','http_change','status=403 title=Forbidden','status=200 title=OK','medium','2026-01-01 00:00:00')`)
-	// Watch status flip: status_change with structured metadata.
-	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-watch','t1','r1','https://watch','status_change','status=500 title=Error','status=200 title=OK','medium','{"old_code":500,"new_code":200}','2026-01-02 00:00:00')`)
+	// Watch status flip: status_change is a detail row in the audit table. The
+	// status filters parse it from the monitor-shaped value text.
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('wc-watch','t1','https://watch','status_change','status=500 title=Error','status=200 title=OK','medium','2026-01-02 00:00:00')`)
 	// Same status, title only.
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-title','t1','https://title','http_change','status=200 title=Old','status=200 title=New','low','2026-01-03 00:00:00')`)
 	// No status codes.
-	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-js','t1','r1','https://js','js_change','a','b','medium','{}','2026-01-04 00:00:00')`)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('wc-js','t1','https://js','js_change','a','b','medium','2026-01-04 00:00:00')`)
 	// Removal row. The producer writes a URL in old_value, not a status token.
-	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-removed','t1','r1','https://gone','http_service_removed','https://gone.example/app','','medium','{}','2026-01-05 00:00:00')`)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('wc-removed','t1','https://gone','http_service_removed','https://gone.example/app','','medium','2026-01-05 00:00:00')`)
 	// Over-long code: status=2000 must not parse as 200 (trailing-space guard).
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-longcode','t1','https://long','http_change','status=2000 title=Big','status=2001 title=Big2','low','2026-01-06 00:00:00')`)
@@ -493,14 +497,14 @@ func TestListChangesNewFiltersScopedToOwner(t *testing.T) {
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-admin','t-admin','https://a','http_change','status=403 title=Forbidden','status=200 title=OK','medium',CURRENT_TIMESTAMP)`)
 	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-bob','t-bob','r1','https://b','status_change','status=500 title=Error','status=200 title=OK','medium','{"old_code":500,"new_code":200}',CURRENT_TIMESTAMP)`)
+		VALUES ('wc-bob','t-bob','r1','','new_subdomain','','b.example','medium','{"hosts":["b.example"]}',CURRENT_TIMESTAMP)`)
 
 	for _, q := range []string{
 		"/api/changes?status_only=1",
 		"/api/changes?status_code=200",
 		"/api/changes?status_class=5",
 		"/api/changes?q=Forbidden",
-		"/api/changes?category=http,scripts",
+		"/api/changes?category=http,assets",
 	} {
 		rec := serveChanges(t, h, bobSID, q, nil, h.handleListChanges)
 		if rec.Code != http.StatusOK {
@@ -528,15 +532,14 @@ func TestListChangesStatusFiltersIgnoreFreeText(t *testing.T) {
 	// not status-bearing, so it must not match any status filter.
 	h.db.Exec(`INSERT INTO notifications (id,target_id,type,title,body,severity,created_at)
 		VALUES ('n-text','t1','monitor_failed','Scan failed','upstream replied status=404 title=Missing','high',CURRENT_TIMESTAMP)`)
-	// A bell that mirrors a real deep change: it carries the same type as the
-	// real row and repeats the token in its body. The source guard in
-	// changesStatusCodeExpr must exclude it, or it duplicates mc-real.
+	// A bell that mirrors a real change type. It is outside the notification
+	// allow-list, so it never reaches the feed at all.
 	h.db.Exec(`INSERT INTO notifications (id,target_id,type,title,body,severity,created_at)
 		VALUES ('n-mirror','t1','http_change','Status changed','https://mirror — status=404 title=Missing','medium',CURRENT_TIMESTAMP)`)
 	// A removal row carrying a status token in old_value. It is excluded by the
 	// explicit http_service_removed clause in each status filter.
-	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES ('wc-removed','t1','r1','https://gone','http_service_removed','status=404 title=Missing','','medium','{}',CURRENT_TIMESTAMP)`)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('wc-removed','t1','https://gone','http_service_removed','status=404 title=Missing','','medium',CURRENT_TIMESTAMP)`)
 
 	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
 	if err != nil {
@@ -594,6 +597,227 @@ func TestListChangesCategoryMalformed(t *testing.T) {
 	}
 	if len(env.Data) != 1 {
 		t.Errorf("category=all: ids = %v, want the row", idsOf(env.Data))
+	}
+}
+
+func TestChangesFeedSourceAllowLists(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, adminID)
+	h.db.Exec(`INSERT INTO bounty_programs (id, provider, external_id, handle, name)
+		VALUES ('p1','intigriti','ext-1','program-one','Program One')`)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+		VALUES ('mc-any','t1','https://1','http_change','a','b','low','2026-04-01 00:00:00')`)
+
+	// Only new_subdomain reaches the feed. Detail and removal rows stay in the
+	// audit table and are reachable through the rounds endpoint, not the feed.
+	watchRows := []string{
+		`'wc-new','t1','round-1','','new_subdomain','','new.example','medium','{}','2026-04-02 00:00:00'`,
+		`'wc-detail','t1','round-1','','status_change','a','b','low','{}','2026-04-02 00:00:00'`,
+		`'wc-removed','t1','round-1','','http_service_removed','https://gone','','medium','{}','2026-04-02 00:00:00'`,
+	}
+	for _, row := range watchRows {
+		stmt := `INSERT INTO watch_round_changes
+			(id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
+			VALUES (` + row + `)`
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("insert watch row: %v", err)
+		}
+	}
+
+	allowed := []string{
+		"n-watch-failed:watch_failed",
+		"n-watch-kind:watch_kind_conflict",
+		"n-monitor-failed:monitor_failed",
+		"n-escalation:monitor_escalation_started",
+		"n-auto-paused:scan_auto_paused",
+		"n-bounty-scope:bounty_scope_change",
+	}
+	blocked := []string{
+		"n-scope-landed:scope_landed",
+		"n-catalog-sync:catalog_sync",
+		"n-new-host:new_subdomain",
+	}
+	for _, spec := range append(append([]string{}, allowed...), blocked...) {
+		parts := bytes.SplitN([]byte(spec), []byte(":"), 2)
+		stmt := `INSERT INTO notifications (id,target_id,type,title,created_at) VALUES ('` +
+			string(parts[0]) + `','t1','` + string(parts[1]) + `','bell','2026-04-03 00:00:00')`
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("insert notification: %v", err)
+		}
+	}
+
+	// Program scope rows come from bounty_scope_events: added -> scope_landed,
+	// modified -> scope_modified, removed -> scope_removed. Other event types
+	// stay out of the feed.
+	scopeRows := []string{
+		`'se-added','t1','p1','added','new.example'`,
+		`'se-modified','t1','p1','modified','new.example'`,
+		`'se-removed','t1','p1','removed','new.example'`,
+		`'se-other','t1','p1','re_eligible','new.example'`,
+	}
+	for _, row := range scopeRows {
+		stmt := `INSERT INTO bounty_scope_events
+			(id,target_id,program_id,event_type,identifier,new_json,detected_at)
+			VALUES (` + row + `,'{"value":"new.example"}','2026-04-04 00:00:00')`
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("insert scope row: %v", err)
+		}
+	}
+
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAll := []string{
+		"mc-any", "wc-new", "n-watch-failed", "n-watch-kind", "n-monitor-failed",
+		"n-escalation", "n-auto-paused", "n-bounty-scope", "se-added", "se-modified", "se-removed",
+	}
+	cases := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{"all", "/api/changes", wantAll},
+		{"source monitor", "/api/changes?source=monitor", []string{"mc-any"}},
+		{"source watch", "/api/changes?source=watch", []string{"wc-new"}},
+		{"source notification", "/api/changes?source=notification", []string{
+			"n-watch-failed", "n-watch-kind", "n-monitor-failed", "n-escalation", "n-auto-paused", "n-bounty-scope",
+		}},
+		{"source bounty", "/api/changes?source=bounty", []string{"se-added", "se-modified", "se-removed"}},
+		{"category assets", "/api/changes?category=assets", []string{"wc-new", "se-added", "se-modified", "se-removed"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveChanges(t, h, sid, tc.path, nil, h.handleListChanges)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var env changesEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatal(err)
+			}
+			got := idsOf(env.Data)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ids = %v, want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Errorf("missing %q in %v", w, got)
+				}
+			}
+			if env.Total != len(tc.want) {
+				t.Errorf("total = %d, want %d", env.Total, len(tc.want))
+			}
+		})
+	}
+
+	// Alert types carry the alerts category. Blocked notification types never
+	// reach the feed under any category.
+	rec := serveChanges(t, h, sid, "/api/changes?category=alerts", nil, h.handleListChanges)
+	var alerts changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &alerts); err != nil {
+		t.Fatal(err)
+	}
+	alertIDs := idsOf(alerts.Data)
+	for _, id := range []string{"n-watch-failed", "n-watch-kind", "n-monitor-failed", "n-escalation", "n-auto-paused"} {
+		if !alertIDs[id] {
+			t.Errorf("missing alert %q in %v", id, alertIDs)
+		}
+	}
+	for _, id := range []string{"n-scope-landed", "n-catalog-sync", "n-new-host"} {
+		if alertIDs[id] {
+			t.Errorf("blocked notification %q leaked into alerts feed: %v", id, alertIDs)
+		}
+	}
+
+	// Scope rows carry source=bounty, mapped change types, and metadata from
+	// the program asset JSON.
+	rec = serveChanges(t, h, sid, "/api/changes?source=bounty", nil, h.handleListChanges)
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	types := map[string]string{}
+	for _, row := range env.Data {
+		if row.Source != "bounty" || row.Category != "assets" {
+			t.Errorf("%s: source = %q, category = %q; want bounty/assets", row.ID, row.Source, row.Category)
+		}
+		types[row.ID] = row.ChangeType
+		if row.ID == "se-added" && row.Metadata["value"] != "new.example" {
+			t.Errorf("se-added metadata = %+v, want value=new.example", row.Metadata)
+		}
+	}
+	if types["se-added"] != "scope_landed" || types["se-modified"] != "scope_modified" || types["se-removed"] != "scope_removed" {
+		t.Errorf("scope change types = %v, want scope_landed/scope_modified/scope_removed", types)
+	}
+}
+
+func TestChangesFeedOwnerScopingAllSources(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSID, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t-admin','admin.example',?)`, adminID)
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t-bob','bob.example',?)`, bob.ID)
+	h.db.Exec(`INSERT INTO bounty_programs (id, provider, external_id, handle, name)
+		VALUES ('p1','intigriti','ext-1','program-one','Program One')`)
+
+	stmts := []string{
+		`INSERT INTO monitoring_changes (id,target_id,url,change_type,detected_at)
+			VALUES ('mc-admin','t-admin','https://a','http_change',CURRENT_TIMESTAMP)`,
+		`INSERT INTO monitoring_changes (id,target_id,url,change_type,detected_at)
+			VALUES ('mc-bob','t-bob','https://b','http_change',CURRENT_TIMESTAMP)`,
+		`INSERT INTO watch_round_changes (id,target_id,task_id,change_type,detected_at)
+			VALUES ('wc-admin','t-admin','r1','new_subdomain',CURRENT_TIMESTAMP)`,
+		`INSERT INTO watch_round_changes (id,target_id,task_id,change_type,detected_at)
+			VALUES ('wc-bob','t-bob','r2','new_subdomain',CURRENT_TIMESTAMP)`,
+		`INSERT INTO bounty_scope_events (id,target_id,program_id,event_type,identifier,detected_at)
+			VALUES ('se-admin','t-admin','p1','added','a.example',CURRENT_TIMESTAMP)`,
+		`INSERT INTO bounty_scope_events (id,target_id,program_id,event_type,identifier,detected_at)
+			VALUES ('se-bob','t-bob','p1','modified','b.example',CURRENT_TIMESTAMP)`,
+		`INSERT INTO notifications (id,target_id,type,title,created_at)
+			VALUES ('n-admin','t-admin','watch_failed','failed',CURRENT_TIMESTAMP)`,
+		`INSERT INTO notifications (id,target_id,type,title,created_at)
+			VALUES ('n-bob','t-bob','monitor_failed','failed',CURRENT_TIMESTAMP)`,
+		`INSERT INTO notifications (id,target_id,type,title,created_at)
+			VALUES ('n-global',NULL,'watch_failed','failed',CURRENT_TIMESTAMP)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	rec := serveChanges(t, h, bobSID, "/api/changes", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	got := idsOf(env.Data)
+	want := []string{"mc-bob", "wc-bob", "se-bob", "n-bob", "n-global"}
+	if len(got) != len(want) {
+		t.Fatalf("ids = %v, want %v", got, want)
+	}
+	for _, id := range want {
+		if !got[id] {
+			t.Errorf("missing %q in %v", id, got)
+		}
+	}
+	for _, id := range []string{"mc-admin", "wc-admin", "se-admin", "n-admin"} {
+		if got[id] {
+			t.Errorf("member saw another owner's row %q", id)
+		}
+	}
+	if env.Total != len(want) {
+		t.Errorf("total = %d, want %d", env.Total, len(want))
 	}
 }
 

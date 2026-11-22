@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { groupMonitorChanges } from './TargetDetail'
+import { groupMonitorChanges } from '../components/changes/changesModel'
 import type { MonitoringChange } from '../types'
 
 const row = (over: Partial<MonitoringChange>): MonitoringChange => ({

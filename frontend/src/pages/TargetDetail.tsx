@@ -9,7 +9,11 @@ import { EvidenceViewer } from '../components/targets/EvidenceViewer'
 import { ChangeDiffViewer } from '../components/targets/ChangeDiffViewer'
 import { LiveResults } from '../components/targets/LiveResults'
 import { ws } from '../lib/websocket'
-import { timeAgo, timeUntil, statusCodeColor, truncate, cn } from '../lib/utils'
+import { timeAgo, timeUntil, statusCodeColor, truncate, cn, safeHref } from '../lib/utils'
+import {
+  CHANGE_FILTERS, OCCURRENCE_PAGE_SIZE, changeBadgeVariant, groupMonitorChanges,
+  monitorRowKind, type ChangeFilter, type MonitorChangeGroup,
+} from '../components/changes/changesModel'
 import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding, Parameter,
   DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService
@@ -19,82 +23,8 @@ const isScannableProjectAsset = (asset: Asset) =>
 	(asset.kind === 'web' && ['domain', 'wildcard', 'url', 'page', 'js', 'api'].includes(asset.asset_type || 'domain')) ||
 	(asset.kind === 'network' && ['ip', 'cidr'].includes(asset.asset_type || 'ip'))
 
-// Changes(/monitor) tab: filter buckets for the noise chips. The stylesheet
-// content tracker (css_change + security:stylesheet_*) turned this tab into a
-// steady stream; the chips let an operator pull one signal back out of it.
-type ChangeFilter = 'all' | 'security' | 'scripts' | 'css' | 'http' | 'tech' | 'headers'
-const CHANGE_FILTERS: { id: ChangeFilter; label: string }[] = [
-  { id: 'all', label: 'All' },
-  { id: 'security', label: 'Security' },
-  { id: 'scripts', label: 'Scripts' },
-  { id: 'css', label: 'Stylesheets' },
-  { id: 'http', label: 'HTTP' },
-  { id: 'tech', label: 'Tech' },
-  { id: 'headers', label: 'Headers' },
-]
-
-// Bucket order matters: the stylesheet/script markers win before the generic
-// "security:" prefix, so a security:stylesheet_* row lands in Stylesheets (not
-// Security), a security:script_* row in Scripts, and header removals in Headers.
-export const monitorRowKind = (c: MonitoringChange): ChangeFilter => {
-  // One render can hold rows from the PREVIOUS tab while the next tab's fetch
-  // is in flight (data is replaced only after the request resolves). Never
-  // assume the row really is a monitoring_changes row.
-  const ct = typeof c?.change_type === 'string' ? c.change_type : ''
-  if (ct === 'css_change' || ct.includes('stylesheet')) return 'css'
-  if (ct === 'js_change' || ct.includes('script')) return 'scripts'
-  if (ct.includes('header')) return 'headers'
-  if (ct.startsWith('security')) return 'security'
-  if (ct === 'tech_change') return 'tech'
-  return 'http'
-}
-
-// Badge color follows the stored severity (rows written since the severity
-// column carry one); older rows without it keep the old type-based estimate.
-export const changeBadgeVariant = (c: { severity?: string; change_type?: string }): 'high' | 'medium' | 'low' | 'info' => {
-  const sev = (c.severity || '').toLowerCase()
-  if (sev === 'high' || sev === 'medium' || sev === 'low' || sev === 'info') return sev
-  // Same stale-row hazard as monitorRowKind: the badge must render even when a
-  // previous tab's row is briefly shown under the Changes tab.
-  const ct = typeof c.change_type === 'string' ? c.change_type : ''
-  return ct === 'js_change' ? 'medium'
-    : ct.startsWith('security') || ct.includes('header') ? 'high'
-    : ct === 'tech_change' ? 'low'
-    : 'info'
-}
-
-// Changes-tab grouping: one row per (change_type, old_value, new_value), with
-// every occurrence kept for the expandable detail list. The key is stable
-// across refreshes, so an expanded group stays open when a live update makes a
-// newer row the representative.
-export interface MonitorChangeGroup {
-  key: string
-  rep: MonitoringChange
-  items: MonitoringChange[]
-  urls: string[]
-}
-
-// Bounds how many occurrence rows mount at once. A noisy target can repeat the
-// same change thousands of times; expanding all of them in one render freezes
-// the tab. The expansion footer pages through the rest.
-const OCCURRENCE_PAGE_SIZE = 200
-
-export function groupMonitorChanges(rows: MonitoringChange[]): MonitorChangeGroup[] {
-  const groups = new Map<string, MonitorChangeGroup>()
-  for (const c of rows) {
-    const key = `${c.change_type}\u0000${c.old_value}\u0000${c.new_value}`
-    const g = groups.get(key)
-    // Keep every occurrence, not just distinct URLs: the same URL can emit the
-    // same change more than once, and the old "+N more URLs" label hid those
-    // repeats entirely.
-    if (g) g.items.push(c)
-    else groups.set(key, { key, rep: c, items: [c], urls: [] })
-  }
-  for (const g of groups.values()) {
-    g.urls = [...new Set(g.items.map(i => i.url))]
-  }
-  return [...groups.values()]
-}
+// Changes-tab categories, badges and grouping are shared with the global feed
+// so both views agree on what Assets, Alerts and the other chips contain.
 
 // Projects created from the WP Scanner page carry this tag (see WPScanner.tsx) —
 // the same signal used there to decide this is a WordPress project, reused here
@@ -672,7 +602,6 @@ export default function TargetDetail() {
         open_redirect: 'redirects',
         nuclei: 'nuclei',
         vuln_scan: 'vulns',
-        monitor: 'monitor',
         wp_enum: 'wp-inventory',
         wp_users: 'wp-users',
         wp_endpoints: 'wp-endpoints',
@@ -711,6 +640,24 @@ export default function TargetDetail() {
       if (findingRefreshTimerRef.current) clearTimeout(findingRefreshTimerRef.current)
       findingRefreshTimerRef.current = setTimeout(() => loadTab(tab), 1200)
     })
+  }, [id, tab])
+
+  // Changes rows are written by watch rounds and by the bounty scope feed.
+  // Reload the open Changes tab on those events only — task_progress is a
+  // per-module tick and scope_landed is already covered by bounty_scope_change.
+  useEffect(() => {
+    if (tab !== 'monitor') return
+    const reload = (payload: unknown) => {
+      const p = payload as { target_id?: string }
+      if (p?.target_id && p.target_id !== id) return
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+      refreshTimerRef.current = setTimeout(() => loadTab('monitor'), 1200)
+    }
+    const offs = [
+      ws.on('changes_written', reload),
+      ws.on('bounty_scope_change', reload),
+    ]
+    return () => offs.forEach(off => off())
   }, [id, tab])
 
   // Detect scan start/finish
@@ -1899,6 +1846,7 @@ export default function TargetDetail() {
                     })}
                     {tab === 'monitor' && monitorGroupPage.map(g => {
                       const c = g.rep
+                      const cHref = safeHref(c.url)
                       const occurrences = g.items.length - 1
                       const shownCount = expandedOccurrences.get(g.key) ?? 0
                       const expanded = expandedOccurrences.has(g.key)
@@ -1907,7 +1855,9 @@ export default function TargetDetail() {
                           <tr className="table-row align-top">
                             <td className="table-cell max-w-xs">
                               <div className="flex items-center gap-1.5">
-                                <a href={c.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
+                                {cHref
+                                  ? <a href={cHref} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
+                                  : <span className="text-xs font-mono truncate">{truncate(c.url, 50)}</span>}
                                 <CopyButton text={c.url} />
                                 {/* Content-capture diff for monitored stylesheets/scripts.
                                     Legacy rows (recorded before capture) open too, but
@@ -1952,19 +1902,24 @@ export default function TargetDetail() {
                             </td>
                             <td className="table-cell text-xs whitespace-nowrap">{timeAgo(c.detected_at)}</td>
                           </tr>
-                          {expanded && g.items.slice(1, 1 + shownCount).map(it => (
-                            <tr key={it.id} className="table-row bg-bg-secondary/30 align-top">
-                              <td colSpan={5} className="table-cell text-[11px]">
-                                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pl-3 text-text-muted">
-                                  <span className="text-accent">↳</span>
-                                  <a href={it.url} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono break-all">{truncate(it.url, 80)}</a>
-                                  <CopyButton text={it.url} />
-                                  <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>
-                                  <span className="whitespace-nowrap">{timeAgo(it.detected_at)}</span>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
+                          {expanded && g.items.slice(1, 1 + shownCount).map(it => {
+                            const itHref = safeHref(it.url)
+                            return (
+                              <tr key={it.id} className="table-row bg-bg-secondary/30 align-top">
+                                <td colSpan={5} className="table-cell text-[11px]">
+                                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pl-3 text-text-muted">
+                                    <span className="text-accent">↳</span>
+                                    {itHref
+                                      ? <a href={itHref} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono break-all">{truncate(it.url, 80)}</a>
+                                      : <span className="font-mono break-all">{truncate(it.url, 80)}</span>}
+                                    <CopyButton text={it.url} />
+                                    <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>
+                                    <span className="whitespace-nowrap">{timeAgo(it.detected_at)}</span>
+                                  </div>
+                                </td>
+                              </tr>
+                            )
+                          })}
                           {expanded && occurrences > shownCount && (
                             <tr key={`more-${g.key}`} className="table-row bg-bg-secondary/30">
                               <td colSpan={5} className="table-cell text-[11px]">

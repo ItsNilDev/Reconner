@@ -174,6 +174,13 @@ func RunMigrations(db *DB) error {
 		alterTargetsAddWatchPaused,
 		createWatchScopeEventsTable,
 		createWatchRoundChangesTable,
+		alterSubdomainsAddFirstAliveAt,
+		alterSubdomainsAddLastAliveAt,
+		alterSubdomainsAddAliveMisses,
+		alterSubdomainsAddAnnouncedAt,
+		createWatchHostsTable,
+		alterHTTPServicesAddProbeTier,
+		alterTelegramChatsAddNotifyNewHost,
 		createChangeSeenTable,
 		createWatchTierIndexes,
 		alterTelegramChatsAddWatchPrefs,
@@ -200,8 +207,31 @@ func RunMigrations(db *DB) error {
 	if err := migrateTaskPhases(db); err != nil {
 		return fmt.Errorf("task phase ledger migration failed: %w", err)
 	}
+	if err := backfillWatchHosts(db); err != nil {
+		return fmt.Errorf("watch host lifecycle migration failed: %w", err)
+	}
 
 	return nil
+}
+
+// backfillWatchHosts seeds the new host lifecycle from the existing subdomains
+// rows. Already-alive hosts are marked announced so the first watch round after
+// an upgrade is a baseline and does not re-announce the whole fleet.
+func backfillWatchHosts(db *DB) error {
+	if _, err := db.Exec(`UPDATE subdomains SET
+		first_alive_at=COALESCE(first_alive_at,CASE WHEN is_alive=1 THEN COALESCE(last_seen,CURRENT_TIMESTAMP) END),
+		last_alive_at=COALESCE(last_alive_at,CASE WHEN is_alive=1 THEN COALESCE(last_seen,CURRENT_TIMESTAMP) END),
+		announced_at=COALESCE(announced_at,CASE WHEN is_alive=1 THEN CURRENT_TIMESTAMP END)
+		WHERE first_alive_at IS NULL OR last_alive_at IS NULL OR announced_at IS NULL`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`INSERT OR IGNORE INTO watch_hosts
+		(target_id,host,first_seen_at,first_alive_at,last_alive_at,alive_misses,announced_at,in_scope)
+		SELECT target_id,subdomain,COALESCE(created_at,last_seen,CURRENT_TIMESTAMP),
+			COALESCE(first_alive_at,CURRENT_TIMESTAMP),COALESCE(last_alive_at,CURRENT_TIMESTAMP),
+			0,announced_at,0
+		FROM subdomains WHERE is_alive=1`)
+	return err
 }
 
 // migrateTaskPhases gives pre-v3 tasks the same explicit execution ledger as
@@ -1881,6 +1911,40 @@ const alterTargetsAddWatchNextRun = `ALTER TABLE targets ADD COLUMN watch_next_r
 const alterTargetsAddWatchFailCount = `ALTER TABLE targets ADD COLUMN watch_fail_count INTEGER NOT NULL DEFAULT 0;`
 const alterTargetsAddWatchRootIndex = `ALTER TABLE targets ADD COLUMN watch_root_index INTEGER NOT NULL DEFAULT 0;`
 const alterTargetsAddWatchPaused = `ALTER TABLE targets ADD COLUMN watch_paused INTEGER NOT NULL DEFAULT 0;`
+
+// Watch host lifecycle. A host is announced at most once, when it is first
+// seen with a live HTTP response. The marker lives in watch_hosts so it
+// survives the 180-day watch_round_changes retention prune.
+const alterSubdomainsAddFirstAliveAt = `ALTER TABLE subdomains ADD COLUMN first_alive_at DATETIME;`
+const alterSubdomainsAddLastAliveAt = `ALTER TABLE subdomains ADD COLUMN last_alive_at DATETIME;`
+const alterSubdomainsAddAliveMisses = `ALTER TABLE subdomains ADD COLUMN alive_misses INTEGER NOT NULL DEFAULT 0;`
+const alterSubdomainsAddAnnouncedAt = `ALTER TABLE subdomains ADD COLUMN announced_at DATETIME;`
+
+const createWatchHostsTable = `
+CREATE TABLE IF NOT EXISTS watch_hosts (
+	target_id TEXT NOT NULL,
+	host TEXT NOT NULL,
+	first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	first_alive_at DATETIME,
+	last_alive_at DATETIME,
+	alive_misses INTEGER NOT NULL DEFAULT 0,
+	announced_at DATETIME,
+	in_scope INTEGER NOT NULL DEFAULT 0,
+	program_id TEXT DEFAULT '',
+	asset_id TEXT DEFAULT '',
+	metadata TEXT DEFAULT '{}',
+	PRIMARY KEY (target_id, host),
+	FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_watch_hosts_announced ON watch_hosts(target_id, announced_at, first_alive_at);`
+
+// Tier tag for HTTP rows. Watch rounds write 'watch'; deep scans write 'deep'.
+const alterHTTPServicesAddProbeTier = `ALTER TABLE http_services ADD COLUMN probe_tier TEXT DEFAULT '';`
+
+// Per-chat opt-in for the grouped new-host delivery. Existing chats default ON
+// because one new online subdomain per round is the signal the watch tier exists
+// to deliver.
+const alterTelegramChatsAddNotifyNewHost = `ALTER TABLE telegram_chats ADD COLUMN notify_new_host INTEGER NOT NULL DEFAULT 1;`
 
 // watch_scope_events is the audit trail of the auto-land: every host the watch
 // tier brought into a project's eligible scope, with the program it came from.

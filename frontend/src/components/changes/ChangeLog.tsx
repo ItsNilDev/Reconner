@@ -3,10 +3,10 @@ import { Link } from 'react-router-dom'
 import { changes, targets as targetsApi, watchApi } from '../../lib/api'
 import type { ChangeEntry, Target, WatchRound } from '../../types'
 import { Badge, Button, CopyButton, Empty, SkeletonRows } from '../ui'
-import { cn, timeAgo } from '../../lib/utils'
+import { cn, safeHref, timeAgo } from '../../lib/utils'
 import { ws } from '../../lib/websocket'
 import {
-  CHANGE_FILTERS, changeBadgeVariant, changeHosts, type ChangeFilter,
+  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isDefaultFeedRow, type ChangeFilter,
 } from './changesModel'
 import InlineChangeDiff from './InlineChangeDiff'
 import { ChangeDiffViewer } from '../targets/ChangeDiffViewer'
@@ -50,7 +50,10 @@ const FIELD_LABELS: Record<string, string> = {
   subdomain_removed: 'Host removed',
   host_status_change: 'Host status',
   scope_landed: 'Scope landed',
+  scope_modified: 'Scope modified',
+  scope_removed: 'Scope removed',
   scope_re_eligible: 'Scope re-eligible',
+  bounty_scope_change: 'Bounty scope change',
   security_header_removed: 'Security header',
   watch_failed: 'Watch failed',
   watch_kind_conflict: 'Watch conflict',
@@ -191,6 +194,7 @@ function SourceBadge({ source }: { source: string }) {
     watch: { label: 'Watch', className: 'border-accent/50 bg-accent/10 text-accent' },
     monitor: { label: 'Deep', className: 'border-border text-text-muted' },
     scope: { label: 'Scope', className: 'border-severity-medium/40 bg-severity-medium/10 text-severity-medium' },
+    bounty: { label: 'Bounty', className: 'border-severity-medium/40 bg-severity-medium/10 text-severity-medium' },
     notification: { label: 'Bell', className: 'border-severity-low/40 bg-severity-low/10 text-severity-low' },
   }
   const s = map[source] || { label: source, className: 'border-border text-text-muted' }
@@ -309,14 +313,14 @@ export default function ChangeLog({ targetId, compact }: Props) {
             }
             return merged
           }),
-        watchApi.rounds(roundTarget ? { target_id: roundTarget } : {}),
+        watchApi.rounds(roundTarget ? { target_id: roundTarget, limit: 20 } : { limit: 20 }),
       ])
       // Only the newest response may replace the rows. A stale response is
       // still cleared below, so it can never leave the skeleton stuck.
       if (seq !== requestSeq.current) return
       if (fetchedTotal !== null) setServerTotal(fetchedTotal)
       setRows(changeRows)
-      setRounds(roundRows)
+      setRounds(roundRows.data)
     } catch (e) {
       if (seq === requestSeq.current) setError(e instanceof Error ? e.message : 'Failed to load changes')
     } finally {
@@ -339,11 +343,12 @@ export default function ChangeLog({ targetId, compact }: Props) {
       if (reloadTimer.current) clearTimeout(reloadTimer.current)
       reloadTimer.current = setTimeout(() => { void load('refresh') }, 2500)
     }
+    // task_progress fires per module and scope_landed is already folded into
+    // the bounty scope feed. Neither should re-query the whole feed.
     const offs = [
-      ws.on('task_progress', schedule),
       ws.on('task_finished', schedule),
-      ws.on('scope_landed', schedule),
-      ws.on('notification_created', schedule),
+      ws.on('changes_written', schedule),
+      ws.on('bounty_scope_change', schedule),
     ]
     return () => {
       offs.forEach(off => off())
@@ -424,7 +429,16 @@ export default function ChangeLog({ targetId, compact }: Props) {
     }
   }
 
-  const visibleRows = useMemo(() => hideSeen ? rows.filter(r => !r.seen) : rows, [rows, hideSeen])
+  // The default view is the real-events feed. An explicit category, source,
+  // severity, status or text filter is a deliberate request to see the wider
+  // history, so it opts out of this client-side guard.
+  const defaultView = categories.has('all') && !source && !severity &&
+    !debouncedQ.trim() && !statusOnly && statusClasses.size === 0 &&
+    parseStatusCodes(debouncedCodes).length === 0
+  const visibleRows = useMemo(() => {
+    const base = hideSeen ? rows.filter(r => !r.seen) : rows
+    return defaultView ? base.filter(isDefaultFeedRow) : base
+  }, [rows, hideSeen, defaultView])
   const cards = useMemo(() => groupIntoCards(visibleRows), [visibleRows])
 
   return (
@@ -527,7 +541,7 @@ export default function ChangeLog({ targetId, compact }: Props) {
         />
         <select className="input w-auto py-1 text-xs" value={source} onChange={e => setSource(e.target.value)}>
           <option value="">All sources</option>
-          {['monitor', 'watch', 'scope', 'notification'].map(s => <option key={s} value={s}>{s}</option>)}
+          {['monitor', 'watch', 'bounty', 'notification'].map(s => <option key={s} value={s}>{s}</option>)}
         </select>
         <select className="input w-auto py-1 text-xs" value={severity} onChange={e => setSeverity(e.target.value)}>
           <option value="">All severities</option>
@@ -611,6 +625,7 @@ export default function ChangeLog({ targetId, compact }: Props) {
             const first = card.items[0]
             const canDiff = first.source === 'monitor' &&
               (first.change_type === 'css_change' || first.change_type === 'js_change') && !!first.url
+            const href = safeHref(card.url)
             return (
               <div
                 key={card.key}
@@ -624,9 +639,9 @@ export default function ChangeLog({ targetId, compact }: Props) {
                       {card.target_name || card.target_id || '—'}
                     </span>
                   )}
-                  {card.url && (
+                  {href && (
                     <a
-                      href={card.url}
+                      href={href}
                       target="_blank"
                       rel="noreferrer"
                       className="max-w-[420px] min-w-0 truncate text-xs text-accent hover:underline"
@@ -634,6 +649,11 @@ export default function ChangeLog({ targetId, compact }: Props) {
                     >
                       {card.url}
                     </a>
+                  )}
+                  {!href && card.url && (
+                    <span className="max-w-[420px] min-w-0 truncate text-xs text-text-muted" title={card.url}>
+                      {card.url}
+                    </span>
                   )}
                   <button
                     type="button"
@@ -770,9 +790,9 @@ export default function ChangeLog({ targetId, compact }: Props) {
             </div>
 
             <div className="mt-5 flex items-center gap-3">
-              {(targetId || selectedTargetId) && (
+              {detail.target_id && (
                 <Link
-                  to={`/targets/${targetId || selectedTargetId}`}
+                  to={`/targets/${detail.target_id}`}
                   className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-accent hover:bg-accent/20"
                 >
                   Open target →
