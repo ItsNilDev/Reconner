@@ -45,6 +45,8 @@ type TelegramChat struct {
 	NotifyWatchScanFinished bool   `json:"notify_watch_scan_finished"`
 	NotifyScopeLanded       bool   `json:"notify_scope_landed"`
 	NotifyNewHost           bool   `json:"notify_new_host"`
+	NotifyProgramScope      bool   `json:"notify_program_scope"`
+	NotifyHTTPStatus        bool   `json:"notify_http_status"`
 	CreatedAt               string `json:"created_at"`
 	UpdatedAt               string `json:"updated_at"`
 }
@@ -205,6 +207,7 @@ func (b *TelegramBot) State(ctx context.Context) (TelegramState, error) {
 	rows, err := b.h.db.QueryContext(ctx, `SELECT id,chat_id,label,role,enabled,
 		notify_scan_started,notify_phase_finished,notify_scan_finished,notify_findings,notify_monitoring,
 		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host,
+		notify_program_scope,notify_http_status,
 		created_at,updated_at FROM telegram_chats ORDER BY created_at`)
 	if err != nil {
 		return state, err
@@ -212,15 +215,15 @@ func (b *TelegramBot) State(ctx context.Context) (TelegramState, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var c TelegramChat
-		var enabled, a, p, f, findings, monitoring, ws, wf, sl, nh int
+		var enabled, a, p, f, findings, monitoring, ws, wf, sl, nh, ps, hs int
 		if err := rows.Scan(&c.ID, &c.ChatID, &c.Label, &c.Role, &enabled, &a, &p, &f, &findings, &monitoring,
-			&ws, &wf, &sl, &nh, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&ws, &wf, &sl, &nh, &ps, &hs, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return state, err
 		}
 		c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = enabled == 1, a == 1, p == 1
 		c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = f == 1, findings == 1, monitoring == 1
 		c.NotifyWatchScanStarted, c.NotifyWatchScanFinished, c.NotifyScopeLanded = ws == 1, wf == 1, sl == 1
-		c.NotifyNewHost = nh == 1
+		c.NotifyNewHost, c.NotifyProgramScope, c.NotifyHTTPStatus = nh == 1, ps == 1, hs == 1
 		state.Chats = append(state.Chats, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -326,15 +329,24 @@ func (b *TelegramBot) AddChat(ctx context.Context, c TelegramChat) (TelegramChat
 	// stays quiet: a watch round runs per project every 30 minutes, so its
 	// start/finish messages would flood the channel. The scope-landed alert is
 	// ON — a newly eligible host is the one event the operator must not miss.
-	c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = true, true, true
-	c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = true, true, true
+	// Routine scan start/phase/finish messages belong in Scan activity. A new
+	// chat starts quiet for those, while the four daily signals stay ON. The
+	// finding sweep still runs from the lifecycle callbacks (B6).
+	c.Enabled, c.NotifyScanStarted, c.NotifyPhaseFinished = true, false, false
+	c.NotifyScanFinished, c.NotifyFindings, c.NotifyMonitoring = false, true, true
 	c.NotifyWatchScanStarted, c.NotifyWatchScanFinished = false, false
 	c.NotifyScopeLanded, c.NotifyNewHost = true, true
+	// The four daily signals stay ON for a new chat. Routine scan lifecycle
+	// messages for the watch tier stay OFF (B9).
+	c.NotifyProgramScope, c.NotifyHTTPStatus = true, true
 	_, err := b.h.db.ExecContext(ctx, `INSERT INTO telegram_chats(id,chat_id,label,role,enabled,
 		notify_scan_started,notify_phase_finished,notify_scan_finished,notify_findings,notify_monitoring,
-		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host)
-		VALUES(?,?,?,?,1,1,1,1,1,1,?,?,?,?)`, c.ID, c.ChatID, c.Label, c.Role,
-		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost))
+		notify_watch_scan_started,notify_watch_scan_finished,notify_scope_landed,notify_new_host,
+		notify_program_scope,notify_http_status)
+		VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?)`, c.ID, c.ChatID, c.Label, c.Role,
+		boolInt(c.Enabled), boolInt(c.NotifyScanStarted), boolInt(c.NotifyPhaseFinished), boolInt(c.NotifyScanFinished),
+		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost),
+		boolInt(c.NotifyProgramScope), boolInt(c.NotifyHTTPStatus))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return c, fmt.Errorf("that chat id is already configured")
@@ -365,10 +377,12 @@ func (b *TelegramBot) UpdateChat(ctx context.Context, id string, c TelegramChat)
 	res, err := b.h.db.ExecContext(ctx, `UPDATE telegram_chats SET label=?,role=?,enabled=?,
 		notify_scan_started=?,notify_phase_finished=?,notify_scan_finished=?,notify_findings=?,notify_monitoring=?,
 		notify_watch_scan_started=?,notify_watch_scan_finished=?,notify_scope_landed=?,notify_new_host=?,
+		notify_program_scope=?,notify_http_status=?,
 		updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		c.Label, c.Role, boolInt(c.Enabled), boolInt(c.NotifyScanStarted), boolInt(c.NotifyPhaseFinished),
 		boolInt(c.NotifyScanFinished), boolInt(c.NotifyFindings), boolInt(c.NotifyMonitoring),
-		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost), id)
+		boolInt(c.NotifyWatchScanStarted), boolInt(c.NotifyWatchScanFinished), boolInt(c.NotifyScopeLanded), boolInt(c.NotifyNewHost),
+		boolInt(c.NotifyProgramScope), boolInt(c.NotifyHTTPStatus), id)
 	if err != nil {
 		return err
 	}
@@ -582,14 +596,51 @@ func (b *TelegramBot) drainOutbox(ctx context.Context) {
 	if err != nil || !enabled || token == "" {
 		return
 	}
+	// Drop pending rows whose category was muted after they were queued.
+	// Leaving them pending would flood the chat on re-enable, and the unique
+	// key would block a newer event of the same kind (review finding #8).
+	_, _ = b.h.db.ExecContext(ctx, `UPDATE telegram_outbox SET status='sent',sent_at=CURRENT_TIMESTAMP,
+		last_error='muted before delivery'
+		WHERE status='pending' AND id IN (
+			SELECT o.id FROM telegram_outbox o JOIN telegram_chats c ON c.id=o.chat_entry_id
+			WHERE CASE o.category
+			  WHEN 'scan_started' THEN c.notify_scan_started
+			  WHEN 'phase_finished' THEN c.notify_phase_finished
+			  WHEN 'scan_finished' THEN c.notify_scan_finished
+			  WHEN 'finding' THEN c.notify_findings
+			  WHEN 'monitoring' THEN c.notify_monitoring
+			  WHEN 'http_status' THEN c.notify_http_status
+			  WHEN 'program_scope' THEN c.notify_program_scope
+			  WHEN 'watch_scan_started' THEN c.notify_watch_scan_started
+			  WHEN 'watch_scan_finished' THEN c.notify_watch_scan_finished
+			  WHEN 'scope_landed' THEN c.notify_scope_landed
+			  WHEN 'new_host' THEN c.notify_new_host
+			  ELSE 1 END <> 1
+		)`)
 	type item struct {
 		id, chatID, message, keyboard string
 		attempts                      int
 	}
+	// Re-check the category switch at delivery time. A row queued before an
+	// operator muted the category must not be sent two seconds later (B11).
+	// Findings also get priority so a routine backlog cannot block them.
 	rows, err := b.h.db.QueryContext(ctx, `SELECT o.id,c.chat_id,o.message,o.keyboard_json,o.attempts
 		FROM telegram_outbox o JOIN telegram_chats c ON c.id=o.chat_entry_id
 		WHERE o.status='pending' AND o.next_attempt_at<=CURRENT_TIMESTAMP AND c.enabled=1
-		ORDER BY o.created_at LIMIT 20`)
+		  AND CASE o.category
+		    WHEN 'scan_started' THEN c.notify_scan_started
+		    WHEN 'phase_finished' THEN c.notify_phase_finished
+		    WHEN 'scan_finished' THEN c.notify_scan_finished
+		    WHEN 'finding' THEN c.notify_findings
+		    WHEN 'monitoring' THEN c.notify_monitoring
+		    WHEN 'http_status' THEN c.notify_http_status
+		    WHEN 'program_scope' THEN c.notify_program_scope
+		    WHEN 'watch_scan_started' THEN c.notify_watch_scan_started
+		    WHEN 'watch_scan_finished' THEN c.notify_watch_scan_finished
+		    WHEN 'scope_landed' THEN c.notify_scope_landed
+		    WHEN 'new_host' THEN c.notify_new_host
+		    ELSE 1 END = 1
+		ORDER BY CASE WHEN o.category='finding' THEN 0 ELSE 1 END, o.created_at LIMIT 20`)
 	if err != nil {
 		return
 	}
@@ -636,6 +687,7 @@ func (b *TelegramBot) enqueue(category, eventKey, text string, keyboard *tgInlin
 		// deep alerts and the breadth alerts never mix in one channel.
 		"watch_scan_started": "notify_watch_scan_started", "watch_scan_finished": "notify_watch_scan_finished",
 		"scope_landed": "notify_scope_landed", "new_host": "notify_new_host",
+		"http_status": "notify_http_status", "program_scope": "notify_program_scope",
 	}[category]
 	if preference == "" {
 		return
@@ -694,7 +746,7 @@ func (b *TelegramBot) NotifyNewVuln(findingID, targetID, domain, vulnType, sever
 	b.enqueue("finding", "finding:"+findingID, text, b.findingKeyboard(targetID))
 }
 
-func (b *TelegramBot) NotifyMonitorChange(targetID, domain, changeType, title, rawURL, oldVal, newVal string) {
+func (b *TelegramBot) NotifyMonitorChange(targetID, domain, changeType, title, rawURL, oldVal, newVal string, eventID ...string) {
 	text := "Monitor change\nTarget: " + displayDomain(domain) + "\nType: " + changeType
 	// The notification title is the human-readable summary ("3 new subdomain(s)
 	// found on x.com", "security header removed", …) — surface it so the alert
@@ -711,7 +763,49 @@ func (b *TelegramBot) NotifyMonitorChange(targetID, domain, changeType, title, r
 	if newVal != "" && newVal != title {
 		text += "\nNew: " + newVal
 	}
-	b.enqueue("monitoring", "monitor:"+targetID+":"+changeType+":"+strconv.FormatInt(time.Now().UnixNano(), 10), text, b.scanKeyboard(targetID))
+	key := "monitor:" + targetID + ":" + changeType + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if len(eventID) > 0 && eventID[0] != "" {
+		// Use the change id so retries and duplicate broadcasts dedupe on the
+		// outbox unique key instead of minting a fresh event every call (B10).
+		key = "monitor:" + eventID[0]
+	}
+	b.enqueue("monitoring", key, text, b.scanKeyboard(targetID))
+}
+
+// NotifyHTTPStatus delivers an actual HTTP status transition. It has its own
+// per-chat switch, so an operator can mute routine monitoring drift and still
+// receive status changes, or the reverse.
+func (b *TelegramBot) NotifyHTTPStatus(targetID, domain, changeType, title, rawURL, oldVal, newVal, eventID string) {
+	text := "HTTP status change\nTarget: " + displayDomain(domain)
+	if oldVal != "" {
+		text += "\nOld: " + oldVal
+	}
+	if newVal != "" {
+		text += "\nNew: " + newVal
+	}
+	if title != "" {
+		text += "\n" + title
+	}
+	if rawURL != "" {
+		text += "\n" + rawURL
+	}
+	key := "http-status:" + eventID
+	if eventID == "" {
+		key = "http-status:" + targetID + ":" + changeType + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	b.enqueue("http_status", key, text, b.scanKeyboard(targetID))
+}
+
+// NotifyProgramScope delivers an upstream program scope change. It uses a
+// stable event key so the outbox deduplicates a whole reconciliation window.
+func (b *TelegramBot) NotifyProgramScope(targetID, domain, programID, eventType, identifier, eventID string) {
+	text := "Program scope " + eventType + "\nTarget: " + displayDomain(domain) +
+		"\nProgram: " + displayDomain(programID) + "\nAsset: " + identifier
+	key := "program-scope:" + eventID
+	if eventID == "" {
+		key = "program-scope:" + programID + ":" + eventType + ":" + identifier
+	}
+	b.enqueue("program_scope", key, text, b.scanKeyboard(targetID))
 }
 
 // NotifyWatchScanStarted reports the start of a breadth/watch round. It is a
@@ -772,6 +866,11 @@ func (b *TelegramBot) enqueueValidFindingsSince(targetID string, since time.Time
 	}{
 		{`SELECT id,type,severity,url,COALESCE(parameter,''),'verified' FROM vuln_findings
 			WHERE target_id=? AND COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive' AND created_at>=?`, []any{targetID, sinceSQL}},
+		// A candidate promoted during verification keeps its old created_at,
+		// so the sweep must look at the promotion timestamp instead (B7).
+		{`SELECT id,type,severity,url,COALESCE(parameter,''),'promoted' FROM vuln_findings
+			WHERE target_id=? AND COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'
+			  AND verified_at>=? AND first_verified_notified=0`, []any{targetID, sinceSQL}},
 		{`SELECT id,template_name,severity,matched_url,'',COALESCE(verification,'unverified') FROM nuclei_findings
 			WHERE target_id=? AND verification='verified' AND verified_at>=?`, []any{targetID, sinceSQL}},
 		{`SELECT id,'open_redirect','medium',url,COALESCE(parameter,''),'verified' FROM open_redirect_findings
@@ -801,6 +900,9 @@ func (b *TelegramBot) enqueueValidFindingsSince(targetID string, since time.Time
 			text += "\nParameter: " + f.param
 		}
 		b.enqueue("finding", "finding:"+f.id, text, b.findingKeyboard(targetID))
+		if f.qualifier == "promoted" {
+			_, _ = b.h.db.Exec(`UPDATE vuln_findings SET first_verified_notified=1 WHERE id=?`, f.id)
+		}
 	}
 }
 

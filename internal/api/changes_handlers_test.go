@@ -368,10 +368,10 @@ func TestListChangesNewFilters(t *testing.T) {
 	// Deep status flip: http_change with status=NNN text, no metadata.
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-deep','t1','https://deep','http_change','status=403 title=Forbidden','status=200 title=OK','medium','2026-01-01 00:00:00')`)
-	// Watch status flip: status_change is a detail row in the audit table. The
-	// status filters parse it from the monitor-shaped value text.
-	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
-		VALUES ('wc-watch','t1','https://watch','status_change','status=500 title=Error','status=200 title=OK','medium','2026-01-02 00:00:00')`)
+	// Watch status flip: the producer writes a detail row in watch_round_changes.
+	// The feed widens the watch source for status-filtered requests only.
+	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
+		VALUES ('wc-watch','t1','task-1','https://watch','status_change','status=500 title=Error','status=200 title=OK','medium','{"old_code":500,"new_code":200}','2026-01-02 00:00:00')`)
 	// Same status, title only.
 	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
 		VALUES ('mc-title','t1','https://title','http_change','status=200 title=Old','status=200 title=New','low','2026-01-03 00:00:00')`)
@@ -411,7 +411,7 @@ func TestListChangesNewFilters(t *testing.T) {
 		{"code 200", "/api/changes?status_code=200", []string{"mc-deep", "wc-watch", "mc-title", "mc-pct"}},
 		{"code 403", "/api/changes?status_code=403", []string{"mc-deep"}},
 		{"multi category", "/api/changes?category=scripts,alerts", []string{"wc-js", "n-alert"}},
-		{"all plus category", "/api/changes?category=all,http", []string{"mc-deep", "wc-watch", "mc-title", "wc-removed", "mc-longcode", "mc-plain", "mc-pct"}},
+		{"all plus category", "/api/changes?category=all,http", []string{"mc-deep", "mc-title", "wc-removed", "mc-longcode", "mc-plain", "mc-pct"}},
 		{"q plain", "/api/changes?q=Forbidden", []string{"mc-deep"}},
 		{"q literal percent", "/api/changes?q=%25", []string{"mc-pct"}},
 	}
@@ -631,6 +631,7 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 		"n-escalation:monitor_escalation_started",
 		"n-auto-paused:scan_auto_paused",
 		"n-bounty-scope:bounty_scope_change",
+		"n-new-host-allowed:new_host",
 	}
 	blocked := []string{
 		"n-scope-landed:scope_landed",
@@ -670,7 +671,7 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 	}
 	wantAll := []string{
 		"mc-any", "wc-new", "n-watch-failed", "n-watch-kind", "n-monitor-failed",
-		"n-escalation", "n-auto-paused", "n-bounty-scope", "se-added", "se-modified", "se-removed",
+		"n-escalation", "n-auto-paused", "n-bounty-scope", "n-new-host-allowed", "se-added", "se-modified", "se-removed",
 	}
 	cases := []struct {
 		name string
@@ -681,10 +682,10 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 		{"source monitor", "/api/changes?source=monitor", []string{"mc-any"}},
 		{"source watch", "/api/changes?source=watch", []string{"wc-new"}},
 		{"source notification", "/api/changes?source=notification", []string{
-			"n-watch-failed", "n-watch-kind", "n-monitor-failed", "n-escalation", "n-auto-paused", "n-bounty-scope",
+			"n-watch-failed", "n-watch-kind", "n-monitor-failed", "n-escalation", "n-auto-paused", "n-bounty-scope", "n-new-host-allowed",
 		}},
 		{"source bounty", "/api/changes?source=bounty", []string{"se-added", "se-modified", "se-removed"}},
-		{"category assets", "/api/changes?category=assets", []string{"wc-new", "se-added", "se-modified", "se-removed"}},
+		{"category assets", "/api/changes?category=assets", []string{"wc-new", "n-new-host-allowed", "se-added", "se-modified", "se-removed"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -747,8 +748,10 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 			t.Errorf("se-added metadata = %+v, want value=new.example", row.Metadata)
 		}
 	}
-	if types["se-added"] != "scope_landed" || types["se-modified"] != "scope_modified" || types["se-removed"] != "scope_removed" {
-		t.Errorf("scope change types = %v, want scope_landed/scope_modified/scope_removed", types)
+	// A pending upstream proposal is surfaced as scope_proposed. Only an
+	// approved event is described as landed (A10).
+	if types["se-added"] != "scope_proposed" || types["se-modified"] != "scope_proposed" || types["se-removed"] != "scope_proposed" {
+		t.Errorf("scope change types = %v, want scope_proposed for pending events", types)
 	}
 }
 

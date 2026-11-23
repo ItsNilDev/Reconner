@@ -1,6 +1,9 @@
 package scanner
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestExclusions(t *testing.T) {
 	e := ParseExclusions("dev.example.com, *.staging.example.com, 10.0.0.0/24, https://admin.example.com/panel, 192.168.5.5")
@@ -54,4 +57,63 @@ func TestExclusions(t *testing.T) {
 	if ParseExclusions("a.com").Excludes("b.com") {
 		t.Error("unrelated host must not be excluded")
 	}
+}
+
+func TestExclusionSyntaxNormalization(t *testing.T) {
+	t.Run("leading dot stays a suffix rule", func(t *testing.T) {
+		e := ParseExclusions(".dev.example.com")
+		for _, h := range []string{"dev.example.com", "api.dev.example.com", "DEV.EXAMPLE.COM."} {
+			if !e.Excludes(h) {
+				t.Errorf("%q should be excluded", h)
+			}
+		}
+		if e.Excludes("example.com") || e.Excludes("notdev.example.com") {
+			t.Error("leading-dot rule must not match unrelated hosts")
+		}
+	})
+
+	t.Run("bare host:port blocks only that destination", func(t *testing.T) {
+		e := ParseExclusions("admin.example.com:8443")
+		if !e.Excludes("admin.example.com:8443") {
+			t.Error("host:port rule must match the exact destination")
+		}
+		if !e.Excludes("admin.example.com") {
+			t.Error("unknown port must be blocked conservatively")
+		}
+		if e.Excludes("admin.example.com:443") {
+			t.Error("a different known port must not be blocked")
+		}
+		if e.Excludes("example.com:8443") {
+			t.Error("a different host must not be blocked")
+		}
+	})
+
+	t.Run("bracketed IPv6 and port", func(t *testing.T) {
+		e := ParseExclusions("[2001:db8::1]:8443")
+		if !e.Excludes("[2001:db8::1]:8443") {
+			t.Error("bracketed IPv6 endpoint must be excluded")
+		}
+		v6 := ParseExclusions("2001:db8::2")
+		if !v6.Excludes("2001:db8::2") {
+			t.Error("bare IPv6 must be excluded")
+		}
+	})
+
+	t.Run("URL rule keeps host-wide meaning", func(t *testing.T) {
+		e := ParseExclusions("https://admin.example.com/panel")
+		if !e.Excludes("admin.example.com:443") || !e.Excludes("admin.example.com/other") {
+			t.Error("a URL rule must exclude the whole host")
+		}
+	})
+
+	t.Run("CIDR evaluates resolved addresses", func(t *testing.T) {
+		e := ParseExclusions("10.0.0.0/24")
+		ip := []net.IP{net.ParseIP("10.0.0.7")}
+		if !e.ExcludesWithIPs("host.example.com", ip) {
+			t.Error("hostname resolving into the CIDR must be excluded")
+		}
+		if e.ExcludesWithIPs("host.example.com", []net.IP{net.ParseIP("10.0.1.7")}) {
+			t.Error("hostname outside the CIDR must not be excluded")
+		}
+	})
 }

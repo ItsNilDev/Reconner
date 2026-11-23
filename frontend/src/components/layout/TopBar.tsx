@@ -141,7 +141,10 @@ export const TopBar = () => {
           setItems(r.notifications || [])
           setUnread(r.unread || 0)
         }
-      } catch { /* ignore */ }
+      } catch {
+        // A failed read must not fabricate an empty bell. Keep the last good
+        // list; the next poll or event will refresh it (review finding B3).
+      }
     }
     load()
     const t = setInterval(load, 60 * 1000) // poll every minute
@@ -171,9 +174,16 @@ export const TopBar = () => {
   }, [open])
 
   const markAllRead = async () => {
-    try { await notifApi.markRead(); notifyNotificationsChanged() } catch { /* ignore */ }
-    setItems(current => current.map(n => ({ ...n, is_read: true })))
-    setUnread(0)
+    try {
+      // Scope the bulk write to the open bucket. The server also scopes it,
+      // and a failed write must not clear local state (B3).
+      const res = await notifApi.markRead([], bucket)
+      setItems(current => current.map(n => ({ ...n, is_read: true })))
+      // The server counts unread across all buckets. Use its value, or the
+      // badge would return on the next poll with unread items elsewhere.
+      setUnread(typeof res?.unread === 'number' ? res.unread : 0)
+      notifyNotificationsChanged()
+    } catch { /* keep the previous read state on failure */ }
   }
 
   const openNotif = (n: Notification) => {

@@ -199,6 +199,8 @@ export function TelegramIntegration() {
                     <ChatToggle label="Watch result" checked={chat.notify_watch_scan_finished} disabled={busyChat === chat.id} onChange={v => updateChat(chat, { notify_watch_scan_finished: v })} />
                     <ChatToggle label="New scope" checked={chat.notify_scope_landed} disabled={busyChat === chat.id} onChange={v => updateChat(chat, { notify_scope_landed: v })} />
                     <ChatToggle label="New hosts" checked={chat.notify_new_host} disabled={busyChat === chat.id} onChange={v => updateChat(chat, { notify_new_host: v })} />
+                    <ChatToggle label="Program scope" checked={chat.notify_program_scope} disabled={busyChat === chat.id} onChange={v => updateChat(chat, { notify_program_scope: v })} />
+                    <ChatToggle label="HTTP status" checked={chat.notify_http_status} disabled={busyChat === chat.id} onChange={v => updateChat(chat, { notify_http_status: v })} />
                   </div>
                   <div className="flex gap-1 shrink-0">
                     <Button size="sm" variant="ghost" disabled={busyChat === chat.id || !chat.enabled} onClick={() => testChat(chat)}>Test</Button>

@@ -661,6 +661,61 @@ func TestReconcileSuspendsStaleNonWebAsset(t *testing.T) {
 	}
 }
 
+// TestReconcileRefreshesProgramDenySnapshot proves that a sync replaces only
+// the deny rules it owns. Manual rules survive, stale rules disappear, and a
+// newly excluded descendant is added to exclude_scope.
+func TestReconcileRefreshesProgramDenySnapshot(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{
+		Provider: "hackerone", ExternalID: "deny-1", Handle: "deny1", Name: "Deny 1",
+		Status: "live", ProgramType: "bug_bounty",
+		Assets: []Asset{
+			{ExternalID: "scope-in", Identifier: "acme.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+			{ExternalID: "scope-out", Identifier: "old.acme.test", AssetType: "DOMAIN", InScope: false, EligibleSubmission: false, Active: true},
+		},
+	}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{
+		Name: "Deny 1", AssetIDs: []string{p.Assets[0].ID}, MonitorEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := db.QueryRow(`SELECT exclude_scope FROM targets WHERE id=?`, projectID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, "old.acme.test") || !strings.Contains(raw, bountyExclusionMarker) {
+		t.Fatalf("import snapshot=%q, want marked old.acme.test", raw)
+	}
+	if _, err := db.Exec(`UPDATE targets SET exclude_scope = exclude_scope || char(10) || 'manual.example.test' WHERE id=?`, projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The program now permits old.acme.test and denies new.acme.test.
+	p.Assets = []Asset{
+		{ExternalID: "scope-in", Identifier: "acme.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+		{ExternalID: "scope-out", Identifier: "old.acme.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+		{ExternalID: "scope-out2", Identifier: "new.acme.test", AssetType: "DOMAIN", InScope: false, EligibleSubmission: false, Active: true},
+	}
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT exclude_scope FROM targets WHERE id=?`, projectID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, "old.acme.test") {
+		t.Fatalf("stale program rule survived sync: %q", raw)
+	}
+	if !strings.Contains(raw, "new.acme.test") {
+		t.Fatalf("new program deny rule missing: %q", raw)
+	}
+	if !strings.Contains(raw, "manual.example.test") {
+		t.Fatalf("manual rule was removed by sync: %q", raw)
+	}
+}
+
 func TestListScopeEventsHidesNonWebHistory(t *testing.T) {
 	svc, db := testCatalog(t)
 	p := Program{

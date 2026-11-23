@@ -19,7 +19,8 @@ function StatusPill({ code }: { code?: number }) {
 
 export default function InlineChangeDiff({ oldValue, newValue, changeType }: Props) {
   const { oldCode, newCode } = parseStatusTransition(oldValue, newValue)
-  if (changeType === 'status_change' && (oldCode || newCode)) {
+  const statusTypes = ['status_change', 'http_change', 'page_change']
+  if (statusTypes.includes(changeType) && (oldCode || newCode)) {
     return (
       <span className="inline-flex items-center gap-1.5" title={`${oldValue} → ${newValue}`}>
         <StatusPill code={oldCode} />

@@ -196,7 +196,13 @@ type Notifier interface {
 	NotifyPhaseFinished(taskID, targetID, domain, phase, status string, duration time.Duration, progress, total int)
 	NotifyScanFinished(taskID, targetID, domain, status string, duration time.Duration, stats map[string]int)
 	NotifyNewVuln(findingID, targetID, domain, vulnType, severity, url, parameter string)
-	NotifyMonitorChange(targetID, domain, changeType, title, url, oldVal, newVal string)
+	NotifyMonitorChange(targetID, domain, changeType, title, url, oldVal, newVal string, eventID ...string)
+	// HTTP status transitions are their own daily signal, with a quiet
+	// per-chat switch independent of general monitoring drift.
+	NotifyHTTPStatus(targetID, domain, changeType, title, url, oldVal, newVal, eventID string)
+	// Program scope changes reach every chat that watches scope, even when
+	// nobody favorited the program.
+	NotifyProgramScope(targetID, domain, programID, eventType, identifier, eventID string)
 	// Watch-tier events. The breadth/watch tier is a separate workload with its
 	// own volume, so it gets its own templates and its own per-chat switches.
 	// A watch round never sends the deep start/phase/finish messages.
@@ -323,6 +329,7 @@ func New(db *database.DB, hub *websocket.Hub, cfg *config.Config, log *logger.Lo
 
 	s.subdomainScanner = scanner.NewSubdomainScanner(db, exec, cfg, log, bc)
 	s.httpScanner = scanner.NewHTTPScanner(db, exec, cfg, log)
+	s.httpScanner.SetBroadcast(bc)
 	s.jsScanner = scanner.NewJSScanner(db, exec, cfg, log, bc)
 	s.jsEndpointScanner = scanner.NewJSEndpointScanner(db, exec, cfg, log, bc)
 	s.paramScanner = scanner.NewParamScanner(db, exec, cfg, log, bc)
@@ -394,11 +401,36 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		if targetID == "" {
 			return
 		}
-		var domain, title, rawURL, oldVal, newVal string
+		// Consume the values carried by the event. The old bridge re-queried
+		// the newest bell row by (target,type), which lost the old value and
+		// could pick the wrong row when two changes landed in one second (B10).
+		changeID, _ := m["change_id"].(string)
+		oldVal, _ := m["old_value"].(string)
+		newVal, _ := m["new_value"].(string)
+		rawURL, _ := m["url"].(string)
+		oldStatus, _ := m["old_status"].(int)
+		newStatus, _ := m["new_status"].(int)
+		var domain, title string
 		_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
-		_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,''),COALESCE(body,'') FROM notifications
-			WHERE target_id=? AND type=? ORDER BY created_at DESC LIMIT 1`, targetID, changeType).Scan(&title, &rawURL, &newVal)
-		s.notifier.NotifyMonitorChange(targetID, domain, changeType, title, rawURL, oldVal, newVal)
+		if changeID != "" {
+			_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,'') FROM notifications WHERE change_id=? ORDER BY created_at DESC LIMIT 1`, changeID).Scan(&title, &rawURL)
+		} else {
+			_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,'') FROM notifications
+				WHERE target_id=? AND type=? ORDER BY created_at DESC LIMIT 1`, targetID, changeType).Scan(&title, &rawURL)
+		}
+		// Only a real status transition belongs on the HTTP status channel.
+		// A title-only write keeps the same code (200/200); it must not
+		// produce a "status change" alert with two identical codes.
+		statusTransition := oldStatus > 0 && newStatus > 0 && oldStatus != newStatus
+		if statusTransition {
+			oldVal = fmt.Sprintf("HTTP %d", oldStatus)
+			newVal = fmt.Sprintf("HTTP %d", newStatus)
+		}
+		if statusTransition && (changeType == "http_change" || changeType == "status_change") {
+			s.notifier.NotifyHTTPStatus(targetID, domain, changeType, title, rawURL, oldVal, newVal, changeID)
+		} else {
+			s.notifier.NotifyMonitorChange(targetID, domain, changeType, title, rawURL, oldVal, newVal, changeID)
+		}
 		return
 	}
 	if event != "new_vuln_finding" {
@@ -412,16 +444,36 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		return
 	}
 
-	// Look up the authoritative projection. Detector-only candidates never have
-	// status='finding', so they cannot escape through this notification path.
+	// Look up the authoritative projection. Use the exact finding id from the
+	// broadcast when the verifier supplies it, so duplicate rows at the same
+	// type/URL/parameter cannot describe the wrong record (review finding #5).
 	var findingID, severity, domain string
-	if err := s.db.QueryRow(`SELECT id,severity FROM vuln_findings
-		WHERE target_id=? AND type=? AND url=? AND COALESCE(parameter,'')=?
-		  AND COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'
-		ORDER BY created_at DESC LIMIT 1`, targetID, vulnType, url, param).Scan(&findingID, &severity); err != nil {
+	findingID, _ = m["finding_id"].(string)
+	query := `SELECT id,severity FROM vuln_findings
+		WHERE target_id=? AND COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'`
+	var err error
+	if findingID != "" {
+		err = s.db.QueryRow(query+` AND id=?`, targetID, findingID).Scan(&findingID, &severity)
+	} else {
+		err = s.db.QueryRow(query+` AND type=? AND url=? AND COALESCE(parameter,'')=?
+			ORDER BY created_at DESC LIMIT 1`, targetID, vulnType, url, param).Scan(&findingID, &severity)
+	}
+	if err != nil {
 		return
 	}
 	_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+	// A verified finding gets a durable bell row as well as a Telegram alert.
+	// The bell had no subscription to finding events, so without this row the
+	// Findings bucket stayed empty for live detections (B2). Key the row on the
+	// finding id so a repeated broadcast cannot create a duplicate bell entry.
+	_, _ = s.db.Exec(`INSERT INTO notifications
+		(id,target_id,type,title,body,url,severity,is_read,metadata,change_id)
+		SELECT ?,?,?,?,?,?,?,0,'{}',?
+		WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE change_id=? AND type='new_vuln_finding')`,
+		uuid.NewString(), targetID, "new_vuln_finding",
+		"Verified finding: "+vulnType,
+		fmt.Sprintf("%s finding on %s", strings.ToUpper(severity), url),
+		"/targets/"+targetID, severity, findingID, findingID)
 	s.notifier.NotifyNewVuln(findingID, targetID, domain, vulnType, severity, url, param)
 }
 
@@ -1780,13 +1832,20 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			webPrimary = ""
 		}
 	}
+	// A managed project with no approved assets stays empty. The legacy
+	// targets.domain fallback applies only to projects that never had a managed
+	// asset list; otherwise suspending the last asset would silently re-open it.
+	managedNoAssets := false
 	seeded := webHosts
 	if !networkTask && scopeOverride == "" {
 		if managed := s.loadProjectWebSeeds(ctx, targetID); len(managed) > 0 {
 			seeded = managed
+		} else if s.projectHasManagedScope(ctx, targetID) {
+			seeded = nil
+			managedNoAssets = true
 		}
 	}
-	if !networkTask && len(seeded) == 0 && webPrimary != "" {
+	if !networkTask && len(seeded) == 0 && webPrimary != "" && !managedNoAssets {
 		seeded = []string{webPrimary}
 	}
 	// Subdomain enumeration is root-oriented (one domain per Run call), unlike
@@ -1803,9 +1862,16 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// parameters as insertion points so the whole pipeline (crawl/JS/DAST/XSS/SQLi)
 	// operates on that endpoint from the first pass. Collect the endpoint URLs so
 	// single-endpoint mode can confine the scan to them.
+	// Exclusions are the single choke point for every request the pipeline
+	// makes. Load them once here and attach them to the task context below, then
+	// skip seeds that are already out of scope before any row is written (A1).
+	excl := scanner.LoadExclusions(ctx, s.db, targetID)
 	var endpointSeeds []string
 	for _, tok := range seeded {
 		if tok = strings.TrimSpace(tok); tok == "" {
+			continue
+		}
+		if excl.ExcludesDestination(ctx, scanner.URLHost(tok)) {
 			continue
 		}
 		host, didSeed := scanner.SeedEndpointURL(ctx, s.db, targetID, tok)
@@ -1832,7 +1898,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	if scopeOverride != "" {
 		scopeHosts = webHosts
 	}
-	if !networkTask && len(scopeHosts) == 0 && webPrimary != "" {
+	if !networkTask && len(scopeHosts) == 0 && webPrimary != "" && !managedNoAssets {
 		scopeHosts = []string{webPrimary}
 	}
 	if len(scopeHosts) > 0 {
@@ -1842,6 +1908,12 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		// every DB-reading module fall back to the whole target, so confine the
 		// round to an empty host set instead.
 		ctx = scanner.WithNoHostScope(ctx)
+	}
+	// Every DB-reading module and HTTP request checks exclusions through this
+	// context choke point. It covers the deep consumers that only consult
+	// hostInScope, the breadth probe, and stored-service readers.
+	if !networkTask {
+		ctx = scanner.WithExclusions(ctx, excl)
 	}
 	// Parameter/archive collectors accept one root domain at a time. Keep an
 	// explicit root list so a project containing unrelated domains does not run
@@ -1938,6 +2010,14 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		ctx = scanner.WithSubdomainBrute(ctx, false)
 		ctx = scanner.WithSubdomainRecursion(ctx, false)
 		ctx = scanner.WithASNDiscovery(ctx, false)
+		// Program-linked rounds use the strict apex/wildcard boundary before
+		// probing, so a descendant of an exact asset is never requested. Manual
+		// watch projects keep the broad matcher because they have no program.
+		if len(scopeOverride) == 0 {
+			if entries, linked, err := scanner.LoadWatchEligibleScope(ctx, s.db, targetID); err == nil && linked {
+				ctx = scanner.WithStrictWatchScope(ctx, entries)
+			}
+		}
 	}
 	// Single-endpoint mode: confine the pipeline to the seeded endpoint URL(s) and
 	// the paths under them. Also force the slow subdomain brute OFF (there is one
@@ -2327,6 +2407,14 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			}
 		}
 
+		// A watch HTTP probe is the one phase whose before/after state carries a
+		// daily signal: real status transitions. Snapshot before the request so
+		// the diff sees the stored baseline, not the value the probe just wrote.
+		watchDiff := taskType == watchScanType && module == ModuleHTTPProbe
+		var watchBefore map[string]watchHTTPSnapshot
+		if watchDiff {
+			watchBefore, _ = snapshotWatchHTTP(ctx, s.db, targetID)
+		}
 		s.startTaskPhase(taskID, module)
 		resultCh := make(chan phaseRunResult, 1)
 		go func() {
@@ -2338,14 +2426,22 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		if forced {
 			logFn("warn", "scheduler", fmt.Sprintf("Phase %q did not stop within %s after cancellation; force-released scheduler ownership.", module, phaseStopGrace))
 		}
-		_ = modCtx.Err()
+		modCtxErr := modCtx.Err()
 		skipped, timedOut := finishPhase()
 		phaseStatus, phaseReason := phaseOutcome(err, skipped, timedOut, ctx.Err())
 		// The single new-host event is emitted once, after a successful HTTP
-		// probe phase. Snapshot diffs and per-phase reset are gone: they made
-		// suppression impossible and produced three events per host.
-		if taskType == watchScanType && module == ModuleHTTPProbe && err == nil && !forced && !skipped && !timedOut {
+		// probe phase. The detail diff below writes status/page/tech/redirect
+		// rows only; it never writes a new-host row, so the two writers cannot
+		// duplicate an announcement.
+		if watchDiff && err == nil && !forced && !skipped && !timedOut {
 			s.emitWatchNewHosts(ctx, taskID, targetID)
+			if shouldWriteWatchDiff(taskType, skipped, timedOut, err, modCtxErr, true) {
+				if after, derr := snapshotWatchHTTP(ctx, s.db, targetID); derr == nil {
+					if changes := diffWatchHTTP(watchBefore, after, false, false); len(changes) > 0 {
+						s.insertWatchRoundChanges(ctx, taskID, targetID, changes)
+					}
+				}
+			}
 		}
 
 		s.finishTaskPhase(taskID, module, phaseStatus, phaseReason, time.Since(phaseStartedAt))
@@ -2518,6 +2614,20 @@ func (s *Scheduler) refreshTargetScanStatus(targetID, terminal string, touchLast
 		targetID, targetID, targetID, terminal, targetID)
 }
 
+// projectHasManagedScope reports whether a project owns a managed asset list or
+// a linked program. A managed project with zero approved assets must never fall
+// back to targets.domain: an operator suspended the last asset on purpose.
+func (s *Scheduler) projectHasManagedScope(ctx context.Context, targetID string) bool {
+	var managed int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CASE WHEN EXISTS(SELECT 1 FROM targets WHERE id=? AND managed_scope=1) THEN 1
+		      WHEN EXISTS(SELECT 1 FROM assets WHERE target_id=?) THEN 1
+		      WHEN EXISTS(SELECT 1 FROM project_programs WHERE target_id=?) THEN 1
+		      ELSE 0 END`,
+		targetID, targetID, targetID).Scan(&managed)
+	return err == nil && managed == 1
+}
+
 // loadProjectWebSeeds keeps a target-level scan aligned with the editable
 // Project asset list. It includes exact page/API/JS URLs (not just DNS roots),
 // and excludes pending/suspended or non-web assets.
@@ -2574,7 +2684,9 @@ func (s *Scheduler) loadSubdomainRoots(ctx context.Context, targetID, fallbackSc
 		}
 		rows.Close()
 	}
-	if len(values) == 0 && assets.IsScannableWebAsset("domain", fallbackScope) {
+	// A managed project with zero approved roots stays empty. Falling back to
+	// targets.domain here would rescan a suspended asset in the DNS phase.
+	if len(values) == 0 && assets.IsScannableWebAsset("domain", fallbackScope) && !s.projectHasManagedScope(ctx, targetID) {
 		values = []string{fallbackScope}
 	}
 	return normalizeSubdomainRoots(values)
@@ -2783,28 +2895,30 @@ const bountyFavoriteScanType = "bounty_favorite_scan"
 
 // notifyBountyScopeEvent is bounty.Service's ScopeEventNotify hook (wired in
 // New()), fired for every NEWLY recorded scope event on ANY program,
-// favorited or not. It alerts every user watching (favoriting) the owning
-// program, then -- per the STRONGEST auto-scan policy opted into among
-// them -- auto-approves and queues a bounded follow-up scan for a newly
-// detected in-scope asset. Scope approval always goes through the existing
-// bounty_scope_events pipeline (ResolveScopeEvent); a favorite's policy only
-// decides whether this hook auto-clicks "approve" for that asset, never a
-// way to bypass scope checking itself -- and a program nobody has favorited
-// gets neither an alert nor an auto-scan, exactly like before this feature.
+// favorited or not. Every scope change goes to the program-scope alert
+// channel regardless of favorites. Favorites only decide auto-scans: per the
+// STRONGEST auto-scan policy opted into among them, this hook may auto-approve
+// and queue a bounded follow-up scan for a newly detected in-scope asset.
+// Scope approval always goes through the existing bounty_scope_events
+// pipeline (ResolveScopeEvent); a favorite's policy only decides whether this
+// hook auto-clicks "approve", never a way to bypass scope checking itself.
+// A program nobody has favorited gets the alert but no auto-scan.
 func (s *Scheduler) notifyBountyScopeEvent(ctx context.Context, targetID, programID, eventID, eventType, identifier string) {
 	if s.hub != nil {
 		s.hub.Broadcast("bounty_scope_change", map[string]any{
 			"target_id": targetID, "program_id": programID, "event_type": eventType, "identifier": identifier,
 		})
 	}
+	var domain string
+	_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+	// Every scope change reaches the scope channel, favorited or not. Favorites
+	// only decide whether an automated follow-up scan runs (B9).
+	if s.notifier != nil {
+		s.notifier.NotifyProgramScope(targetID, domain, programID, eventType, identifier, eventID)
+	}
 	favorites, err := s.bountyCatalog.FavoritesForProgram(ctx, programID)
 	if err != nil || len(favorites) == 0 {
 		return
-	}
-	var domain string
-	_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
-	if s.notifier != nil {
-		s.notifier.NotifyMonitorChange(targetID, domain, "bounty-"+eventType, identifier, "", "", "")
 	}
 	if eventType != "added" {
 		return // only a NEW in-scope asset warrants an automated follow-up scan
@@ -3591,7 +3705,10 @@ func (s *Scheduler) bountyCatalogScheduler() {
 // a round only ADDS hosts. A project that was flipped back to Deep still gets
 // its markers updated.
 func (s *Scheduler) sweepWatchScope() {
-	rows, err := s.db.Query(`SELECT id FROM targets WHERE watch_only = 1`)
+	// Visit every project, not just current breadth projects. A project flipped
+	// back to Deep can still hold landed watch:scope hosts that fell out of the
+	// eligible program set; its markers must be refreshed too.
+	rows, err := s.db.Query(`SELECT id FROM targets`)
 	if err != nil {
 		return
 	}

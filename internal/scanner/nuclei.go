@@ -636,14 +636,17 @@ func (s *NucleiScanner) runNucleiProcess(ctx context.Context, targetID string, t
 		sev := strings.ToLower(out.Info.Severity)
 		actionableSev := !(sev == "info" || sev == "low" || sev == "unknown" || sev == "")
 		typ, _ := classifyNucleiTemplate(out.TemplateID, out.Info.Tags)
+		findingID := uuid.New().String()
 		// MISS NOTHING: capture every hit that is either an actionable severity OR
 		// maps to a real vulnerability class as a normalized candidate — even an
 		// info/low template that actually hit a sqli/xss/ssrf/lfi/rce/ssti/redirect
 		// class is preserved (queryable, fingerprint-deduped) so nothing real is
 		// ever silently dropped by the severity policy.
+		var candidateID string
 		if actionableSev || typ != "nuclei" {
-			_ = StoreCandidate(ctx, s.db,
-				nucleiToCandidate(targetID, out.TemplateID, out.Info.Name, out.Info.Severity, out.MatchedAt, out.Info.Tags))
+			cand := nucleiToCandidate(targetID, out.TemplateID, out.Info.Name, out.Info.Severity, out.MatchedAt, out.Info.Tags)
+			cand.SourceResultID = findingID
+			candidateID = StoreCandidate(ctx, s.db, cand)
 		}
 
 		// A behavior template returning only a redirect, auth denial, no-content or
@@ -670,7 +673,7 @@ func (s *NucleiScanner) runNucleiProcess(ctx context.Context, targetID string, t
 		}
 
 		finding := &models.NucleiFinding{
-			ID:           uuid.New().String(),
+			ID:           findingID,
 			TargetID:     targetID,
 			TemplateID:   out.TemplateID,
 			TemplateName: out.Info.Name,
@@ -703,6 +706,18 @@ func (s *NucleiScanner) runNucleiProcess(ctx context.Context, targetID string, t
 			}
 			s.logger.Error("Store nuclei finding failed", "error", err)
 			return
+		}
+
+		// storeFinding deduplicates by (target, template, matched_url). Point
+		// the candidate at the row that actually exists, so verification can
+		// update one exact result instead of every result at the URL (B8).
+		if candidateID != "" {
+			var storedID string
+			if s.db.QueryRowContext(ctx, `SELECT id FROM nuclei_findings
+				WHERE target_id=? AND template_id=? AND matched_url=? ORDER BY rowid DESC LIMIT 1`,
+				targetID, out.TemplateID, out.MatchedAt).Scan(&storedID) == nil && storedID != "" && storedID != findingID {
+				_, _ = s.db.ExecContext(ctx, `UPDATE candidates SET source_result_id=? WHERE id=?`, storedID, candidateID)
+			}
 		}
 
 		findingCount.Add(1)

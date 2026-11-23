@@ -178,7 +178,32 @@ function NewHostsSection({ items }: { items: ChangeEntry[] }) {
         {total} new subdomain(s)
       </p>
       <div className="mt-2 max-h-64 space-y-1 overflow-y-auto font-mono text-xs text-text-primary">
-        {shown.map((h, i) => <div key={`${h}-${i}`} className="break-all">{h}</div>)}
+        {sections.map((g, gi) => (
+          <div key={gi}>
+            {(typeof g.meta?.status === 'number' || typeof g.meta?.in_scope === 'boolean' || !!g.meta?.server) && (
+              <div className="mb-0.5 text-[10px] text-text-muted">
+                {typeof g.meta?.status === 'number' && <span>HTTP {g.meta.status} </span>}
+                {!!g.meta?.server && <span>{String(g.meta.server)} </span>}
+                {g.meta?.in_scope === true && <span className="text-accent">· in scope</span>}
+                {g.meta?.in_scope === false && <span>· out of scope</span>}
+              </div>
+            )}
+            {Array.isArray(g.meta?.members) && g.meta.members.length > 0 ? (
+              (g.meta.members as { host?: string; in_scope?: boolean }[]).map((m, i) => (
+                <div key={`${m.host}-${gi}-${i}`} className="break-all">
+                  {m.host}
+                  {typeof m.in_scope === 'boolean' && (
+                    <span className={m.in_scope ? 'ml-1 text-accent' : 'ml-1 text-text-muted'}>
+                      {m.in_scope ? '· in scope' : '· out of scope'}
+                    </span>
+                  )}
+                </div>
+              ))
+            ) : (
+              (g.hosts as string[]).map((h, i) => <div key={`${h}-${gi}-${i}`} className="break-all">{h}</div>)
+            )}
+          </div>
+        ))}
       </div>
       {truncated && (
         <p className="mt-2 text-[10px] text-text-muted">
@@ -252,11 +277,25 @@ export default function ChangeLog({ targetId, compact }: Props) {
     return () => { alive = false }
   }, [targetId])
 
+  // The default view is the real-events feed. An explicit category, source,
+  // severity, status, text filter or selected round is a deliberate request to
+  // see the wider history. Compute this from the SAME values passed to
+  // buildParams, so reads and Mark all read agree even inside the debounce
+  // window (A11, review findings #2 and #6).
+  const isDefaultView = useCallback((searchText: string, codesText: string) =>
+    categories.has('all') && !source && !severity && !selectedTaskId &&
+    !searchText.trim() && !statusOnly && statusClasses.size === 0 &&
+    parseStatusCodes(codesText).length === 0,
+    [categories, source, severity, selectedTaskId, statusOnly, statusClasses])
+
+  const defaultView = isDefaultView(debouncedQ, debouncedCodes)
+
   // Build query params from explicit text values. Reads pass the debounced
   // values, while writes (mark-all-read) pass the raw values so a click before
   // the debounce settles still targets exactly the rows currently on screen.
   const buildParams = useCallback((searchText: string, codesText: string): Record<string, string> => {
     const p: Record<string, string> = {}
+    if (isDefaultView(searchText, codesText)) p.default_view = '1'
     const since = sinceFor(hours, customSince)
     if (since) p.since = since
     const cats = [...categories].filter(c => c !== 'all')
@@ -272,7 +311,7 @@ export default function ChangeLog({ targetId, compact }: Props) {
     const t = targetId || selectedTargetId
     if (t) p.target_id = t
     return p
-  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId])
+  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, isDefaultView])
 
   const params = useCallback((): Record<string, string> => buildParams(debouncedQ, debouncedCodes),
     [buildParams, debouncedQ, debouncedCodes])
@@ -429,12 +468,8 @@ export default function ChangeLog({ targetId, compact }: Props) {
     }
   }
 
-  // The default view is the real-events feed. An explicit category, source,
-  // severity, status or text filter is a deliberate request to see the wider
-  // history, so it opts out of this client-side guard.
-  const defaultView = categories.has('all') && !source && !severity &&
-    !debouncedQ.trim() && !statusOnly && statusClasses.size === 0 &&
-    parseStatusCodes(debouncedCodes).length === 0
+  // Keep the client guard as a safety net; the server now applies the same
+  // filter before pagination.
   const visibleRows = useMemo(() => {
     const base = hideSeen ? rows.filter(r => !r.seen) : rows
     return defaultView ? base.filter(isDefaultFeedRow) : base
@@ -681,6 +716,11 @@ export default function ChangeLog({ targetId, compact }: Props) {
                           <InlineChangeDiff oldValue={item.old_value} newValue={item.new_value} changeType={item.change_type} />
                         )}
                         <Badge variant={changeBadgeVariant(item)}>{item.severity}</Badge>
+                        {item.scope_status && (
+                          <span className="text-[10px] text-text-muted">
+                            {item.scope_status}{item.program_id ? ` · ${item.program_id}` : ''}
+                          </span>
+                        )}
                       </div>
                     )
                   })}

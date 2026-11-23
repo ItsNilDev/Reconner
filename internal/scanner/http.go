@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strings"
@@ -19,15 +20,21 @@ import (
 )
 
 type HTTPScanner struct {
-	db     *database.DB
-	exec   *tools.Executor
-	cfg    *config.Config
-	logger *logger.Logger
+	db        *database.DB
+	exec      *tools.Executor
+	cfg       *config.Config
+	logger    *logger.Logger
+	broadcast BroadcastFunc
 }
 
 func NewHTTPScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, log *logger.Logger) *HTTPScanner {
 	return &HTTPScanner{db: db, exec: exec, cfg: cfg, logger: log}
 }
+
+// SetBroadcast wires the task event bus. The probe captures the status baseline
+// before an upsert, so the event must reach the same alert bridge as monitor
+// changes. The constructor stays stable for the many direct test callers.
+func (s *HTTPScanner) SetBroadcast(fn BroadcastFunc) { s.broadcast = fn }
 
 type httpxOutput struct {
 	URL           string   `json:"url"`
@@ -54,7 +61,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	logFn("info", "http_probe", "Loading subdomains for HTTP probing...")
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT subdomain FROM subdomains
+		SELECT subdomain, COALESCE(ip,'') FROM subdomains
 		WHERE target_id = ?
 		  AND (COALESCE(ip,'') != '' OR COALESCE(source,'dns') IN ('seed','vhost'))
 		  AND COALESCE(catchall,0) = 0
@@ -65,12 +72,25 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	}
 
 	var hosts []string
+	hostIPs := map[string][]net.IP{}
 	for rows.Next() {
-		var sub string
-		if err := rows.Scan(&sub); err != nil {
+		var sub, ip string
+		if err := rows.Scan(&sub, &ip); err != nil {
 			continue
 		}
 		hosts = append(hosts, sub)
+		if parsed := net.ParseIP(ip); parsed != nil {
+			hostIPs[sub] = append(hostIPs[sub], parsed)
+		} else if ip != "" {
+			// A stored address list is kept as delimited text.
+			for _, part := range strings.FieldsFunc(ip, func(r rune) bool {
+				return r == ',' || r == ' ' || r == ';' || r == '\n'
+			}) {
+				if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
+					hostIPs[sub] = append(hostIPs[sub], parsed)
+				}
+			}
+		}
 	}
 	rows.Close()
 	// Per-asset host scope: only probe hosts belonging to this scoped task.
@@ -93,7 +113,21 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		kept := hosts[:0]
 		var dropped int
 		for _, h := range hosts {
-			if excl.Excludes(h) {
+			var resolved []net.IP
+			if len(hostIPs[h]) > 0 {
+				resolved = hostIPs[h]
+			} else if excl.HasCIDRs() && net.ParseIP(h) == nil {
+				// CIDR rules need actual destination addresses. Resolve only
+				// when the stored row has no address and a CIDR rule exists.
+				if ips, err := net.DefaultResolver.LookupIP(ctx, "ip", h); err == nil {
+					resolved = ips
+				} else {
+					// Destination cannot be checked reliably — keep it blocked.
+					dropped++
+					continue
+				}
+			}
+			if excl.ExcludesWithIPs(h, resolved) {
 				dropped++
 				continue
 			}
@@ -186,6 +220,11 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	var probedHosts []string
 	seenHost := map[string]bool{}
 
+	// A watch round must not confuse a tool outage with a healthy empty result.
+	// recordWatchMisses increments alive_misses, so two failed rounds would flip
+	// every host to is_alive=0. Track probe failures and abort before liveness is
+	// touched. Partial observations already stored by the callback are retained.
+	var probeFailed error
 	if s.exec.IsToolAvailable("httpx") {
 		err = s.exec.RunWithCallback(ctx, targetID, func(line string) {
 			var out httpxOutput
@@ -193,7 +232,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 				return
 			}
 
-			if err := s.storeHTTPService(targetID, out); err != nil {
+			if err := s.storeHTTPService(ctx, targetID, out); err != nil {
 				s.logger.Error("Failed to store HTTP service", "error", err)
 			} else if watchMode {
 				_, _ = s.db.Exec(`UPDATE http_services SET probe_tier='watch' WHERE target_id=? AND url=?`, targetID, out.URL)
@@ -220,9 +259,15 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 
 		if err != nil && ctx.Err() == nil {
 			logFn("warn", "http_probe", fmt.Sprintf("httpx error: %v", err))
+			if watchMode {
+				probeFailed = fmt.Errorf("httpx invocation failed: %w", err)
+			}
 		}
 	} else {
 		logFn("info", "http_probe", "httpx not available, using basic HTTP probing...")
+		if watchMode {
+			probeFailed = fmt.Errorf("httpx tool is not available")
+		}
 	}
 
 	// Resilience gate: httpx is the whole scan's front door — every downstream
@@ -251,6 +296,11 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	}
 	if watchMode && probed == 0 && len(hosts) > 0 {
 		logFn("warn", "http_probe", "httpx produced no live services — nothing is landed from this round (the native prober is skipped in watch mode).")
+	}
+	// A tool outage is a phase failure, not a healthy round. Abort before
+	// recordWatchMisses can damage liveness or scope landing can claim results.
+	if watchMode && probeFailed != nil {
+		return probeFailed
 	}
 
 	// Scope landing (watch tier only): the stage runs AFTER the HTTP phase, so
@@ -336,6 +386,11 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 	}
 	rows.Close()
 	urls = filterURLsByHostScope(ctx, urls)
+	// A host excluded after it was first probed keeps its historical service
+	// row, but no later phase may open a connection to it.
+	if excl := LoadExclusions(ctx, s.db, targetID); !excl.Empty() {
+		urls = FilterExcludedURLs(urls, excl)
+	}
 	if len(urls) == 0 {
 		return
 	}
@@ -372,7 +427,56 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 	}
 }
 
-func (s *HTTPScanner) storeHTTPService(targetID string, out httpxOutput) error {
+// captureProbeStatusChange records an HTTP status/title transition at the write
+// boundary. It writes one monitoring_changes row with numeric codes and a bell
+// notification, then publishes the same event the monitor bridge consumes. Seed
+// rows (status=0) are a baseline, not a change.
+func (s *HTTPScanner) captureProbeStatusChange(ctx context.Context, targetID, rawURL string, newCode int, newTitle string) {
+	var oldCode int
+	var oldTitle string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status_code, COALESCE(title,'') FROM http_services WHERE target_id=? AND url=?`,
+		targetID, rawURL).Scan(&oldCode, &oldTitle)
+	if err != nil || oldCode == 0 || (oldCode == newCode && oldTitle == newTitle) {
+		return
+	}
+	severity := "info"
+	if oldCode != newCode {
+		severity = "medium"
+	}
+	oldValue := fmt.Sprintf("status=%d title=%s", oldCode, oldTitle)
+	newValue := fmt.Sprintf("status=%d title=%s", newCode, newTitle)
+	changeID := uuid.New().String()
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO monitoring_changes
+		(id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+		VALUES(?,?,?,'http_change',?,?,?,?,?,CURRENT_TIMESTAMP)`,
+		changeID, targetID, rawURL, oldValue, newValue, severity, oldCode, newCode)
+	notifyWithIdentity(s.db, targetID, "http_change",
+		fmt.Sprintf("HTTP status changed on %s", URLHost(rawURL)),
+		fmt.Sprintf("%d → %d", oldCode, newCode), rawURL, severity, "{}",
+		changeID, oldValue, newValue)
+	if s.broadcast != nil {
+		s.broadcast("notification_created", map[string]any{
+			"target_id":  targetID,
+			"type":       "http_change",
+			"severity":   severity,
+			"change_id":  changeID,
+			"old_value":  oldValue,
+			"new_value":  newValue,
+			"old_status": oldCode,
+			"new_status": newCode,
+			"url":        rawURL,
+		})
+	}
+}
+
+func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out httpxOutput) error {
+	// Read the stored baseline BEFORE the blind upsert. The deep planner runs
+	// http_probe ahead of monitor, so without this the monitor compares the new
+	// value with itself and never records the transition (A7).
+	if !watchModeEnabled(ctx) {
+		s.captureProbeStatusChange(ctx, targetID, out.URL, out.StatusCode, out.Title)
+	}
 	id := uuid.New().String()
 	sortedTechs := append([]string(nil), out.Technologies...)
 	sort.Strings(sortedTechs)
@@ -517,7 +621,7 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 				if svc != nil {
 					svc.ID = uuid.New().String()
 					svc.TargetID = targetID
-					if err := s.storeBasicService(svc); err != nil {
+					if err := s.storeBasicService(ctx, svc); err != nil {
 						s.logger.Error("Store basic service failed", "error", err)
 					}
 				}
@@ -529,7 +633,10 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 	return nil
 }
 
-func (s *HTTPScanner) storeBasicService(svc *models.HTTPService) error {
+func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPService) error {
+	if !watchModeEnabled(ctx) {
+		s.captureProbeStatusChange(ctx, svc.TargetID, svc.URL, svc.StatusCode, svc.Title)
+	}
 	_, err := s.db.Exec(`
 		INSERT INTO http_services (id, target_id, url, status_code, title, server, content_type, content_length, last_seen)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -589,7 +696,7 @@ func (s *HTTPScanner) RunWithInput(ctx context.Context, taskID string, input str
 		if err := json.Unmarshal([]byte(line), &out); err != nil {
 			return
 		}
-		if err := s.storeHTTPService(taskID, out); err != nil {
+		if err := s.storeHTTPService(ctx, taskID, out); err != nil {
 			s.logger.Error("Failed to store HTTP service from input run", "error", err)
 		}
 	}, "httpx", args...)

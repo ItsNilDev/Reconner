@@ -181,11 +181,19 @@ func (s *Scheduler) flushScopeLandings() {
 		return
 	}
 
-	// Landing is an audit trail only. It carries no bell, feed row, Telegram
-	// message or socket event; the new-host emitter and real program scope
-	// changes own those channels now. Close the claim so it cannot be replayed.
+	// Deliver one grouped scope-landed alert for the whole window. The event
+	// key is derived from the claimed rows, so the outbox deduplicates retries.
+	// This makes the per-chat scope-landed switch meaningful (B9).
+	if s.notifier != nil {
+		hosts := make([]string, 0, len(claimed))
+		for _, l := range claimed {
+			hosts = append(hosts, l.Identifier)
+		}
+		summary := fmt.Sprintf("%d host(s) landed in eligible scope", len(claimed))
+		s.notifier.NotifyScopeLanded("scope-landed:"+claimed[0].EventID, summary, hosts)
+	}
 	s.markScopeLandingsSent(claimed)
-	s.logger.Info("Closed silent watch landing audit rows", "count", len(claimed))
+	s.logger.Info("Closed watch landing audit rows", "count", len(claimed))
 }
 
 // claimScopeLandings marks the given rows as in flight and returns the ones it

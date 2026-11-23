@@ -354,6 +354,13 @@ func (s *Service) createProjectFromProgram(ctx context.Context, ownerID int64, p
 		hours = 12
 	}
 	scope := strings.Join(values, ",")
+	// Mark every copied deny rule with its program so a later sync can refresh
+	// it without deleting manual operator rules. Legacy unmarked rules are
+	// preserved by the reconciliation merge.
+	managedExclusions := make([]string, 0, len(outScope))
+	for _, identifier := range outScope {
+		managedExclusions = append(managedExclusions, programExclusionLine(p.ID, identifier))
+	}
 	targetID := uuid.New().String()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -376,7 +383,7 @@ func (s *Service) createProjectFromProgram(ctx context.Context, ownerID int64, p
 	// bulk creates spread their first rounds across the normal interval.
 	// Deep projects keep NULL ("not scheduled").
 	_, err = tx.ExecContext(ctx, `INSERT INTO targets(id,domain,name,description,priority,notes,kind,exclude_scope,owner_id,monitor_enabled,monitor_interval_hours,watch_only,watch_next_run,watch_paused,watch_fail_count,watch_root_index)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ? = 1 THEN datetime('now','+' || ? || ' minutes') ELSE NULL END,0,0,0)`, targetID, scope, name, req.Description, priority, req.Notes, kind, strings.Join(outScope, "\n"), ownerID, boolInt(monitorEnabled), hours, watchOnly, watchOnly, watchStartOffsetMinutes)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ? = 1 THEN datetime('now','+' || ? || ' minutes') ELSE NULL END,0,0,0)`, targetID, scope, name, req.Description, priority, req.Notes, kind, strings.Join(managedExclusions, "\n"), ownerID, boolInt(monitorEnabled), hours, watchOnly, watchOnly, watchStartOffsetMinutes)
 	if err != nil {
 		return "", err
 	}
@@ -671,7 +678,9 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	if err != nil {
 		return err
 	}
-	existing := map[string]struct{ ID, Value, Status, Raw string }{}
+	// JSON keeps the old state in the same bounty.Asset shape as new_json, so
+	// reviewers see one consistent diff structure for modified events.
+	existing := map[string]struct{ ID, Value, Status, Raw, JSON string }{}
 	staleNonWeb := []string{}
 	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.source_id,a.value,a.approval_status,a.metadata,
 		COALESCE(b.asset_type,''),COALESCE(b.identifier,'')
@@ -694,7 +703,8 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 			var m map[string]any
 			_ = json.Unmarshal([]byte(meta), &m)
 			raw, _ := m["raw_hash"].(string)
-			existing[sid] = struct{ ID, Value, Status, Raw string }{id, value, status, raw}
+			oldAsset := Asset{ID: sid, Identifier: value, AssetType: bType, RawHash: raw}
+			existing[sid] = struct{ ID, Value, Status, Raw, JSON string }{id, value, status, raw, mustJSON(oldAsset)}
 		}
 	}
 	rows.Close()
@@ -710,11 +720,13 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 		if a.Active && a.InScope && a.EligibleSubmission {
 			current[a.ID] = a
 			if old, ok := existing[a.ID]; !ok {
-				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "added", a.Identifier, "{}", mustJSON(a)) {
+				// Carry the raw hash so approval can detect an upstream edit
+				// made after this "added" event was recorded (A13).
+				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "added", a.Identifier, "{}", mustJSON(a), a.RawHash) {
 					added++
 				}
 			} else if old.Raw != "" && old.Raw != a.RawHash {
-				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "modified", a.Identifier, mustJSON(old), mustJSON(a)) {
+				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "modified", a.Identifier, old.JSON, mustJSON(a), a.RawHash) {
 					modified++
 				}
 			}
@@ -723,12 +735,21 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	for sid, old := range existing {
 		if _, ok := current[sid]; !ok && old.Status != "suspended" {
 			_, _ = s.db.ExecContext(ctx, `UPDATE assets SET approval_status='suspended',monitor_enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?`, old.ID)
-			if s.createScopeEvent(ctx, targetID, p.ID, sid, "removed", old.Value, mustJSON(old), "{}") {
+			if s.createScopeEvent(ctx, targetID, p.ID, sid, "removed", old.Value, old.JSON, "{}") {
 				removed++
 			}
 		}
 	}
 	_, _ = s.db.ExecContext(ctx, `UPDATE project_programs SET last_scope_hash=?,last_checked_at=CURRENT_TIMESTAMP WHERE target_id=? AND program_id=?`, p.ScopeHash, targetID, p.ID)
+	// Refresh the program's deny snapshot with provenance. Only rules this
+	// program owns are replaced. Manual edits, other programs' rules, and legacy
+	// unmarked rules survive, so a sync never widens or narrows them by accident.
+	var excludeRaw string
+	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&excludeRaw)
+	other, _, manual := splitManagedExclusions(excludeRaw, programID)
+	merged := append(manual, other...)
+	merged = append(merged, programDenyRules(p)...)
+	_, _ = s.db.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID)
 	if added+removed+modified > 0 {
 		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified)
 		_, _ = s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium")
@@ -737,6 +758,59 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 }
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+// Program deny rules are stored in targets.exclude_scope with a provenance
+// marker. Reconciliation removes only the rules owned by the syncing program;
+// manual operator rules and legacy unmarked rules stay untouched.
+const bountyExclusionMarker = "#bounty:"
+
+func programExclusionLine(programID, identifier string) string {
+	return bountyExclusionMarker + programID + "|" + identifier
+}
+
+// splitManagedExclusions partitions exclude_scope into rules owned by other
+// programs, rules owned by programID, and manual/legacy rules.
+func splitManagedExclusions(raw, programID string) (other, mine, manual []string) {
+	prefix := bountyExclusionMarker + programID + "|"
+	// Use the same delimiter set as ParseExclusions. A line can hold several
+	// rules separated by commas or spaces; splitting only on newlines made a
+	// sync of one program drop another program's rule on the same line.
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == ';'
+	}) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Only a well-formed marker is managed. A manual rule that merely
+		// begins with the marker text stays untouched.
+		if strings.HasPrefix(line, bountyExclusionMarker) {
+			parts := strings.SplitN(line, "|", 2)
+			if len(parts) == 2 && parts[1] != "" {
+				if strings.HasPrefix(line, prefix) {
+					mine = append(mine, line)
+				} else {
+					other = append(other, line)
+				}
+				continue
+			}
+		}
+		manual = append(manual, line)
+	}
+	return
+}
+
+// programDenyRules rebuilds the active out-of-scope rules a program contributes.
+func programDenyRules(p Program) []string {
+	out := []string{}
+	for _, a := range p.Assets {
+		if !a.Active || a.InScope && a.EligibleSubmission || a.Identifier == "" {
+			continue
+		}
+		out = append(out, programExclusionLine(p.ID, a.Identifier))
+	}
+	return out
+}
 
 // scopeEventFingerprint identifies one specific scope state. "added" and
 // "modified" events are keyed by the new program-asset state; "removed" events
@@ -755,20 +829,37 @@ func scopeEventFingerprint(eventType, identifier, oldJSON, newJSON string) strin
 // createScopeEvent inserts a pending review event unless the fingerprint was
 // already decided or a pending event exists. It reports whether a row was
 // inserted so callers count and notify only for genuinely new changes.
-func (s *Service) createScopeEvent(ctx context.Context, targetID, programID, assetID, eventType, identifier, oldJSON, newJSON string) bool {
+func (s *Service) createScopeEvent(ctx context.Context, targetID, programID, assetID, eventType, identifier, oldJSON, newJSON string, stateHash ...string) bool {
 	fingerprint := scopeEventFingerprint(eventType, identifier, oldJSON, newJSON)
+	// RawHash is hidden from the JSON payload, so a raw-only upstream edit would
+	// otherwise produce the same fingerprint. Fold it in for modifications.
+	if len(stateHash) > 0 && stateHash[0] != "" {
+		fingerprint = scopeEventFingerprint(eventType, identifier, oldJSON, newJSON+"\x00"+stateHash[0])
+	}
 	var decided int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bounty_scope_decisions WHERE target_id=? AND program_id=? AND program_asset_id=? AND event_type=? AND fingerprint=?`, targetID, programID, assetID, eventType, fingerprint).Scan(&decided)
 	if decided > 0 {
 		return false
 	}
-	var n int
-	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bounty_scope_events WHERE target_id=? AND program_asset_id=? AND event_type=? AND status='pending'`, targetID, assetID, eventType).Scan(&n)
-	if n > 0 {
-		return false
+	// A newer proposal supersedes an older pending one instead of being hidden
+	// by it. The operator reviews the latest state only.
+	var pendingID, pendingHash string
+	if err := s.db.QueryRowContext(ctx, `SELECT id,COALESCE(proposed_hash,'') FROM bounty_scope_events
+		WHERE target_id=? AND program_asset_id=? AND event_type=? AND status='pending'
+		ORDER BY detected_at DESC LIMIT 1`, targetID, assetID, eventType).Scan(&pendingID, &pendingHash); err == nil {
+		// A legacy pending row has no hash. Treat it as stale rather than let
+		// it block every later edit forever (A13).
+		if pendingHash != "" && pendingHash == fingerprint {
+			return false
+		}
+		_, _ = s.db.ExecContext(ctx, `UPDATE bounty_scope_events SET status='superseded' WHERE id=?`, pendingID)
+	}
+	rawHash := ""
+	if len(stateHash) > 0 {
+		rawHash = stateHash[0]
 	}
 	eventID := uuid.New().String()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO bounty_scope_events(id,target_id,program_id,program_asset_id,event_type,identifier,old_json,new_json,status) VALUES(?,?,?,?,?,?,?,?, 'pending')`, eventID, targetID, programID, assetID, eventType, identifier, oldJSON, newJSON)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO bounty_scope_events(id,target_id,program_id,program_asset_id,event_type,identifier,old_json,new_json,status,proposed_hash,proposed_raw_hash) VALUES(?,?,?,?,?,?,?,?, 'pending',?,?)`, eventID, targetID, programID, assetID, eventType, identifier, oldJSON, newJSON, fingerprint, rawHash)
 	if err != nil {
 		return false
 	}
@@ -787,10 +878,13 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 		return err
 	}
 	defer tx.Rollback()
-	var eventType, assetID, status, programID, identifier, oldJSON, newJSON string
-	err = tx.QueryRowContext(ctx, `SELECT event_type,COALESCE(program_asset_id,''),status,program_id,identifier,old_json,new_json FROM bounty_scope_events WHERE id=? AND target_id=?`, eventID, targetID).Scan(&eventType, &assetID, &status, &programID, &identifier, &oldJSON, &newJSON)
+	var eventType, assetID, status, programID, identifier, oldJSON, newJSON, proposedHash, proposedRawHash string
+	err = tx.QueryRowContext(ctx, `SELECT event_type,COALESCE(program_asset_id,''),status,program_id,identifier,old_json,new_json,COALESCE(proposed_hash,''),COALESCE(proposed_raw_hash,'') FROM bounty_scope_events WHERE id=? AND target_id=?`, eventID, targetID).Scan(&eventType, &assetID, &status, &programID, &identifier, &oldJSON, &newJSON, &proposedHash, &proposedRawHash)
 	if err != nil {
 		return err
+	}
+	if status == "superseded" {
+		return fmt.Errorf("scope event was superseded by a newer proposal")
 	}
 	if status != "pending" && status != "rejected" {
 		return fmt.Errorf("scope event already resolved")
@@ -811,6 +905,12 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			if active != 1 || inScope != 1 || submit != 1 {
 				return fmt.Errorf("scope asset is no longer active and submission-eligible")
 			}
+			// Refuse to apply a proposal against a different upstream state. A
+			// later edit supersedes the pending row; approving the stale one
+			// must not silently land the new state under the old decision key.
+			if proposedRawHash != "" && proposedRawHash != a.RawHash {
+				return fmt.Errorf("scope changed since this proposal; refresh the program and review the new event")
+			}
 			meta := map[string]any{"raw_hash": a.RawHash, "eligible_bounty": bounty == 1, "max_severity": a.MaxSeverity, "instruction": a.Instruction}
 			metaJSON, _ := json.Marshal(meta)
 			// The upsert must NOT rewrite a row the watch tier landed
@@ -828,7 +928,10 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			}
 		}
 	}
-	fingerprint := scopeEventFingerprint(eventType, identifier, oldJSON, newJSON)
+	fingerprint := proposedHash
+	if fingerprint == "" {
+		fingerprint = scopeEventFingerprint(eventType, identifier, oldJSON, newJSON)
+	}
 	// One decision per fingerprint. Upserting also lets an operator approve a
 	// scope change they dismissed earlier: the approve path below still runs,
 	// and the stored decision flips so the event cannot come back again.

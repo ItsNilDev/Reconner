@@ -92,7 +92,14 @@ func TestTelegramOutboxFansOutAndHonorsPerChatPreferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// New chats start quiet for routine phase messages. Opt in explicitly:
+	// this test asserts per-chat preference fanout, not the defaults.
+	first.NotifyPhaseFinished = true
+	if err := bot.UpdateChat(context.Background(), first.ID, first); err != nil {
+		t.Fatal(err)
+	}
 	second.NotifyFindings = false
+	second.NotifyPhaseFinished = true
 	if err := bot.UpdateChat(context.Background(), second.ID, second); err != nil {
 		t.Fatal(err)
 	}

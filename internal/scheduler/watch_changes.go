@@ -26,6 +26,8 @@ type watchChange struct {
 	NewValue   string
 	Severity   string
 	Metadata   string // JSON object
+	OldStatus  int    // numeric HTTP codes for a status_change row
+	NewStatus  int
 }
 
 type watchHTTPSnapshot struct {
@@ -112,6 +114,7 @@ func diffWatchHTTP(before, after map[string]watchHTTPSnapshot, _ bool, _ bool) [
 				NewValue: fmt.Sprintf("status=%d title=%s", cur.StatusCode, cur.Title),
 				Severity: watchStatusSeverity(old.StatusCode, cur.StatusCode),
 				Metadata: fmt.Sprintf(`{"old_code":%d,"new_code":%d}`, old.StatusCode, cur.StatusCode),
+				OldStatus: old.StatusCode, NewStatus: cur.StatusCode,
 			})
 		}
 		if old.Title != cur.Title {
@@ -221,11 +224,13 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	// Fold identical responses into one event. The representative carries the
 	// probed URL; fleet metadata carries every host in the group.
 	groups := make([]watchHostCandidate, 0, len(candidates))
-	members := make(map[string][]string, len(candidates))
+	// Keep scope per member. One in-scope host in a fleet must not label every
+	// other member as in scope (A9).
+	members := make(map[string][]map[string]any, len(candidates))
 	byFP := map[string]int{}
 	for _, c := range candidates {
 		if idx, ok := byFP[c.Fingerprint]; ok {
-			members[c.Fingerprint] = append(members[c.Fingerprint], c.Host)
+			members[c.Fingerprint] = append(members[c.Fingerprint], map[string]any{"host": c.Host, "in_scope": c.InScope})
 			if !groups[idx].InScope && c.InScope {
 				groups[idx].InScope = true
 				groups[idx].ProgramID = c.ProgramID
@@ -235,7 +240,7 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 		}
 		byFP[c.Fingerprint] = len(groups)
 		groups = append(groups, c)
-		members[c.Fingerprint] = []string{c.Host}
+		members[c.Fingerprint] = []map[string]any{{"host": c.Host, "in_scope": c.InScope}}
 	}
 
 	capK := 20
@@ -253,9 +258,15 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 
 	changes := make([]watchChange, 0, len(visible)+1)
 	for _, g := range visible {
-		hosts := members[g.Fingerprint]
+		memberRows := members[g.Fingerprint]
+		hosts := make([]string, 0, len(memberRows))
+		for _, m := range memberRows {
+			if h, ok := m["host"].(string); ok {
+				hosts = append(hosts, h)
+			}
+		}
 		meta := map[string]any{
-			"host": g.Host, "hosts": hosts, "fleet.size": len(hosts),
+			"host": g.Host, "hosts": hosts, "members": memberRows, "fleet.size": len(hosts),
 			"status": g.Service.StatusCode, "title": g.Service.Title,
 			"server": g.Service.Server, "tech": watchTechList(g.Service.Technologies),
 			"ip": "", "source": "watch", "in_scope": g.InScope,
@@ -272,7 +283,11 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	if truncated > 0 {
 		all := make([]string, 0, truncated)
 		for _, g := range groups[capK:] {
-			all = append(all, members[g.Fingerprint]...)
+			for _, m := range members[g.Fingerprint] {
+				if h, ok := m["host"].(string); ok {
+					all = append(all, h)
+				}
+			}
 		}
 		b, _ := json.Marshal(map[string]any{
 			"hosts": all, "total": truncated, "truncated": true,
@@ -421,8 +436,8 @@ func (s *Scheduler) insertWatchRoundChanges(ctx context.Context, taskID, targetI
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.PrepareContext(ctx, `INSERT INTO watch_round_changes
-		(id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
-		VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)`)
+		(id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,old_status,new_status,detected_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)`)
 	if err != nil {
 		s.logger.Warn("watch changes: prepare failed", "error", err)
 		return
@@ -430,15 +445,28 @@ func (s *Scheduler) insertWatchRoundChanges(ctx context.Context, taskID, targetI
 	defer func() { _ = stmt.Close() }()
 
 	written := 0
+	// A real status transition is a daily signal. Keep its change id so the
+	// bell row and the Telegram alert share one stable identity.
+	type statusAlert struct {
+		id, rawURL, title string
+		oldCode, newCode  int
+		severity          string
+	}
+	var alerts []statusAlert
 	for _, c := range changes {
 		metadata := c.Metadata
 		if metadata == "" {
 			metadata = "{}"
 		}
-		if _, err := stmt.ExecContext(ctx, uuid.New().String(), targetID, taskID, c.URL,
-			c.ChangeType, c.OldValue, c.NewValue, c.Severity, metadata); err != nil {
+		id := uuid.New().String()
+		if _, err := stmt.ExecContext(ctx, id, targetID, taskID, c.URL,
+			c.ChangeType, c.OldValue, c.NewValue, c.Severity, metadata, c.OldStatus, c.NewStatus); err != nil {
 			s.logger.Warn("watch changes: insert failed", "error", err, "type", c.ChangeType)
 			continue
+		}
+		if c.ChangeType == "status_change" && c.OldStatus > 0 && c.NewStatus > 0 && c.OldStatus != c.NewStatus {
+			alerts = append(alerts, statusAlert{id: id, rawURL: c.URL, title: c.NewValue,
+				oldCode: c.OldStatus, newCode: c.NewStatus, severity: c.Severity})
 		}
 		written++
 	}
@@ -451,5 +479,23 @@ func (s *Scheduler) insertWatchRoundChanges(ctx context.Context, taskID, targetI
 	}
 	if s.hub != nil {
 		s.hub.Broadcast("changes_written", map[string]any{"target_id": targetID, "count": written})
+	}
+	if len(alerts) == 0 {
+		return
+	}
+	var domain string
+	_ = s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+	for _, a := range alerts {
+		host := a.rawURL
+		if u, err := url.Parse(a.rawURL); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+		s.insertNotification(targetID, "status_change",
+			fmt.Sprintf("HTTP status changed on %s", host),
+			fmt.Sprintf("%d → %d", a.oldCode, a.newCode), a.severity)
+		if s.notifier != nil {
+			s.notifier.NotifyHTTPStatus(targetID, domain, "status_change", a.title, a.rawURL,
+				fmt.Sprintf("HTTP %d", a.oldCode), fmt.Sprintf("HTTP %d", a.newCode), a.id)
+		}
 	}
 }

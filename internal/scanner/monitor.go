@@ -87,6 +87,7 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		SecSnapshot   string
 		Server        string
 	}
+	excl := LoadExclusions(ctx, s.db, targetID)
 	var services []svcRecord
 	for rows.Next() {
 		var r svcRecord
@@ -94,7 +95,7 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			rows.Close()
 			return err
 		}
-		if urlHostInScope(ctx, r.URL) {
+		if urlHostInScope(ctx, r.URL) && !excl.Excludes(URLHost(r.URL)) {
 			services = append(services, r)
 		}
 	}
@@ -633,19 +634,26 @@ func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, h
 // recordChange inserts a monitoring_changes row with a severity classification,
 // and raises a matching notification so the operator sees it in the bell menu.
 func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal, severity string) {
+	changeID := uuid.New().String()
+	oldStatus := statusCodeFromValue(oldVal)
+	newStatus := statusCodeFromValue(newVal)
 	_, _ = s.db.Exec(`
-		INSERT INTO monitoring_changes (id, target_id, url, change_type, old_value, new_value, severity, detected_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		uuid.New().String(), targetID, url, changeType, oldVal, newVal, severity)
+		INSERT INTO monitoring_changes (id, target_id, url, change_type, old_value, new_value, severity, old_status, new_status, detected_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		changeID, targetID, url, changeType, oldVal, newVal, severity, oldStatus, newStatus)
 
 	title := notificationTitle(changeType)
 	body := url
 	if newVal != "" {
 		body = url + " — " + newVal
 	}
-	notify(s.db, targetID, changeType, title, body, url, severity)
+	notifyWithIdentity(s.db, targetID, changeType, title, body, url, severity, "{}", changeID, oldVal, newVal)
 	if s.broadcast != nil {
-		s.broadcast("notification_created", map[string]any{"target_id": targetID, "type": changeType, "severity": severity})
+		s.broadcast("notification_created", map[string]any{
+			"target_id": targetID, "type": changeType, "severity": severity,
+			"change_id": changeID, "old_value": oldVal, "new_value": newVal,
+			"old_status": oldStatus, "new_status": newStatus, "url": url,
+		})
 	}
 }
 

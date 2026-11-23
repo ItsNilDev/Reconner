@@ -99,12 +99,16 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
   })
   const allSelected = coverageTargets.length > 0 && coverageTargets.every(t => selected.has(t.id))
   const toggleSelectAll = () => setSelected(allSelected ? new Set() : new Set(coverageTargets.map(t => t.id)))
+  // A bulk action may only touch projects still visible under the coverage
+  // filter. A hidden selection must never be submitted (B12).
+  const selectedVisibleIDs = coverageTargets.filter(t => selected.has(t.id)).map(t => t.id)
+  const selectedVisibleNames = coverageTargets.filter(t => selected.has(t.id)).map(t => t.name || t.domain)
 
   const handleBulkDelete = async () => {
     if (selected.size === 0) return
     setBulkDeleting(true)
     try {
-      const res = await targetsApi.bulkDelete([...selected])
+      const res = await targetsApi.bulkDelete(selectedVisibleIDs)
       addToast('success', `Deleted ${res.deleted} target${res.deleted === 1 ? '' : 's'}${res.failed ? ` · ${res.failed} failed` : ''}`)
       setBulkOpen(false)
       setSelected(new Set())
@@ -122,7 +126,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
     if (selected.size === 0) return
     setCoverageBusy(true)
     try {
-      const res = await targetsApi.bulkCoverage([...selected], toBreadth)
+      const res = await targetsApi.bulkCoverage(selectedVisibleIDs, toBreadth)
       const applied = (res.results || []).filter(r => r.ok)
       const refused = (res.results || []).filter(r => !r.ok)
       if (applied.length > 0) {
@@ -291,6 +295,8 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
       case 'priority':   result = (prioRank[b.priority] || 0) - (prioRank[a.priority] || 0); break
       case 'status':     result = (a.scan_status || '').localeCompare(b.scan_status || ''); break
       case 'last_scan':  result = (b.last_scan_at || '').localeCompare(a.last_scan_at || ''); break
+      case 'last_watch': result = (b.watch_last_run || '').localeCompare(a.watch_last_run || ''); break
+      case 'last_monitor': result = (b.monitor_last_run || '').localeCompare(a.monitor_last_run || ''); break
       case 'created':
       default:           result = (b.created_at || '').localeCompare(a.created_at || '')
     }
@@ -339,7 +345,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
           {([['all', 'All'], ['deep', 'Deep scans'], ['breadth', 'Breadth watches']] as const).map(([value, label]) => (
             <button
               key={value}
-              onClick={() => setCoverageFilter(value)}
+              onClick={() => { setCoverageFilter(value); setSelected(new Set()) }}
               className={cn(
                 'rounded px-2 py-1 text-xs transition-colors',
                 coverageFilter === value ? 'bg-accent text-white' : 'text-text-muted hover:text-text-primary',
@@ -360,7 +366,9 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
             <option value="priority" className="bg-surface-3">Priority</option>
             <option value="name" className="bg-surface-3">Name (A–Z)</option>
             <option value="status" className="bg-surface-3">Scan status</option>
-            <option value="last_scan" className="bg-surface-3">Last scan</option>
+            <option value="last_scan" className="bg-surface-3">Last deep scan</option>
+            <option value="last_watch" className="bg-surface-3">Last watch round</option>
+            <option value="last_monitor" className="bg-surface-3">Last monitor check</option>
             <option value="created" className="bg-surface-3">Newest</option>
           </select>
         </label>
@@ -478,7 +486,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
                     </div>
                     <div>
                       <p className={cn('text-lg font-semibold', t.finding_count > 0 ? 'text-severity-high' : '')}>{t.finding_count}</p>
-                      <p className="text-xs text-text-muted">Findings</p>
+                      <p className="text-xs text-text-muted">All findings</p>
                     </div>
                   </div>
 
@@ -490,8 +498,20 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
 
                   <div className="flex justify-between text-xs text-text-muted">
                     <span className="capitalize">{t.scan_status}</span>
-                    <span>{t.last_scan_at ? timeAgo(t.last_scan_at) : 'Never scanned'}</span>
+                    <span>Deep: {t.last_scan_at ? timeAgo(t.last_scan_at) : 'never'}</span>
                   </div>
+                  {t.watch_only && (
+                    <div className="flex justify-between text-xs text-text-muted">
+                      <span>Breadth watch</span>
+                      <span>{t.watch_last_run ? timeAgo(t.watch_last_run) : 'never'}</span>
+                    </div>
+                  )}
+                  {t.monitor_last_run && (
+                    <div className="flex justify-between text-xs text-text-muted">
+                      <span>Monitor</span>
+                      <span>{timeAgo(t.monitor_last_run)}</span>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -645,13 +665,17 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
       <Modal open={bulkOpen} onClose={() => setBulkOpen(false)} title="Delete Selected Projects" width="sm">
         <div className="space-y-4">
           <p className="text-sm text-text-secondary">
-            Permanently delete <span className="font-semibold text-text-primary">{selected.size}</span> selected
-            target{selected.size === 1 ? '' : 's'} and all of their subdomains,
-            findings, and scan data? This cannot be undone.
+            Permanently delete <span className="font-semibold text-text-primary">{selectedVisibleIDs.length}</span> selected
+            target{selectedVisibleIDs.length === 1 ? '' : 's'} and all of their subdomains,
+            findings, and scan data?
+            {selectedVisibleNames.length > 0 && (
+              <span className="block mt-1 text-xs text-text-muted">{selectedVisibleNames.join(', ')}</span>
+            )}
+            This cannot be undone.
           </p>
           <div className="flex justify-end gap-2 pt-2 border-t border-border">
             <Button variant="ghost" onClick={() => setBulkOpen(false)}>Cancel</Button>
-            <Button variant="danger" loading={bulkDeleting} onClick={handleBulkDelete}>Delete {selected.size}</Button>
+            <Button variant="danger" loading={bulkDeleting} onClick={handleBulkDelete}>Delete {selectedVisibleIDs.length}</Button>
           </div>
         </div>
       </Modal>

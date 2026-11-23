@@ -270,7 +270,7 @@ func (s *VerifyScanner) verifyNucleiCandidates(ctx context.Context, targetID str
 	// below) — nuclei's own LFI/SSRF templates previously got NO independent
 	// re-proof at all despite that machinery already existing.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, type, url, method, parameter, location, severity, confidence FROM candidates
+		`SELECT id, type, url, method, parameter, location, severity, confidence, COALESCE(source_result_id,''), COALESCE(detection_method,'') FROM candidates
 		 WHERE target_id=? AND detection_source='nuclei'
 		   AND type IN ('sqli','xss','open_redirect','lfi','ssrf')
 		   AND status IN ('DETECTED','TRIAGED') LIMIT 100`, targetID)
@@ -278,13 +278,13 @@ func (s *VerifyScanner) verifyNucleiCandidates(ctx context.Context, targetID str
 		return
 	}
 	type cand struct {
-		id, typ, url, method, param, loc, sev string
-		conf                                  int
+		id, typ, url, method, param, loc, sev, sourceResultID, detectionMethod string
+		conf                                                                  int
 	}
 	var cands []cand
 	for rows.Next() {
 		var c cand
-		if rows.Scan(&c.id, &c.typ, &c.url, &c.method, &c.param, &c.loc, &c.sev, &c.conf) == nil {
+		if rows.Scan(&c.id, &c.typ, &c.url, &c.method, &c.param, &c.loc, &c.sev, &c.conf, &c.sourceResultID, &c.detectionMethod) == nil {
 			cands = append(cands, c)
 		}
 	}
@@ -352,13 +352,13 @@ func (s *VerifyScanner) verifyNucleiCandidates(ctx context.Context, targetID str
 		}
 		switch r.Verdict {
 		case VerifyVerified:
-			s.markNucleiVerification(targetID, c.url, "verified", r.Confidence)
+			s.markNucleiVerification(targetID, c.sourceResultID, c.detectionMethod, c.url, "verified", r.Confidence)
 			verified++
 		case VerifyRejected:
-			s.markNucleiVerification(targetID, c.url, "rejected", 0)
+			s.markNucleiVerification(targetID, c.sourceResultID, c.detectionMethod, c.url, "rejected", 0)
 			rejected++
 		default:
-			s.markNucleiVerification(targetID, c.url, "inconclusive", c.conf)
+			s.markNucleiVerification(targetID, c.sourceResultID, c.detectionMethod, c.url, "inconclusive", c.conf)
 		}
 	}
 	if verified > 0 || rejected > 0 {
@@ -414,12 +414,32 @@ func verifyNucleiSignatureReplay(rawURL, method string, check func(string) bool)
 	return VerifyResult{Verdict: VerifyRejected, Reason: "signature did not reproduce on replay", Method: method}
 }
 
-// markNucleiVerification records the verifier verdict on the matching nuclei_findings
-// row(s) so the UI/report can hide rejected false positives and surface proven ones.
-func (s *VerifyScanner) markNucleiVerification(targetID, matchedURL, verification string, confidence int) {
-	_, _ = s.db.Exec(`UPDATE nuclei_findings SET verification=?, confidence=?,
-		verified_at=CASE WHEN ?='verified' THEN CURRENT_TIMESTAMP ELSE verified_at END
-		WHERE target_id=? AND matched_url=?`, verification, confidence, verification, targetID, matchedURL)
+// markNucleiVerification records the verifier verdict on the exact source row.
+// Older candidates have no source_result_id, so those fall back to the URL and
+// template pair. Updating by URL alone would label every template at that URL
+// with one verdict (B8). A rejected or inconclusive verdict also clears the
+// verified timestamp, so the Telegram sweep cannot treat a stale hit as proof.
+func (s *VerifyScanner) markNucleiVerification(targetID, sourceResultID, detectionMethod, matchedURL, verification string, confidence int) {
+	verifiedAt := "NULL"
+	if verification == "verified" {
+		verifiedAt = "CURRENT_TIMESTAMP"
+	}
+	base := `UPDATE nuclei_findings SET verification=?, confidence=?, verified_at=` + verifiedAt + ` WHERE target_id=?`
+	if sourceResultID != "" {
+		_, _ = s.db.Exec(base+` AND id=?`, verification, confidence, targetID, sourceResultID)
+		return
+	}
+	// A legacy candidate has no exact source id. Narrow by its template before
+	// falling back to the URL, so one verdict cannot label every template that
+	// matched the same URL (review finding #9).
+	if strings.HasPrefix(detectionMethod, "template:") {
+		templateID := strings.TrimPrefix(detectionMethod, "template:")
+		res, _ := s.db.Exec(base+` AND template_id=? AND matched_url=?`, verification, confidence, targetID, templateID, matchedURL)
+		if n, _ := res.RowsAffected(); n > 0 {
+			return
+		}
+	}
+	_, _ = s.db.Exec(base+` AND matched_url=? AND verification='unverified'`, verification, confidence, targetID, matchedURL)
 }
 
 // contextPayloadFor pulls the example payload out of the verifier evidence line
@@ -632,7 +652,20 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 
 		priority := severityWeight[strings.ToLower(f.sev)] * conf / 100
 
-		_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence = ?, priority = ?, status = ? WHERE id = ?`, conf, priority, status, f.id)
+		promoted := f.existingStatus != StatusFinding && status == StatusFinding
+		if promoted {
+			// A durable promotion timestamp lets the Telegram sweep find a
+			// candidate that became a finding after its creation window (B7).
+			_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence = ?, priority = ?, status = ?, verified_at = CURRENT_TIMESTAMP WHERE id = ?`, conf, priority, status, f.id)
+			if s.broadcast != nil {
+				s.broadcast("new_vuln_finding", map[string]any{
+					"target_id": targetID, "type": f.typ, "url": f.url,
+					"parameter": f.param, "finding_id": f.id,
+				})
+			}
+		} else {
+			_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence = ?, priority = ?, status = ? WHERE id = ?`, conf, priority, status, f.id)
+		}
 	}
 
 	logFn("info", "verify", fmt.Sprintf("Verification done. %d findings re-confirmed, %d downgraded, %d scored.",

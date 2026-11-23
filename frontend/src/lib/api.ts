@@ -513,6 +513,7 @@ export interface TelegramChat {
   notify_scan_started: boolean; notify_phase_finished: boolean; notify_scan_finished: boolean
   notify_findings: boolean; notify_monitoring: boolean
   notify_watch_scan_started: boolean; notify_watch_scan_finished: boolean; notify_scope_landed: boolean; notify_new_host: boolean
+  notify_program_scope: boolean; notify_http_status: boolean
   created_at: string; updated_at: string
 }
 export interface TelegramState {
@@ -607,6 +608,7 @@ export interface Notification {
   url: string
   severity: string
   is_read: boolean
+  metadata?: Record<string, unknown>
   created_at: string
 }
 
@@ -617,6 +619,6 @@ export const notifications = {
     const q = type ? '?type=' + encodeURIComponent(type) : ''
     return req<{ notifications: Notification[]; unread: number }>(`/notifications${q}`)
   },
-  markRead: (ids?: string[]) =>
-    req<{ message: string }>('/notifications/read', { method: 'POST', body: JSON.stringify({ ids: ids || [] }) }),
+  markRead: (ids?: string[], type?: string) =>
+    req<{ message: string; unread: number }>('/notifications/read', { method: 'POST', body: JSON.stringify({ ids: ids || [], type: type || '' }) }),
 }

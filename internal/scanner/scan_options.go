@@ -339,16 +339,98 @@ func hostScopeSet(ctx context.Context) map[string]bool {
 	return nil
 }
 
+// ── Out-of-scope exclusions in context ───────────────────────────────────────
+// The scheduler compiles a target's exclude_scope once and attaches it to the
+// task context. Every host-scope consumer then shares one admission decision,
+// so a host excluded mid-scan cannot slip into a saved-service reader, a
+// redirect, or an injection module that reads stored URLs.
+
+type exclusionScopeKey string
+
+const ctxExclusions exclusionScopeKey = "exclusions"
+
+func WithExclusions(ctx context.Context, e ExclusionSet) context.Context {
+	return context.WithValue(ctx, ctxExclusions, e)
+}
+
+func exclusionsFromContext(ctx context.Context) ExclusionSet {
+	if v, ok := ctx.Value(ctxExclusions).(ExclusionSet); ok {
+		return v
+	}
+	return ExclusionSet{}
+}
+
+// scoped returns true when either a positive host scope or an exclusion set is
+// present. Both must be consulted before a request to a derived destination.
+func scoped(ctx context.Context) bool {
+	return hostScopeSet(ctx) != nil || strictWatchScopeSet(ctx) != nil || !exclusionsFromContext(ctx).Empty()
+}
+
+// hostExcluded applies the context exclusion set to a host or host:port.
+func hostExcluded(ctx context.Context, host string) bool {
+	return exclusionsFromContext(ctx).Excludes(host)
+}
+
+// ── Strict program scope (breadth tier) ──────────────────────────────────────
+// Program-linked watch rounds must use the same apex/wildcard boundary as scope
+// landing. Without this, the broad hostInScope matcher lets a descendant of an
+// exact asset receive a request even though it can never land as approved scope.
+
+type strictScopeKey string
+
+const ctxStrictWatchScope strictScopeKey = "strict_watch_scope"
+
+// WithStrictWatchScope installs a program-eligible host set. Map keys are either
+// a bare apex host (exact) or "*.base" (wildcard, descendants only).
+func WithStrictWatchScope(ctx context.Context, entries []WatchScopeEntry) context.Context {
+	set := map[string]bool{}
+	for _, e := range entries {
+		h := strings.ToLower(strings.TrimSuffix(e.host, "."))
+		if h == "" {
+			continue
+		}
+		if e.IsWildcard {
+			set["*."+h] = true
+		} else {
+			set[h] = true
+		}
+	}
+	return context.WithValue(ctx, ctxStrictWatchScope, set)
+}
+
+func strictWatchScopeSet(ctx context.Context) map[string]bool {
+	if v, ok := ctx.Value(ctxStrictWatchScope).(map[string]bool); ok {
+		return v
+	}
+	return nil
+}
+
 // hostInScope reports whether host is allowed. Unset scope ⇒ everything in scope.
 func hostInScope(ctx context.Context, host string) bool {
-	set := hostScopeSet(ctx)
-	if set == nil {
-		return true
+	if hostExcluded(ctx, host) {
+		return false
 	}
 	host = strings.ToLower(strings.TrimSpace(host))
 	host = strings.TrimSuffix(host, ".")
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+	}
+	if strict := strictWatchScopeSet(ctx); strict != nil {
+		for allowed := range strict {
+			if strings.HasPrefix(allowed, "*.") {
+				base := strings.TrimPrefix(allowed, "*.")
+				if strings.HasSuffix(host, "."+base) {
+					return true
+				}
+			} else if host == allowed {
+				return true
+			}
+		}
+		return false
+	}
+	set := hostScopeSet(ctx)
+	if set == nil {
+		return true
 	}
 	for allowed := range set {
 		if host == allowed || (net.ParseIP(host) == nil && net.ParseIP(allowed) == nil && strings.HasSuffix(host, "."+allowed)) {
@@ -360,7 +442,10 @@ func hostInScope(ctx context.Context, host string) bool {
 
 // urlHostInScope extracts the host from rawURL and checks hostInScope.
 func urlHostInScope(ctx context.Context, rawURL string) bool {
-	if hostScopeSet(ctx) == nil {
+	if hostExcluded(ctx, URLHost(rawURL)) {
+		return false
+	}
+	if hostScopeSet(ctx) == nil && strictWatchScopeSet(ctx) == nil {
 		return true
 	}
 	u, err := url.Parse(strings.TrimSpace(rawURL))
@@ -370,10 +455,10 @@ func urlHostInScope(ctx context.Context, rawURL string) bool {
 	return hostInScope(ctx, u.Host)
 }
 
-// filterURLsByHostScope drops URLs whose host is outside the per-asset scope.
-// No-op when host scope is unset (full-target scan).
+// filterURLsByHostScope drops URLs whose host is outside the per-asset scope
+// or inside the target's exclusions.
 func filterURLsByHostScope(ctx context.Context, urls []string) []string {
-	if hostScopeSet(ctx) == nil || len(urls) == 0 {
+	if !scoped(ctx) || len(urls) == 0 {
 		return urls
 	}
 	kept := urls[:0]
@@ -385,9 +470,10 @@ func filterURLsByHostScope(ctx context.Context, urls []string) []string {
 	return kept
 }
 
-// filterHostsByHostScope drops bare hostnames outside the per-asset scope.
+// filterHostsByHostScope drops bare hostnames outside the per-asset scope or
+// inside the target's exclusions.
 func filterHostsByHostScope(ctx context.Context, hosts []string) []string {
-	if hostScopeSet(ctx) == nil || len(hosts) == 0 {
+	if !scoped(ctx) || len(hosts) == 0 {
 		return hosts
 	}
 	kept := hosts[:0]

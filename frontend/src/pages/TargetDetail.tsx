@@ -1,5 +1,5 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, bounty as bountyApi, changes as changesApi } from '../lib/api'
 import type { WatchScopeEvent } from '../lib/api'
 import { useUIStore } from '../store/ui'
@@ -16,7 +16,7 @@ import {
 } from '../components/changes/changesModel'
 import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding, Parameter,
-  DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService
+  DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService, ChangeEntry
 } from '../types'
 
 const isScannableProjectAsset = (asset: Asset) =>
@@ -461,9 +461,20 @@ function ReportMenu({ targetId }: { targetId: string }) {
 export default function TargetDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  // A bell notification deep-links with ?tab=monitor&q=<host>. Honor it so the
+  // operator lands on the Changes tab with the host already filtered (B4).
+  const initialTab = useMemo(() => {
+    const t = searchParams.get('tab')
+    return t && t.length < 60 ? t : 'subdomains'
+  }, [searchParams])
+  const initialQuery = useMemo(() => {
+    const q = searchParams.get('q') || ''
+    return q.length < 200 ? q : ''
+  }, [searchParams])
   const { addToast } = useUIStore()
   const [target, setTarget] = useState<Target | null>(null)
-  const [tab, setTab] = useState('subdomains')
+  const [tab, setTab] = useState(initialTab)
   const [fpView, setFpView] = useState(false)
   const [loading, setLoading] = useState(true)
   const [tabLoading, setTabLoading] = useState(false)
@@ -482,11 +493,12 @@ export default function TargetDetail() {
   const [newAssetType, setNewAssetType] = useState('auto')
   const [assetBusy, setAssetBusy] = useState(false)
   const [scopeEvents, setScopeEvents] = useState<BountyScopeEvent[]>([])
-  const [scopeTab, setScopeTab] = useState<'pending' | 'approved' | 'rejected'>('pending')
+  const [scopeTab, setScopeTab] = useState<'pending' | 'approved' | 'rejected' | 'superseded'>('pending')
   const [eventBusy, setEventBusy] = useState<string | null>(null)
   const [evidence, setEvidence] = useState<{ id: string; url: string; type: string } | null>(null)
   // Changes-tab noise filter + the open content-diff drawer (css/js rows).
   const [changeFilter, setChangeFilter] = useState<ChangeFilter>('all')
+  const [changeQuery, setChangeQuery] = useState(initialQuery)
   // Changes tab: group key -> how many occurrence rows are currently mounted.
   // Presence in the map means the group is expanded.
   const [expandedOccurrences, setExpandedOccurrences] = useState<Map<string, number>>(new Map())
@@ -504,6 +516,19 @@ export default function TargetDetail() {
   const [resuming, setResuming] = useState(false)
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const findingRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // A stale tab request must never replace the rows of the tab the operator
+  // switched to. Each load captures its sequence and target (B14).
+  const requestSeqRef = useRef(0)
+  const activeTabRef = useRef(tab)
+  const activeIdRef = useRef(id)
+  activeTabRef.current = tab
+  activeIdRef.current = id
+  const [dataError, setDataError] = useState('')
+
+  const loadScopeEvents = useCallback(() => {
+    if (!id) return
+    bountyApi.events(id).then(e => setScopeEvents(e || [])).catch(() => {})
+  }, [id])
 
   useEffect(() => {
     if (!id) return
@@ -518,8 +543,8 @@ export default function TargetDetail() {
     targetsApi.graph(id).then(g => setPaths(g.attack_paths || [])).catch(() => {})
     loadAssets()
     loadWatchScope()
-    bountyApi.events(id).then(e => setScopeEvents(e || [])).catch(() => {})
-  }, [id])
+    loadScopeEvents()
+  }, [id, loadScopeEvents])
 
   const loadAssets = () => { if (id) targetsApi.assets(id).then(a => setAssets(a || [])).catch(() => {}) }
   const addAsset = async () => {
@@ -541,6 +566,7 @@ export default function TargetDetail() {
       if (nextStatus === 'approved') setScopeTab('approved')
       if (nextStatus === 'rejected') setScopeTab('rejected')
       loadAssets()
+      loadScopeEvents()
       addToast('success', decision === 'approve' ? 'Scope change approved' : 'Scope change dismissed')
     } catch (e) { addToast('error', e instanceof Error ? e.message : 'Could not resolve scope change') }
     finally { setEventBusy(null) }
@@ -646,19 +672,21 @@ export default function TargetDetail() {
   // Reload the open Changes tab on those events only — task_progress is a
   // per-module tick and scope_landed is already covered by bounty_scope_change.
   useEffect(() => {
-    if (tab !== 'monitor') return
-    const reload = (payload: unknown) => {
-      const p = payload as { target_id?: string }
-      if (p?.target_id && p.target_id !== id) return
-      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
-      refreshTimerRef.current = setTimeout(() => loadTab('monitor'), 1200)
+    // The review panel is outside the Changes tab, so its data must refresh on
+    // scope events even when another tab is open (B16).
+    const onScope = () => loadScopeEvents()
+    const offs: (() => void)[] = [ws.on('bounty_scope_change', onScope)]
+    if (tab === 'monitor') {
+      const reload = (payload: unknown) => {
+        const p = payload as { target_id?: string }
+        if (p?.target_id && p.target_id !== id) return
+        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = setTimeout(() => loadTab('monitor'), 1200)
+      }
+      offs.push(ws.on('changes_written', reload), ws.on('bounty_scope_change', reload))
     }
-    const offs = [
-      ws.on('changes_written', reload),
-      ws.on('bounty_scope_change', reload),
-    ]
     return () => offs.forEach(off => off())
-  }, [id, tab])
+  }, [id, tab, loadScopeEvents])
 
   // Detect scan start/finish
   useEffect(() => {
@@ -707,8 +735,15 @@ export default function TargetDetail() {
         const code = Number((row as { status_code?: number })?.status_code || 0)
         return Math.floor(code / 100) === Number(statusClass)
       })
-    : (tab === 'monitor' && changeFilter !== 'all')
-    ? (data as MonitoringChange[]).filter(row => monitorRowKind(row) === changeFilter)
+    : tab === 'monitor'
+    ? (data as MonitoringChange[]).filter(row => {
+        if (changeFilter !== 'all' && monitorRowKind(row) !== changeFilter) return false
+        if (!changeQuery.trim()) return true
+        const q = changeQuery.trim().toLowerCase()
+        const c = row as ChangeEntry
+        return [c.url, c.change_type, c.old_value, c.new_value, c.metadata ? JSON.stringify(c.metadata) : '']
+          .some(v => (v || '').toLowerCase().includes(q))
+      })
     : data
   // Windowed view of the loaded rows — only the first `visibleCount` are mounted.
   const pageData = filteredData.slice(0, visibleCount)
@@ -735,7 +770,13 @@ export default function TargetDetail() {
   // and the footer disagreed, and they changed as you loaded more rows.
   const monitorGroups = useMemo(() => {
     if (!isMonitorTab) return [] as MonitorChangeGroup[]
-    return groupMonitorChanges(data as MonitoringChange[])
+    // Group by host and day. A collision on two different hosts or two
+    // different days must not collapse into one undated representative (B15).
+    return groupMonitorChanges(data as MonitoringChange[], (c) => {
+      let host = c.url || ''
+      try { host = new URL(c.url).hostname } catch { /* keep the raw value */ }
+      return `${host}\u0000${(c.detected_at || '').slice(0, 10)}`
+    })
   }, [isMonitorTab, data])
   // Chip counts: distinct groups (what the table shows) plus raw row counts
   // (tooltip), so "HTTP 18" and "58 changes" are both visible and explained.
@@ -754,12 +795,19 @@ export default function TargetDetail() {
     }
     return { groups, raw }
   }, [isMonitorTab, monitorGroups, data])
-  const monitorFilteredGroups = useMemo(
-    () => (isMonitorTab && changeFilter !== 'all'
-      ? monitorGroups.filter(g => monitorRowKind(g.rep) === changeFilter)
-      : monitorGroups),
-    [isMonitorTab, monitorGroups, changeFilter]
-  )
+  const monitorFilteredGroups = useMemo(() => {
+    if (!isMonitorTab) return monitorGroups
+    const q = changeQuery.trim().toLowerCase()
+    return monitorGroups.filter(g => {
+      if (changeFilter !== 'all' && monitorRowKind(g.rep) !== changeFilter) return false
+      if (!q) return true
+      return g.items.some(row => {
+        const c = row as ChangeEntry
+        return [c.url, c.change_type, c.old_value, c.new_value, c.metadata ? JSON.stringify(c.metadata) : '']
+          .some(v => (v || '').toLowerCase().includes(q))
+      })
+    })
+  }, [isMonitorTab, monitorGroups, changeFilter, changeQuery])
   const vulnGroupPage = vulnGroups.slice(0, visibleCount)
   const monitorGroupPage = monitorFilteredGroups.slice(0, visibleCount)
   const footerShownCount = isVulnTab ? vulnGroupPage.length : isMonitorTab ? monitorGroupPage.length : pageData.length
@@ -768,7 +816,8 @@ export default function TargetDetail() {
 
   const loadTab = async (t: string) => {
     if (!id) return
-    setTabLoading(true)
+    const seq = ++requestSeqRef.current
+    const requestTarget = id
     try {
       let r: unknown[] = []
       if (t === 'subdomains') r = await findingsApi.subdomains(id)
@@ -806,21 +855,32 @@ export default function TargetDetail() {
         // and bell rows. Keep the original table and its stylesheet diff.
         const feed = await changesApi.forTarget(id)
         r = feed.map(c => ({
-          id: c.id,
-          target_id: c.target_id,
-          url: c.url,
-          change_type: c.change_type,
-          old_value: c.old_value,
-          new_value: c.new_value,
-          severity: c.severity,
-          detected_at: c.detected_at,
+          ...c,
+          // Keep source, category, metadata and seen. Fleet members and
+          // per-member scope live only in metadata (A9).
+          metadata: c.metadata || {},
         }))
       }
+      if (seq !== requestSeqRef.current || t !== activeTabRef.current || requestTarget !== activeIdRef.current) return
+      setTabLoading(true)
+      setDataError('')
       setData(r || [])
       setVisibleCount(PAGE)
-    } catch { setData([]) }
-    setTabLoading(false)
+    } catch (e) {
+      if (seq !== requestSeqRef.current || t !== activeTabRef.current || requestTarget !== activeIdRef.current) return
+      setData([])
+      setDataError(e instanceof Error ? e.message : 'Failed to load this tab')
+    } finally {
+      if (seq === requestSeqRef.current && t === activeTabRef.current && requestTarget === activeIdRef.current) setTabLoading(false)
+    }
   }
+
+  // Clear delayed refresh timers on tab/target change and unmount, so a stale
+  // timer cannot fetch an abandoned tab (review finding #4).
+  useEffect(() => () => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+    if (findingRefreshTimerRef.current) clearTimeout(findingRefreshTimerRef.current)
+  }, [tab, id])
 
   if (loading) return <div className="flex items-center justify-center h-64"><Spinner /></div>
   if (!target) return null
@@ -1020,7 +1080,7 @@ export default function TargetDetail() {
 				<p className="mt-0.5 text-[11px] text-text-muted">Decisions are saved. Dismissed changes stay in history and can be approved later.</p>
 			  </div>
 			  <div className="flex gap-1">
-				{(['pending','approved','rejected'] as const).map(tab => {
+				{(['pending','approved','rejected','superseded'] as const).map(tab => {
 				  const count = scopeEvents.filter(e => e.status === tab).length
 				  return (
 					<button key={tab} onClick={() => setScopeTab(tab)}
@@ -1379,7 +1439,9 @@ export default function TargetDetail() {
           not leave the fallback stuck when the operator switches tabs. */}
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
-        {tabLoading
+        {dataError && !tabLoading
+          ? <div className="p-4 text-sm text-severity-high" role="alert">{dataError}</div>
+          : tabLoading
           ? <div className="py-2"><SkeletonRows rows={8} cols={5} /></div>
           : data.length === 0
             ? <Empty message={tab === 'cameras' ? 'No legacy camera/DVR results are stored for this project. Network execution is unavailable in this build.' : 'No data found'} />
@@ -1418,6 +1480,14 @@ export default function TargetDetail() {
               <>
               {tab === 'monitor' && (
                 <div className="flex items-center gap-1.5 flex-wrap mb-3">
+                  <input
+                    type="search"
+                    value={changeQuery}
+                    onChange={e => { setChangeQuery(e.target.value); setVisibleCount(PAGE) }}
+                    placeholder="Filter changes (host, value…)"
+                    className="rounded border border-border bg-surface px-2 py-1 text-[11px] text-text-primary placeholder:text-text-muted w-48"
+                    aria-label="Filter changes"
+                  />
                   {CHANGE_FILTERS.map(f => {
                     const n = monitorCounts.groups[f.id] || 0
                     const rawN = monitorCounts.raw[f.id] || 0

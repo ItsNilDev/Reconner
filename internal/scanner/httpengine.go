@@ -1,7 +1,9 @@
 package scanner
 
 import (
+	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -14,12 +16,62 @@ import (
 // one transport with a large idle-connection pool lets keep-alive reuse those
 // connections, cutting CPU and latency dramatically without touching detection
 // logic.
+var baseDialer = &net.Dialer{
+	Timeout:   10 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+// scopeGuardedDialContext blocks a connection whose destination resolves into
+// an excluded CIDR. Hostname gates only see a name, so a crawled host such as
+// intranet.example.com resolving to 10.x can otherwise slip past a 10.0.0.0/8
+// exclusion. The check runs at connect time on the real destination. When the
+// request carries no CIDR exclusions the normal pooled dialer is used, so
+// ordinary scans pay no extra lookup.
+func scopeGuardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	excl := exclusionsFromContext(ctx)
+	if excl.Empty() || !excl.HasCIDRs() {
+		return baseDialer.DialContext(ctx, network, addr)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if excl.ExcludesWithIPs(host, []net.IP{ip}) {
+			return nil, fmt.Errorf("%w: %s is in an excluded CIDR", ErrDestinationBlocked, host)
+		}
+		return baseDialer.DialContext(ctx, network, addr)
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(resolved))
+	for _, ia := range resolved {
+		ips = append(ips, ia.IP)
+	}
+	if excl.ExcludesWithIPs(host, ips) {
+		return nil, fmt.Errorf("%w: %s resolves into an excluded CIDR", ErrDestinationBlocked, host)
+	}
+	// Pin the connection to the validated addresses so DNS cannot be rebound
+	// between the check and the connect.
+	var lastErr error
+	for _, ia := range resolved {
+		conn, e := baseDialer.DialContext(ctx, network, net.JoinHostPort(ia.IP.String(), port))
+		if e == nil {
+			return conn, nil
+		}
+		lastErr = e
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return baseDialer.DialContext(ctx, network, addr)
+}
+
 var baseHTTPTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: (&net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
+	Proxy:       http.ProxyFromEnvironment,
+	DialContext: scopeGuardedDialContext,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          512,
 	MaxIdleConnsPerHost:   16,

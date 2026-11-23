@@ -26,9 +26,11 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   tech_change: 'tech',
   new_subdomain: 'assets',
   new_host: 'assets',
+  scope_proposed: 'assets',
   scope_landed: 'assets',
   scope_modified: 'assets',
   scope_removed: 'assets',
+  scope_rejected: 'assets',
   watch_failed: 'alerts',
   watch_kind_conflict: 'alerts',
   monitor_failed: 'alerts',
@@ -43,10 +45,13 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
 // out of the default view.
 export const NOTIFICATION_ALLOWED_TYPES = [
   'watch_failed', 'watch_kind_conflict', 'monitor_failed',
-  'monitor_escalation_started', 'scan_auto_paused', 'bounty_scope_change',
+  'monitor_escalation_started', 'scan_auto_paused',
+  'new_host',
 ] as const
 
-export const BOUNTY_SCOPE_TYPES = ['scope_landed', 'scope_modified', 'scope_removed'] as const
+export const BOUNTY_SCOPE_TYPES = [
+  'scope_proposed', 'scope_landed', 'scope_modified', 'scope_removed', 'scope_rejected',
+] as const
 
 const notificationTypes: ReadonlySet<string> = new Set(NOTIFICATION_ALLOWED_TYPES)
 const bountyScopeTypes: ReadonlySet<string> = new Set(BOUNTY_SCOPE_TYPES)
@@ -56,6 +61,9 @@ const bountyScopeTypes: ReadonlySet<string> = new Set(BOUNTY_SCOPE_TYPES)
 // an operator can still inspect deep changes explicitly.
 export function isDefaultFeedRow(row: { source?: string; change_type?: string }): boolean {
   const type = row.change_type || ''
+  // An actual HTTP status transition is a daily signal. Routine monitor diffs
+  // stay out of the default view (A8).
+  if (row.source === 'monitor') return type === 'http_change' || type === 'status_change'
   if (row.source === 'watch') return type === 'new_subdomain'
   if (row.source === 'bounty') return bountyScopeTypes.has(type)
   if (row.source === 'notification') return notificationTypes.has(type)
@@ -76,7 +84,7 @@ export function categoryForChangeType(changeType: string): ChangeCategory {
 // Returns null for any other change type, missing metadata, or a non-string
 // hosts value so callers can keep the prior count-only rendering.
 export function changeHosts(item: Pick<ChangeEntry, 'change_type' | 'metadata'>): string[] | null {
-  if (item.change_type !== 'new_subdomain') return null
+  if (item.change_type !== 'new_subdomain' && item.change_type !== 'new_host') return null
   const hosts = item.metadata?.hosts
   if (!Array.isArray(hosts)) return null
   const out = hosts.filter((h): h is string => typeof h === 'string' && h.length > 0)
@@ -139,10 +147,11 @@ export function groupMonitorChanges<T extends ChangeLike>(rows: T[], identity: G
 }
 
 export function parseStatusTransition(oldValue: string, newValue: string): { oldCode?: number; newCode?: number } {
+  // Mirror changesStatusCodeExpr in changes_handlers.go: require the exact
+  // "status=NNN " token with a trailing space and an in-range code. Dropping
+  // the older free-text fallback keeps pills aligned with status filters.
   const pick = (value: string) => {
-    const text = value || ''
-    const explicit = /(?:^|[\s,])status=(\d{3})(?!\d)/.exec(text)
-    const match = explicit || /\b([1-5]\d{2})\b/.exec(text)
+    const match = /(?:^|[\s,])status=([1-5]\d{2})\s/.exec(value || '')
     if (!match) return undefined
     const code = Number(match[1])
     return Number.isFinite(code) ? code : undefined

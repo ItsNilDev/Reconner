@@ -43,6 +43,9 @@ type VulnerabilityCandidate struct {
 	Payload         string
 	DetectionSource string // internal | nuclei | dalfox | …
 	DetectionMethod string // boolean-diff | timing | reflection | template:<id> …
+	// SourceResultID points at the exact source row (for example one
+	// nuclei_findings.id) so a verdict never labels other results at the URL.
+	SourceResultID  string
 	Severity        string
 	Confidence      int
 	Status          string
@@ -87,16 +90,17 @@ func StoreCandidateE(ctx context.Context, db *database.DB, c VulnerabilityCandid
 	id := uuid.New().String()
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO candidates (id, target_id, type, subtype, url, method, parameter, location, payload,
-			detection_source, detection_method, severity, confidence, status, evidence, fingerprint)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			detection_source, detection_method, severity, confidence, status, evidence, fingerprint, source_result_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(target_id, fingerprint) DO UPDATE SET
+			source_result_id=CASE WHEN excluded.source_result_id<>'' THEN excluded.source_result_id ELSE candidates.source_result_id END,
 			confidence=MAX(candidates.confidence, excluded.confidence),
 			payload=CASE WHEN excluded.payload<>'' THEN excluded.payload ELSE candidates.payload END,
 			evidence=CASE WHEN excluded.evidence<>'' THEN excluded.evidence ELSE candidates.evidence END,
 			detection_method=CASE WHEN excluded.detection_method<>'' THEN excluded.detection_method ELSE candidates.detection_method END,
 			severity=CASE WHEN excluded.severity<>'' THEN excluded.severity ELSE candidates.severity END`,
 		id, c.TargetID, c.Type, c.Subtype, c.URL, c.Method, c.Parameter, c.Location, c.Payload,
-		c.DetectionSource, c.DetectionMethod, c.Severity, c.Confidence, CandDetected, c.Evidence, fp)
+		c.DetectionSource, c.DetectionMethod, c.Severity, c.Confidence, CandDetected, c.Evidence, fp, c.SourceResultID)
 	if err != nil {
 		return "", fmt.Errorf("candidate store: %w", err)
 	}

@@ -29,7 +29,16 @@ export function openNotification(
   markRead: (ids: string[]) => Promise<unknown>,
 ): void {
   if (!n.is_read) void markRead([n.id]).then(notifyNotificationsChanged).catch(() => {})
-  if (n.target_id) navigate(`/targets/${n.target_id}`)
+  if (n.target_id) {
+    // A new-host bell carries the discovered names in metadata. Route to the
+    // Changes tab filtered to the first host instead of the generic target
+    // landing page (B4).
+    const hosts = n.metadata?.hosts
+    const first = Array.isArray(hosts) && typeof hosts[0] === 'string' ? hosts[0] : ''
+    navigate(first
+      ? `/targets/${n.target_id}?tab=monitor&q=${encodeURIComponent(first)}`
+      : `/targets/${n.target_id}`)
+  }
   else if (n.url.startsWith('/') && !n.url.startsWith('//')) navigate(n.url)
   else if (/^https?:\/\//i.test(n.url)) window.open(n.url, '_blank', 'noopener,noreferrer')
 }

@@ -20,6 +20,31 @@ func TestNoHostScopeBlocksEveryHost(t *testing.T) {
 	}
 }
 
+// TestStrictWatchScopeHonorsProgramBoundary proves that a breadth round uses
+// the eligibility matcher: an exact asset covers only its apex, while a wildcard
+// covers descendants but not the apex itself.
+func TestStrictWatchScopeHonorsProgramBoundary(t *testing.T) {
+	entries := []WatchScopeEntry{
+		{host: "exact.example.com"},
+		{host: "wild.example.org", IsWildcard: true},
+	}
+	ctx := WithStrictWatchScope(context.Background(), entries)
+
+	cases := map[string]bool{
+		"exact.example.com":     true,
+		"a.exact.example.com":   false,
+		"wild.example.org":      false,
+		"a.wild.example.org":    true,
+		"a.b.wild.example.org":  true,
+		"unrelated.example.net": false,
+	}
+	for host, want := range cases {
+		if got := hostInScope(ctx, host); got != want {
+			t.Errorf("hostInScope(%q)=%v, want %v", host, got, want)
+		}
+	}
+}
+
 func TestHostScopeAcceptsURLsAndSubdomains(t *testing.T) {
 	ctx := WithHostScope(context.Background(), []string{"https://App.Example.com/account", "*.example.org"})
 	for _, host := range []string{"app.example.com", "api.app.example.com", "www.example.org"} {

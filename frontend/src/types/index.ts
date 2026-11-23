@@ -103,7 +103,7 @@ export interface BountyScopeEvent {
   identifier: string
   old_json: string
   new_json: string
-  status: 'pending' | 'approved' | 'rejected'
+  status: 'pending' | 'approved' | 'rejected' | 'superseded'
   detected_at: string
   resolved_at: string | null
 }
@@ -342,6 +342,10 @@ export interface ChangeEntry {
   old_value: string
   new_value: string
   metadata?: Record<string, unknown>
+  program_id?: string
+  program_asset_id?: string
+  scope_status?: string
+  resolved_at?: string
   seen: boolean
   detected_at: string
 }

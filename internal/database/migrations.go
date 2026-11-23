@@ -185,6 +185,25 @@ func RunMigrations(db *DB) error {
 		createWatchTierIndexes,
 		alterTelegramChatsAddWatchPrefs,
 		alterNotificationsAddMetadata,
+		// Scope authority: a managed project keeps its provenance after its last
+		// asset is removed, so the original domain can never silently return.
+		alterTargetsAddManagedScope,
+		createManagedScopeTrigger,
+		// Structured event identity and status codes travel with alerts.
+		alterNotificationsAddChangeIdentity,
+		alterNotificationsAddOldValue,
+		alterNotificationsAddNewValue,
+		alterMonitoringChangesAddOldStatus,
+		alterMonitoringChangesAddNewStatus,
+		alterWatchRoundChangesAddOldStatus,
+		alterWatchRoundChangesAddNewStatus,
+		alterVulnFindingsAddVerifiedAt,
+		alterVulnFindingsAddFirstNotified,
+		alterCandidatesAddSourceResultID,
+		alterBountyScopeEventsAddProposedHash,
+		alterBountyScopeEventsAddProposedRawHash,
+		// Four signal categories plus Scan activity replace the broad switches.
+		alterTelegramChatsAddSignalPrefs,
 	}
 
 	for i, m := range migrations {
@@ -209,6 +228,9 @@ func RunMigrations(db *DB) error {
 	}
 	if err := backfillWatchHosts(db); err != nil {
 		return fmt.Errorf("watch host lifecycle migration failed: %w", err)
+	}
+	if err := backfillManagedScope(db); err != nil {
+		return fmt.Errorf("managed scope migration failed: %w", err)
 	}
 
 	return nil
@@ -2033,3 +2055,60 @@ const alterTelegramChatsAddWatchPrefs = `
 ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_started INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_finished INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE telegram_chats ADD COLUMN notify_scope_landed INTEGER NOT NULL DEFAULT 1;`
+
+// A managed project is one that has (or once had) its own asset list or a
+// linked program. Keep that provenance on the target so removing the last
+// asset cannot turn the project back into a legacy "scan targets.domain" case.
+const alterTargetsAddManagedScope = `ALTER TABLE targets ADD COLUMN managed_scope INTEGER NOT NULL DEFAULT 0;`
+
+const createManagedScopeTrigger = `
+CREATE TRIGGER IF NOT EXISTS trg_targets_managed_scope_insert
+AFTER INSERT ON assets
+BEGIN
+  UPDATE targets SET managed_scope=1 WHERE id=NEW.target_id;
+END;`
+
+// backfillManagedScope marks existing managed projects. It is repeatable.
+func backfillManagedScope(db *DB) error {
+	if _, err := db.Exec(`UPDATE targets SET managed_scope=1 WHERE managed_scope=0 AND (
+		EXISTS(SELECT 1 FROM assets WHERE assets.target_id=targets.id)
+		OR EXISTS(SELECT 1 FROM project_programs WHERE project_programs.target_id=targets.id))`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Bell rows carry the originating change id and numeric codes so a status or
+// finding alert can be identified without re-querying the newest row of a type.
+const alterNotificationsAddChangeIdentity = `ALTER TABLE notifications ADD COLUMN change_id TEXT NOT NULL DEFAULT '';`
+const alterNotificationsAddOldValue = `ALTER TABLE notifications ADD COLUMN old_value TEXT NOT NULL DEFAULT '';`
+const alterNotificationsAddNewValue = `ALTER TABLE notifications ADD COLUMN new_value TEXT NOT NULL DEFAULT '';`
+
+const alterMonitoringChangesAddOldStatus = `ALTER TABLE monitoring_changes ADD COLUMN old_status INTEGER NOT NULL DEFAULT 0;`
+const alterMonitoringChangesAddNewStatus = `ALTER TABLE monitoring_changes ADD COLUMN new_status INTEGER NOT NULL DEFAULT 0;`
+const alterWatchRoundChangesAddOldStatus = `ALTER TABLE watch_round_changes ADD COLUMN old_status INTEGER NOT NULL DEFAULT 0;`
+const alterWatchRoundChangesAddNewStatus = `ALTER TABLE watch_round_changes ADD COLUMN new_status INTEGER NOT NULL DEFAULT 0;`
+
+// Durable first-verification identity for promoted candidates.
+const alterVulnFindingsAddVerifiedAt = `ALTER TABLE vuln_findings ADD COLUMN verified_at DATETIME;`
+const alterVulnFindingsAddFirstNotified = `ALTER TABLE vuln_findings ADD COLUMN first_verified_notified INTEGER NOT NULL DEFAULT 0;`
+
+// Nuclei verdicts must target the exact source result row, not every template
+// that shares a URL.
+const alterCandidatesAddSourceResultID = `ALTER TABLE candidates ADD COLUMN source_result_id TEXT NOT NULL DEFAULT '';`
+
+// A pending scope event records the proposed state so a later edit can be
+// distinguished from the earlier proposal.
+const alterBountyScopeEventsAddProposedHash = `ALTER TABLE bounty_scope_events ADD COLUMN proposed_hash TEXT NOT NULL DEFAULT '';`
+
+// proposed_raw_hash is the upstream state version a review event proposes.
+// Approval compares it with the catalog's current raw hash so a later silent
+// edit cannot land under an older decision (A13).
+const alterBountyScopeEventsAddProposedRawHash = `ALTER TABLE bounty_scope_events ADD COLUMN proposed_raw_hash TEXT NOT NULL DEFAULT '';`
+
+// The four user-facing signal categories. Existing chats receive both signal
+// switches enabled so their current coverage is kept; new chats use the quiet
+// lifecycle defaults set in AddChat.
+const alterTelegramChatsAddSignalPrefs = `
+ALTER TABLE telegram_chats ADD COLUMN notify_program_scope INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE telegram_chats ADD COLUMN notify_http_status INTEGER NOT NULL DEFAULT 1;`

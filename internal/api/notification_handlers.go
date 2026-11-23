@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,15 +10,16 @@ import (
 )
 
 type notification struct {
-	ID        string `json:"id"`
-	TargetID  string `json:"target_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	URL       string `json:"url"`
-	Severity  string `json:"severity"`
-	IsRead    bool   `json:"is_read"`
-	CreatedAt string `json:"created_at"`
+	ID        string         `json:"id"`
+	TargetID  string         `json:"target_id"`
+	Type      string         `json:"type"`
+	Title     string         `json:"title"`
+	Body      string         `json:"body"`
+	URL       string         `json:"url"`
+	Severity  string         `json:"severity"`
+	IsRead    bool           `json:"is_read"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	CreatedAt string         `json:"created_at"`
 }
 
 // notificationBuckets maps the bell's filter buckets to the stored
@@ -66,22 +68,44 @@ func notificationTypeFilter(bucket string) (string, []any) {
 	return " AND n.type IN (" + strings.Join(placeholders, ",") + ")", args
 }
 
+// unreadNotificationCount counts unread bell rows for one caller across every
+// bucket. The badge uses it, and the mark-read handlers return it so the UI
+// never has to guess a count that covers only the open bucket.
+func (h *Handler) unreadNotificationCount(ctx context.Context, uid int64, isAdmin bool) int {
+	readExpr := `CASE
+		WHEN EXISTS(SELECT 1 FROM notification_reads mine WHERE mine.notification_id=n.id AND mine.user_id=?) THEN 1
+		ELSE COALESCE(n.is_read,0) END`
+	query := `SELECT COUNT(*) FROM notifications n WHERE (` + readExpr + `)=0`
+	args := []any{uid}
+	if !isAdmin {
+		query += ` AND (COALESCE(n.target_id,'')='' OR EXISTS(
+			SELECT 1 FROM targets t WHERE t.id=n.target_id AND t.owner_id=?))`
+		args = append(args, uid)
+	}
+	var unread int
+	_ = h.db.QueryRowContext(ctx, query, args...).Scan(&unread)
+	return unread
+}
+
 // handleListNotifications returns the most recent notifications plus the current
 // unread count for the bell badge.
 func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request) {
 	uid, isAdmin := h.callerScope(r)
-	scope := ""
-	// New rows use per-user receipts. When no receipts exist at all for an older
-	// notification, retain its legacy is_read value to avoid resurfacing history.
+	// Start with a valid WHERE clause for every caller. An admin has no owner
+	// predicate; appending " AND n.type IN (...)" to an empty scope produced
+	// "FROM notifications n AND ..." and HTTP 500 (B1).
+	scope := " WHERE 1=1"
+	// New rows use per-user receipts. The legacy is_read fallback must not
+	// depend on receipts from other users, or one user's read action can
+	// resurrect old rows for everybody else (B5).
 	readExpr := `CASE
 		WHEN EXISTS(SELECT 1 FROM notification_reads mine WHERE mine.notification_id=n.id AND mine.user_id=?) THEN 1
-		WHEN NOT EXISTS(SELECT 1 FROM notification_reads any_read WHERE any_read.notification_id=n.id) THEN COALESCE(n.is_read,0)
-		ELSE 0 END`
+		ELSE COALESCE(n.is_read,0) END`
 	args := []any{uid}
 	if !isAdmin {
 		// Global (target-less) notices are shared; target notices belong only to
 		// the target owner. The old global query leaked every member's findings.
-		scope = ` WHERE (COALESCE(n.target_id,'')='' OR EXISTS(
+		scope += ` AND (COALESCE(n.target_id,'')='' OR EXISTS(
 			SELECT 1 FROM targets t WHERE t.id=n.target_id AND t.owner_id=?))`
 		args = append(args, uid)
 	}
@@ -95,7 +119,7 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 	}
 	rows, err := h.db.QueryContext(r.Context(), `
 		SELECT id, COALESCE(target_id,''), type, title, COALESCE(body,''), COALESCE(url,''),
-		       COALESCE(severity,'info'), `+readExpr+`, created_at
+		       COALESCE(severity,'info'), `+readExpr+`, COALESCE(n.metadata,'{}'), created_at
 		FROM notifications n`+scope+`
 		ORDER BY created_at DESC
 		LIMIT 100`, args...)
@@ -109,8 +133,11 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 	for rows.Next() {
 		var n notification
 		var read int
-		if rows.Scan(&n.ID, &n.TargetID, &n.Type, &n.Title, &n.Body, &n.URL, &n.Severity, &read, &n.CreatedAt) == nil {
+		var metadata string
+		if rows.Scan(&n.ID, &n.TargetID, &n.Type, &n.Title, &n.Body, &n.URL, &n.Severity, &read, &metadata, &n.CreatedAt) == nil {
 			n.IsRead = read == 1
+			n.Metadata = map[string]any{}
+			_ = json.Unmarshal([]byte(metadata), &n.Metadata)
 			items = append(items, n)
 		}
 	}
@@ -127,12 +154,8 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 			SELECT 1 FROM targets t WHERE t.id=n.target_id AND t.owner_id=?))`
 		unreadArgs = append(unreadArgs, uid)
 	}
-	// The badge counts the SAME rows the list shows, so a filtered bell never
-	// shows a badge for rows the operator cannot see.
-	if typeFilter != "" {
-		unreadQuery += typeFilter
-		unreadArgs = append(unreadArgs, typeArgs...)
-	}
+	// The badge counts unread rows across every bucket. The dropdown filter
+	// must never hide an unread finding behind the last viewed category (B3).
 	if err := h.db.QueryRowContext(r.Context(), unreadQuery, unreadArgs...).Scan(&unread); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to count notifications")
 		return
@@ -145,7 +168,8 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 // marks those; with no body (or empty ids) it marks ALL as read.
 func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []string `json:"ids"`
+		IDs  []string `json:"ids"`
+		Type string   `json:"type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		h.writeError(w, http.StatusBadRequest, "invalid request body")
@@ -161,13 +185,22 @@ func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Req
 	}
 
 	if len(req.IDs) == 0 {
-		args := append([]any{uid}, ownerArgs...)
+		// "Mark all read" applies to the selected bucket only. Without this
+		// scope the bell clears findings and other hidden categories (B3).
+		bulkTypeFilter, bulkTypeArgs := notificationTypeFilter(req.Type)
+		bulkScope := " WHERE 1=1" + ownerClause + bulkTypeFilter
+		args := []any{uid}
+		args = append(args, ownerArgs...)
+		args = append(args, bulkTypeArgs...)
 		if _, err := h.db.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
-			SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n WHERE 1=1`+ownerClause, args...); err != nil {
+			SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n`+bulkScope, args...); err != nil {
 			h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
 			return
 		}
-		h.writeSuccess(w, map[string]string{"message": "all marked read"})
+		h.writeSuccess(w, map[string]any{
+			"message": "all marked read",
+			"unread":  h.unreadNotificationCount(r.Context(), uid, isAdmin),
+		})
 		return
 	}
 	seen := map[string]bool{}
@@ -180,7 +213,10 @@ func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if len(ids) == 0 {
-		h.writeSuccess(w, map[string]string{"message": "marked read"})
+		h.writeSuccess(w, map[string]any{
+			"message": "marked read",
+			"unread":  h.unreadNotificationCount(r.Context(), uid, isAdmin),
+		})
 		return
 	}
 	marks := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
@@ -195,5 +231,8 @@ func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Req
 		h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
 		return
 	}
-	h.writeSuccess(w, map[string]string{"message": "marked read"})
+	h.writeSuccess(w, map[string]any{
+		"message": "marked read",
+		"unread":  h.unreadNotificationCount(r.Context(), uid, isAdmin),
+	})
 }

@@ -24,9 +24,12 @@ describe('categoryForChangeType', () => {
 
   it('maps alert change types to the alerts category', () => {
     for (const type of NOTIFICATION_ALLOWED_TYPES) {
+      if (type === 'new_host') continue
       expect(categoryForChangeType(type)).toBe('alerts')
     }
     expect(categoryForChangeType('new_host')).toBe('assets')
+    expect(categoryForChangeType('scope_proposed')).toBe('assets')
+    expect(categoryForChangeType('scope_rejected')).toBe('assets')
   })
 
   it('maps redirect_change to http', () => {
@@ -69,7 +72,9 @@ describe('isDefaultFeedRow', () => {
   })
 
   it('drops routine monitor and watch noise', () => {
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change' })).toBe(false)
+    // An actual status transition is a daily signal and stays visible.
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change' })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'http_change' })).toBe(true)
     expect(isDefaultFeedRow({ source: 'monitor', change_type: 'tech_change' })).toBe(false)
     expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change' })).toBe(false)
     expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain_extra' })).toBe(false)
@@ -156,12 +161,15 @@ describe('parseStatusTransition', () => {
     expect(parseStatusTransition('status=403 title=Forbidden', 'status=200 title=OK')).toEqual({ oldCode: 403, newCode: 200 })
   })
 
-  it('reads bare codes', () => {
-    expect(parseStatusTransition('301', '302')).toEqual({ oldCode: 301, newCode: 302 })
+  it('ignores bare codes that do not match the monitor format', () => {
+    // The server parses only "status=NNN " with a trailing space. Bare numbers
+    // must not produce pills where status filters exclude the row.
+    expect(parseStatusTransition('301', '302')).toEqual({ oldCode: undefined, newCode: undefined })
+    expect(parseStatusTransition('status=200x', 'path /403')).toEqual({ oldCode: undefined, newCode: undefined })
   })
 
-  it('prefers the explicit status code over an earlier bare number', () => {
-    expect(parseStatusTransition('2026-01-02 status=403', '2026-01-02 status=200')).toEqual({ oldCode: 403, newCode: 200 })
+  it('reads the explicit status code after a timestamp', () => {
+    expect(parseStatusTransition('2026-01-02 status=403 ', '2026-01-02 status=200 ')).toEqual({ oldCode: 403, newCode: 200 })
   })
 
   it('returns undefined when no code is present', () => {
