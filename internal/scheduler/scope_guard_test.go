@@ -36,6 +36,28 @@ func TestStoreAssetsAreNotScannableRoots(t *testing.T) {
 	}
 }
 
+func TestWildcardAssetSeedsApexNotPattern(t *testing.T) {
+	s := newTestScheduler(t)
+	if _, err := s.db.Exec(`INSERT INTO targets (id,domain) VALUES ('sgw','fallback.example.org')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO assets (id,target_id,name,value,kind,approval_status,asset_type)
+		VALUES ('gw1','sgw','','*.example.com','wildcard','approved','wildcard')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The seed loop stores the apex for a wildcard asset. It must never write
+	// the literal "*.example.com" as a concrete host.
+	seeds := s.loadProjectWebSeeds(context.Background(), "sgw")
+	if len(seeds) != 1 || seeds[0] != "*.example.com" {
+		t.Fatalf("web seeds=%v, want the raw wildcard asset", seeds)
+	}
+	roots := normalizeSubdomainRoots(seeds)
+	if want := []string{"example.com"}; !reflect.DeepEqual(roots, want) {
+		t.Fatalf("wildcard seed roots=%v, want %v", roots, want)
+	}
+}
+
 func TestNormalizeSubdomainRootsDropsStoreValues(t *testing.T) {
 	got := normalizeSubdomainRoots([]string{
 		"https://play.google.com/store/apps/details?id=com.example",

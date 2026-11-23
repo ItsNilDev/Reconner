@@ -1878,6 +1878,15 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		if host == "" {
 			host = tok // not a URL — treat the token itself as the host
 		}
+		// A wildcard asset is a scope pattern, not a host. Store its apex so
+		// the DNS root fan-out covers the descendants but the probe never sees
+		// a literal "*" and no bogus new-host event is emitted.
+		if scanner.IsWildcardScopePattern(host) {
+			if roots := normalizeSubdomainRoots([]string{host}); len(roots) > 0 {
+				host = roots[0]
+			}
+			didSeed = false
+		}
 		if didSeed {
 			if n := scanner.NormalizeEndpointURL(tok); n != "" {
 				endpointSeeds = append(endpointSeeds, n)

@@ -349,6 +349,42 @@ func TestEmitWatchNewHostsEmitsOnceAndMarksAnnounced(t *testing.T) {
 	}
 }
 
+func TestEmitWatchNewHostsSkipsWildcardScopePatterns(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	stmts := []string{
+		`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`,
+		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
+			VALUES ('round-0','t1','watch_scan','finished',1,'[]',1)`,
+		// The bad row a wildcard asset used to create in the seed loop.
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','*.example.com','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-wild','t1','*.example.com',1)`,
+		// A real host must still be announced.
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES ('t1','a.example','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-a','t1','a.example',1)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	got := s.emitWatchNewHosts(ctx, "round-1", "t1")
+	if len(got) != 1 || got[0].NewValue != "a.example" {
+		t.Fatalf("emitted %+v, want one event for a.example only", got)
+	}
+	var feedRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE target_id='t1'
+		AND (new_value LIKE '%*%' OR metadata LIKE '%*.example.com%')`).Scan(&feedRows); err != nil || feedRows != 0 {
+		t.Fatalf("wildcard feed rows = %d, err = %v, want 0", feedRows, err)
+	}
+	var wildcardPending int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_hosts WHERE target_id='t1'
+		AND host='*.example.com' AND announced_at IS NULL`).Scan(&wildcardPending); err != nil || wildcardPending != 0 {
+		t.Fatalf("wildcard row left pending = %d, err = %v, want 0", wildcardPending, err)
+	}
+}
+
 func TestEmitWatchNewHostsGroupsIdenticalFingerprints(t *testing.T) {
 	s := newTestScheduler(t)
 	ctx := context.Background()

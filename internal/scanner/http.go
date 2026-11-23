@@ -93,6 +93,24 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		}
 	}
 	rows.Close()
+	// A wildcard scope value such as "*.example.com" is a pattern, not a host.
+	// It must never reach a probe, a live-service row, or a new-host event.
+	// Old rows from earlier rounds are dropped here as well.
+	{
+		kept := hosts[:0]
+		var dropped int
+		for _, h := range hosts {
+			if IsWildcardScopePattern(h) {
+				dropped++
+				continue
+			}
+			kept = append(kept, h)
+		}
+		hosts = kept
+		if dropped > 0 {
+			logFn("info", "http_probe", fmt.Sprintf("Skipped %d wildcard scope pattern(s) — patterns are not hosts", dropped))
+		}
+	}
 	// Per-asset host scope: only probe hosts belonging to this scoped task.
 	if hostScopeSet(ctx) != nil {
 		kept := hosts[:0]
@@ -507,6 +525,9 @@ func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out
 }
 
 func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int, techs []string, server string) error {
+	if IsWildcardScopePattern(host) {
+		return nil
+	}
 	hasHTTPS := 0
 	hasHTTP := 0
 

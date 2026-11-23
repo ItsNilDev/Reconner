@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestIsWildcardScopePattern(t *testing.T) {
+	cases := map[string]bool{
+		"*.example.com": true,
+		"*":             true,
+		"example.*":     true,
+		"example.com":   false,
+		"a.example.com": false,
+		"":              false,
+	}
+	for raw, want := range cases {
+		if got := IsWildcardScopePattern(raw); got != want {
+			t.Errorf("IsWildcardScopePattern(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
 func TestNoHostScopeBlocksEveryHost(t *testing.T) {
 	ctx := WithNoHostScope(context.Background())
 	if hostScopeSet(ctx) == nil {

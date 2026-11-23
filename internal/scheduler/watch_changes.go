@@ -198,6 +198,14 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 		if !c.alive {
 			continue
 		}
+		// A wildcard scope pattern is not an observable host. Never emit it as
+		// a new host and never label it in or out of scope.
+		if scanner.IsWildcardScopePattern(c.host) {
+			// Close the bad row so it cannot stay pending every round.
+			_, _ = s.db.ExecContext(ctx, `UPDATE watch_hosts SET announced_at=CURRENT_TIMESTAMP
+				WHERE target_id=? AND host=?`, targetID, c.host)
+			continue
+		}
 		inScope, programID, assetID := scanner.IsWatchScopeHostEligible(ctx, s.db, targetID, c.host)
 		if !inScope {
 			programID, assetID = c.programID, c.assetID

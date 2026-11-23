@@ -7,6 +7,13 @@ import (
 	"strings"
 )
 
+// IsWildcardScopePattern reports whether raw is a scope pattern such as
+// "*.example.com" instead of a resolvable host. A literal wildcard is never an
+// observable host. Never probe it, record it, or emit it as a new host.
+func IsWildcardScopePattern(raw string) bool {
+	return strings.Contains(strings.TrimSpace(raw), "*")
+}
+
 type NetworkProfile string
 
 const (
