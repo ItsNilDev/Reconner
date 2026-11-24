@@ -10,20 +10,20 @@ import (
 
 func TestNewSubdomainNames(t *testing.T) {
 	before := map[string]bool{
-		"apex.example":         true,
-		"www.example":          true,
-		"kept.example":         true,
-		"vhost.example":        true, // inserted by the vhost path, already stored
-		"pruned.example":       true, // removed by pruning before the notify
+		"apex.example":   true,
+		"www.example":    true,
+		"kept.example":   true,
+		"vhost.example":  true, // inserted by the vhost path, already stored
+		"pruned.example": true, // removed by pruning before the notify
 	}
 	after := map[string]bool{
-		"apex.example":       true,
-		"www.example":        true,
-		"kept.example":       true,
-		"vhost.example":      true,
-		"deep.example":       true, // apex resolveAll
-		"recursive.example":  true, // recursiveEnum
-		"probe.example":      true, // upsertVhost
+		"apex.example":      true,
+		"www.example":       true,
+		"kept.example":      true,
+		"vhost.example":     true,
+		"deep.example":      true, // apex resolveAll
+		"recursive.example": true, // recursiveEnum
+		"probe.example":     true, // upsertVhost
 		// pruned.example is absent: pruning removed it, so it is not a new name.
 	}
 
@@ -93,7 +93,34 @@ func TestNewSubdomainMetadataTruncation(t *testing.T) {
 
 func TestNewSubdomainMetadataEmpty(t *testing.T) {
 	raw := newSubdomainMetadata(nil, 0)
-	if raw != `{"hosts":[],"truncated":false,"total":0}` {
+	if raw != `{"hosts":[],"all_hosts":[],"omitted":0,"truncated":false,"total":0}` {
 		t.Fatalf("empty metadata = %s", raw)
+	}
+}
+
+func TestNewSubdomainMetadataKeepsEveryNameForSearch(t *testing.T) {
+	hosts := make([]string, 0, 501)
+	for i := 0; i < 501; i++ {
+		hosts = append(hosts, fmt.Sprintf("h%03d.example.test", i))
+	}
+	raw := newSubdomainMetadata(hosts, len(hosts))
+	var parsed struct {
+		Hosts     []string `json:"hosts"`
+		AllHosts  []string `json:"all_hosts"`
+		Omitted   int      `json:"omitted"`
+		Truncated bool     `json:"truncated"`
+		Total     int      `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Hosts) != newSubdomainMetadataCap || parsed.Omitted != 1 || !parsed.Truncated || parsed.Total != 501 {
+		t.Fatalf("preview/omitted/total = %d/%d/%v/%d", len(parsed.Hosts), parsed.Omitted, parsed.Truncated, parsed.Total)
+	}
+	if len(parsed.AllHosts) != 501 || parsed.AllHosts[500] != "h500.example.test" {
+		t.Fatalf("all_hosts lost the last member: %d names", len(parsed.AllHosts))
+	}
+	if !strings.Contains(raw, "h500.example.test") {
+		t.Fatal("stored metadata cannot be searched by the last member")
 	}
 }

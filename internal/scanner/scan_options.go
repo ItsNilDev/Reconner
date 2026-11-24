@@ -14,6 +14,21 @@ func IsWildcardScopePattern(raw string) bool {
 	return strings.Contains(strings.TrimSpace(raw), "*")
 }
 
+type ctxTaskIDKey struct{}
+
+// WithTaskID attaches the executing task to a request context so observation
+// writers can record the actual breadth round or deep task id.
+func WithTaskID(ctx context.Context, taskID string) context.Context {
+	return context.WithValue(ctx, ctxTaskIDKey{}, taskID)
+}
+
+func taskIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxTaskIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 type NetworkProfile string
 
 const (

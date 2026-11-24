@@ -249,19 +249,45 @@ func matchWatchHost(entries []WatchScopeEntry, host WatchScopeHost) (WatchScopeE
 // ids so the watch host lifecycle can store the match without repeating the
 // lookup. A project with no linked program has no eligible scope.
 func IsWatchScopeHostEligible(ctx context.Context, db *database.DB, targetID, rawHost string) (bool, string, string) {
+	ok, programID, assetID, _ := IsWatchScopeHostEligibleE(ctx, db, targetID, rawHost)
+	return ok, programID, assetID
+}
+
+// IsWatchScopeHostEligibleE is the error-returning form of
+// IsWatchScopeHostEligible. A scope read failure is returned so a caller that
+// can act on it blocks the task instead of treating the host as out of scope.
+func IsWatchScopeHostEligibleE(ctx context.Context, db *database.DB, targetID, rawHost string) (bool, string, string, error) {
 	entries, hasProgram, err := LoadWatchEligibleScope(ctx, db, targetID)
-	if err != nil || !hasProgram || len(entries) == 0 {
-		return false, "", ""
+	if err != nil {
+		return false, "", "", err
+	}
+	if !hasProgram || len(entries) == 0 {
+		return false, "", "", nil
 	}
 	host, ok := normalizeWatchHost(rawHost)
 	if !ok {
-		return false, "", ""
+		return false, "", "", nil
 	}
 	entry, ok := matchWatchHost(entries, host)
 	if !ok {
-		return false, "", ""
+		return false, "", "", nil
 	}
-	return true, entry.ProgramID, entry.AssetID
+	return true, entry.ProgramID, entry.AssetID, nil
+}
+
+// HostMatchesWatchScope applies exact and wildcard program rules to raw. A
+// bare exact host covers only the apex; a *.base rule covers descendants but
+// not the apex itself.
+func HostMatchesWatchScope(entries []WatchScopeEntry, raw string) (string, string, bool) {
+	host, ok := normalizeWatchHost(raw)
+	if !ok {
+		return "", "", false
+	}
+	entry, ok := matchWatchHost(entries, host)
+	if !ok {
+		return "", "", false
+	}
+	return entry.ProgramID, entry.AssetID, true
 }
 
 func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, hosts []string, logFn LogFunc) []string {
@@ -343,6 +369,7 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 		"program_id":    entry.ProgramID,
 		"program_asset": entry.AssetID,
 		"out_of_scope":  0,
+		"task_id":       taskIDFromContext(ctx),
 	}
 	metaJSON, _ := json.Marshal(meta)
 	if err := insertWatchScopeEvent(ctx, tx, targetID, entry.ProgramID, host.Value, "landed", assetID, metaJSON); err != nil {
@@ -392,6 +419,7 @@ func reactivateWatchAsset(ctx context.Context, db watchScopeDB, targetID, assetI
 		"program_id":    entry.ProgramID,
 		"program_asset": entry.AssetID,
 		"out_of_scope":  0,
+		"task_id":       taskIDFromContext(ctx),
 	}
 	metaJSON, _ := json.Marshal(meta)
 	if _, err := db.ExecContext(ctx,
@@ -491,6 +519,10 @@ func SweepWatchScopeOutOfScope(ctx context.Context, db *database.DB, targetID st
 			`UPDATE assets SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
 			string(metaJSON), a.id); err == nil {
 			marked++
+			eventMeta, _ := json.Marshal(map[string]any{
+				"out_of_scope": 1, "task_id": taskIDFromContext(ctx),
+			})
+			_ = insertWatchScopeEvent(ctx, db, targetID, "", a.value, "out_of_scope", a.id, eventMeta)
 		}
 	}
 	if marked > 0 {

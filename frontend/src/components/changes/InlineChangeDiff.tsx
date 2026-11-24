@@ -6,6 +6,8 @@ interface Props {
   oldValue: string
   newValue: string
   changeType: string
+  oldStatus?: number
+  newStatus?: number
 }
 
 function StatusPill({ code }: { code?: number }) {
@@ -17,8 +19,10 @@ function StatusPill({ code }: { code?: number }) {
   )
 }
 
-export default function InlineChangeDiff({ oldValue, newValue, changeType }: Props) {
-  const { oldCode, newCode } = parseStatusTransition(oldValue, newValue)
+export default function InlineChangeDiff({ oldValue, newValue, changeType, oldStatus, newStatus }: Props) {
+  const parsed = parseStatusTransition(oldValue, newValue)
+  const oldCode = oldStatus || parsed.oldCode
+  const newCode = newStatus || parsed.newCode
   const statusTypes = ['status_change', 'http_change', 'page_change']
   if (statusTypes.includes(changeType) && (oldCode || newCode)) {
     return (

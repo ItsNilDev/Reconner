@@ -716,6 +716,61 @@ func TestReconcileRefreshesProgramDenySnapshot(t *testing.T) {
 	}
 }
 
+// A deny rule can change without any asset row. Sync records the rule edit
+// itself, and a repeated sync of the same rules adds no duplicate event.
+func TestReconcileRecordsDenyRuleEvents(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{
+		Provider: "hackerone", ExternalID: "deny-rule-1", Handle: "denyrule", Name: "Deny Rule",
+		Status: "live", ProgramType: "bug_bounty",
+		Assets: []Asset{
+			{ExternalID: "scope-in", Identifier: "acme.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+		},
+	}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{
+		Name: "Deny Rule", AssetIDs: []string{p.Assets[0].ID}, MonitorEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRules := func(eventType string) int {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM bounty_scope_events WHERE target_id=? AND event_type=?`, projectID, eventType).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	p.Assets = append(p.Assets, Asset{
+		ExternalID: "scope-out", Identifier: "admin.acme.test", AssetType: "DOMAIN",
+		InScope: false, EligibleSubmission: false, Active: true,
+	})
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if countRules("rule_added") != 1 {
+		t.Fatalf("rule_added events=%d, want 1", countRules("rule_added"))
+	}
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if countRules("rule_added") != 1 {
+		t.Fatalf("repeat sync added rule event: %d", countRules("rule_added"))
+	}
+
+	p.Assets = p.Assets[:1]
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if countRules("rule_removed") != 1 {
+		t.Fatalf("rule_removed events=%d, want 1", countRules("rule_removed"))
+	}
+}
+
 func TestListScopeEventsHidesNonWebHistory(t *testing.T) {
 	svc, db := testCatalog(t)
 	p := Program{

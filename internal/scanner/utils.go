@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -25,17 +26,45 @@ var probeHTTPClient = &http.Client{
 }
 
 func probeURL(url string) *models.HTTPService {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return probeURLWithContext(context.Background(), url)
+}
+
+// probeURLWithContext runs the native fallback with the task context. It adds a
+// scope check to every redirect so a request cannot follow an allowed URL to a
+// destination outside the current project scope. The transport already blocks
+// excluded CIDRs at connect time through scopeGuardedDialContext.
+func probeURLWithContext(ctx context.Context, rawURL string) *models.HTTPService {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	client := &http.Client{
+		Transport: sharedHTTPTransport,
+		Timeout:   10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return http.ErrUseLastResponse
+			}
+			if !urlHostInScope(ctx, req.URL.String()) {
+				return fmt.Errorf("%w: redirect to %s is outside scope", ErrDestinationBlocked, req.URL.Host)
+			}
+			return nil
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return nil
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ReconBot/1.0)")
 
-	resp, err := probeHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		return nil
 	}
 	defer resp.Body.Close()
@@ -50,7 +79,7 @@ func probeURL(url string) *models.HTTPService {
 	contentType := resp.Header.Get("Content-Type")
 
 	return &models.HTTPService{
-		URL:           url,
+		URL:           rawURL,
 		StatusCode:    resp.StatusCode,
 		Title:         title,
 		Server:        server,

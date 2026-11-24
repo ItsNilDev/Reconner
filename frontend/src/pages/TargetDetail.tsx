@@ -12,8 +12,11 @@ import { ws } from '../lib/websocket'
 import { timeAgo, timeUntil, statusCodeColor, truncate, cn, safeHref } from '../lib/utils'
 import {
   CHANGE_FILTERS, OCCURRENCE_PAGE_SIZE, changeBadgeVariant, groupMonitorChanges,
+  isScopeEvent, scopeChangedFields, scopeEventSummary, scopeReviewLabel,
   monitorRowKind, type ChangeFilter, type MonitorChangeGroup,
 } from '../components/changes/changesModel'
+import ScopeEventView from '../components/changes/ScopeEventView'
+import ChangeLog from '../components/changes/ChangeLog'
 import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding, Parameter,
   DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService, ChangeEntry
@@ -472,6 +475,10 @@ export default function TargetDetail() {
     const q = searchParams.get('q') || ''
     return q.length < 200 ? q : ''
   }, [searchParams])
+  const initialEventId = useMemo(() => {
+    const e = searchParams.get('event') || ''
+    return e.length < 200 ? e : ''
+  }, [searchParams])
   const { addToast } = useUIStore()
   const [target, setTarget] = useState<Target | null>(null)
   const [tab, setTab] = useState(initialTab)
@@ -503,6 +510,8 @@ export default function TargetDetail() {
   // Presence in the map means the group is expanded.
   const [expandedOccurrences, setExpandedOccurrences] = useState<Map<string, number>>(new Map())
   const [diffView, setDiffView] = useState<{ url: string; kind: 'css' | 'js' } | null>(null)
+  // Scope-event Details drawer. Uses the same renderer as the sidebar feed.
+  const [scopeDetail, setScopeDetail] = useState<ChangeEntry | null>(null)
   const [isScanning, setIsScanning] = useState(false)
   const [monitorSaving, setMonitorSaving] = useState(false)
   const [catchallSaving, setCatchallSaving] = useState(false)
@@ -512,6 +521,7 @@ export default function TargetDetail() {
   const [coverageBusy, setCoverageBusy] = useState(false)
   const [watchScopeEvents, setWatchScopeEvents] = useState<WatchScopeEvent[]>([])
   const [paths, setPaths] = useState<AttackPath[]>([])
+  const [programNames, setProgramNames] = useState<Record<string, string>>({})
   const [lastFailedTask, setLastFailedTask] = useState<Task | null>(null)
   const [resuming, setResuming] = useState(false)
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -544,6 +554,11 @@ export default function TargetDetail() {
     loadAssets()
     loadWatchScope()
     loadScopeEvents()
+    bountyApi.list().then(r => {
+      const names: Record<string, string> = {}
+      for (const prog of r.programs || []) names[prog.id] = prog.name
+      setProgramNames(names)
+    }).catch(() => {})
   }, [id, loadScopeEvents])
 
   const loadAssets = () => { if (id) targetsApi.assets(id).then(a => setAssets(a || [])).catch(() => {}) }
@@ -674,7 +689,10 @@ export default function TargetDetail() {
   useEffect(() => {
     // The review panel is outside the Changes tab, so its data must refresh on
     // scope events even when another tab is open (B16).
-    const onScope = () => loadScopeEvents()
+    const onScope = () => {
+      loadScopeEvents()
+      loadWatchScope()
+    }
     const offs: (() => void)[] = [ws.on('bounty_scope_change', onScope)]
     if (tab === 'monitor') {
       const reload = (payload: unknown) => {
@@ -697,12 +715,16 @@ export default function TargetDetail() {
         if (ev.target_id !== id) return
         setIsScanning(false)
         loadTab(tab)
+        // A breadth round can land or revoke Watch scope. Reload both scope
+        // views so the review card and the history agree after the round.
+        loadScopeEvents()
+        loadWatchScope()
         targetsApi.get(id!).then(setTarget).catch(() => {})
       }),
       ws.on('task_cancelled', () => setIsScanning(false)),
     ]
     return () => unsubs.forEach(u => u())
-  }, [id, tab])
+  }, [id, tab, loadScopeEvents])
 
   useEffect(() => { if (id) loadTab(tab) }, [tab, id, fpView])
 
@@ -818,6 +840,14 @@ export default function TargetDetail() {
     if (!id) return
     const seq = ++requestSeqRef.current
     const requestTarget = id
+    if (t === 'monitor') {
+      // The shared ChangeLog owns its own paged fetch and controls. Do not
+      // load the old full-history table in the background.
+      setData([])
+      setDataError('')
+      setTabLoading(false)
+      return
+    }
     try {
       let r: unknown[] = []
       if (t === 'subdomains') r = await findingsApi.subdomains(id)
@@ -1097,7 +1127,13 @@ export default function TargetDetail() {
 			  <div key={e.id} className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3">
 				<div className="min-w-0 flex-1">
 				  <div className="flex items-center gap-2"><Badge variant={e.event_type === 'removed' ? 'critical' : e.event_type === 'added' ? 'low' : 'medium'}>{e.event_type}</Badge><code className="text-[11px] break-all">{e.identifier}</code></div>
-				  <p className="mt-1 text-[10px] text-text-muted">Detected {timeAgo(e.detected_at)}{e.resolved_at ? ` · Resolved ${timeAgo(e.resolved_at)}` : ''}</p>
+				  <p className="mt-1 text-[10px] text-text-muted">
+					{programNames[e.program_id] || e.program_id || 'Program'} · {scopeReviewLabel(e.status)}
+					{' · '}Detected {timeAgo(e.detected_at)}{e.resolved_at ? ` · Resolved ${timeAgo(e.resolved_at)}` : ''}
+				  </p>
+				  {scopeChangedFields(e.old_json, e.new_json).slice(0, 4).map(f => (
+					<p key={f.field} className="mt-0.5 text-[10px] text-text-muted">{f.field}: {f.before} → {f.after}</p>
+				  ))}
 				</div>
 				<div className="flex gap-2 self-end sm:self-auto">
 				  {e.status === 'pending' && <Button size="sm" variant="ghost" disabled={eventBusy === e.id} onClick={() => resolveScopeEvent(e,'reject')}>Dismiss</Button>}
@@ -1439,7 +1475,9 @@ export default function TargetDetail() {
           not leave the fallback stuck when the operator switches tabs. */}
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
-        {dataError && !tabLoading
+        {tab === 'monitor'
+          ? <div className="p-3"><ChangeLog targetId={id} compact initialEventId={initialEventId} /></div>
+          : dataError && !tabLoading
           ? <div className="p-4 text-sm text-severity-high" role="alert">{dataError}</div>
           : tabLoading
           ? <div className="py-2"><SkeletonRows rows={8} cols={5} /></div>
@@ -1916,6 +1954,9 @@ export default function TargetDetail() {
                     })}
                     {tab === 'monitor' && monitorGroupPage.map(g => {
                       const c = g.rep
+                      const change = c as ChangeEntry
+                      const scopeRow = isScopeEvent(change)
+                      const scopeFields = scopeRow ? scopeChangedFields(change.old_value, change.new_value) : []
                       const cHref = safeHref(c.url)
                       const occurrences = g.items.length - 1
                       const shownCount = expandedOccurrences.get(g.key) ?? 0
@@ -1924,19 +1965,32 @@ export default function TargetDetail() {
                         <Fragment key={c.id}>
                           <tr className="table-row align-top">
                             <td className="table-cell max-w-xs">
-                              <div className="flex items-center gap-1.5">
-                                {cHref
-                                  ? <a href={cHref} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
-                                  : <span className="text-xs font-mono truncate">{truncate(c.url, 50)}</span>}
-                                <CopyButton text={c.url} />
-                                {/* Content-capture diff for monitored stylesheets/scripts.
-                                    Legacy rows (recorded before capture) open too, but
-                                    show the not-captured note + hashes only. */}
-                                {(c.change_type === 'css_change' || c.change_type === 'js_change') && (
-                                  <button onClick={() => setDiffView({ url: c.url, kind: c.change_type === 'css_change' ? 'css' : 'js' })}
-                                    className="btn-secondary text-[10px] px-1.5 py-0.5 shrink-0">Diff</button>
-                                )}
-                              </div>
+                              {scopeRow ? (
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="text-xs text-text-primary">{scopeEventSummary(change)}</span>
+                                  {scopeReviewLabel(change.scope_status) && (
+                                    <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted">
+                                      {scopeReviewLabel(change.scope_status)}
+                                    </span>
+                                  )}
+                                  <button type="button" onClick={() => setScopeDetail(change)}
+                                    className="text-[10px] text-accent hover:underline">Details</button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-1.5">
+                                  {cHref
+                                    ? <a href={cHref} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
+                                    : <span className="text-xs font-mono truncate">{truncate(c.url, 50)}</span>}
+                                  <CopyButton text={c.url} />
+                                  {/* Content-capture diff for monitored stylesheets/scripts.
+                                      Legacy rows (recorded before capture) open too, but
+                                      show the not-captured note + hashes only. */}
+                                  {(c.change_type === 'css_change' || c.change_type === 'js_change') && (
+                                    <button onClick={() => setDiffView({ url: c.url, kind: c.change_type === 'css_change' ? 'css' : 'js' })}
+                                      className="btn-secondary text-[10px] px-1.5 py-0.5 shrink-0">Diff</button>
+                                  )}
+                                </div>
+                              )}
                               {occurrences > 0 && (
                                 <button
                                   onClick={() => setExpandedOccurrences(prev => {
@@ -1953,22 +2007,34 @@ export default function TargetDetail() {
                               )}
                             </td>
                             <td className="table-cell">
-                              <Badge variant={changeBadgeVariant(c)}>{c.change_type}</Badge>
+                              <Badge variant={changeBadgeVariant(c)}>{scopeRow ? 'Scope' : c.change_type}</Badge>
                             </td>
                             {/* Old/new values were truncated to 50 chars with no way to read the
                                 rest. Now each value wraps, shows the full text on hover, and has a
                                 copy button, so a full diff is actually inspectable. */}
-                            <td className="table-cell text-xs text-text-muted font-mono break-all whitespace-pre-wrap max-w-sm">
-                              <div className="flex items-start gap-1">
-                                <span title={c.old_value} className="flex-1">{c.old_value || '—'}</span>
-                                {c.old_value && <CopyButton text={c.old_value} />}
-                              </div>
+                            <td className="table-cell text-xs text-text-muted break-all whitespace-pre-wrap max-w-sm">
+                              {scopeRow ? (
+                                scopeFields.length
+                                  ? scopeFields.map(f => <div key={f.field}><span className="text-text-muted">{f.field}:</span> <span className="text-severity-medium line-through">{f.before}</span></div>)
+                                  : <span className="text-text-muted">—</span>
+                              ) : (
+                                <div className="flex items-start gap-1 font-mono">
+                                  <span title={c.old_value} className="flex-1">{c.old_value || '—'}</span>
+                                  {c.old_value && <CopyButton text={c.old_value} />}
+                                </div>
+                              )}
                             </td>
-                            <td className="table-cell text-xs text-severity-medium font-mono break-all whitespace-pre-wrap max-w-sm">
-                              <div className="flex items-start gap-1">
-                                <span title={c.new_value} className="flex-1">{c.new_value || '—'}</span>
-                                {c.new_value && <CopyButton text={c.new_value} />}
-                              </div>
+                            <td className="table-cell text-xs text-severity-medium break-all whitespace-pre-wrap max-w-sm">
+                              {scopeRow ? (
+                                scopeFields.length
+                                  ? scopeFields.map(f => <div key={f.field}><span className="text-text-muted">{f.field}:</span> <span className="text-severity-low">{f.after}</span></div>)
+                                  : <span className="text-text-muted">—</span>
+                              ) : (
+                                <div className="flex items-start gap-1 font-mono">
+                                  <span title={c.new_value} className="flex-1">{c.new_value || '—'}</span>
+                                  {c.new_value && <CopyButton text={c.new_value} />}
+                                </div>
+                              )}
                             </td>
                             <td className="table-cell text-xs whitespace-nowrap">{timeAgo(c.detected_at)}</td>
                           </tr>
@@ -1983,7 +2049,9 @@ export default function TargetDetail() {
                                       ? <a href={itHref} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono break-all">{truncate(it.url, 80)}</a>
                                       : <span className="font-mono break-all">{truncate(it.url, 80)}</span>}
                                     <CopyButton text={it.url} />
-                                    <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>
+                                    {isScopeEvent(it as ChangeEntry)
+                                      ? <span className="break-all">{scopeEventSummary(it as ChangeEntry)}</span>
+                                      : <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>}
                                     <span className="whitespace-nowrap">{timeAgo(it.detected_at)}</span>
                                   </div>
                                 </td>
@@ -2068,6 +2136,19 @@ export default function TargetDetail() {
       )}
       {diffView && (
         <ChangeDiffViewer targetId={id!} url={diffView.url} kind={diffView.kind} onClose={() => setDiffView(null)} />
+      )}
+      {scopeDetail && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={() => setScopeDetail(null)}>
+          <div className="h-full w-full max-w-lg overflow-y-auto border-l border-border bg-surface-1 p-5" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start justify-between gap-3">
+              <h3 className="text-sm font-semibold">Scope event</h3>
+              <Button size="sm" variant="ghost" onClick={() => setScopeDetail(null)}>Close</Button>
+            </div>
+            <div className="mt-4">
+              <ScopeEventView item={scopeDetail} variant="details" programName={scopeDetail.program_id ? programNames[scopeDetail.program_id] : undefined} />
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Coverage change confirmation */}

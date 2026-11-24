@@ -32,6 +32,8 @@ type ChangeEntry struct {
 	ProgramAssetID string `json:"program_asset_id,omitempty"`
 	ScopeStatus    string `json:"scope_status,omitempty"`
 	ResolvedAt     string `json:"resolved_at,omitempty"`
+	OldStatus      int    `json:"old_status,omitempty"`
+	NewStatus      int    `json:"new_status,omitempty"`
 }
 
 // WatchRound is one finished or running watch task for the round filter strip.
@@ -58,7 +60,7 @@ func changeCategoryExpr(col string) string {
 		WHEN ` + col + ` LIKE '%header%' THEN 'headers'
 		WHEN ` + col + ` LIKE 'security:%' THEN 'security'
 		WHEN ` + col + ` = 'tech_change' THEN 'tech'
-		WHEN ` + col + ` IN ('new_subdomain','new_host','scope_proposed','scope_landed','scope_modified','scope_removed','scope_rejected') THEN 'assets'
+		WHEN ` + col + ` IN ('new_subdomain','new_host','scope_proposed','scope_landed','scope_modified','scope_removed','scope_rejected','scope_rule_added','scope_rule_removed','scope_re_eligible') THEN 'assets'
 		WHEN ` + col + ` IN ('watch_failed','watch_kind_conflict','monitor_failed','monitor_escalation_started','scan_auto_paused','bounty_scope_change') THEN 'alerts'
 		ELSE 'http' END`
 }
@@ -101,19 +103,14 @@ func parseChangesSince(raw string) string {
 func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inner, whereSQL string, ownerArgs, filterArgs []any) {
 	q := r.URL.Query()
 	uid, isAdmin := h.callerScope(r)
-	// Detail-tier watch rows (status/page/tech/redirect) are hidden from the
-	// default feed. A caller that asks for status filters or one round must see
-	// them, so the watch source widens only for those requests.
-	watchDetail := q.Get("status_only") != "" || q.Get("status_class") != "" || q.Get("status_code") != "" ||
-		q.Get("task_id") != "" || q.Get("default_view") == "1"
-
 	args := make([]any, 0, 8)
 	sourceMonitor := `SELECT mc.id, 'monitor' AS source, mc.target_id, COALESCE(t.domain,'') AS target_name, '' AS task_id,
 		COALESCE(mc.url,'') AS url, mc.change_type, ` + changeCategoryExpr("mc.change_type") + ` AS category,
 		COALESCE(mc.severity,'info') AS severity, COALESCE(mc.old_value,'') AS old_value,
 		COALESCE(mc.new_value,'') AS new_value, '{}' AS metadata,
 		COALESCE(mc.detected_at,'') AS detected_at,
-		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at
+		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at,
+		COALESCE(mc.old_status,0) AS old_status, COALESCE(mc.new_status,0) AS new_status
 		FROM monitoring_changes mc JOIN targets t ON t.id=mc.target_id WHERE 1=1`
 	if !isAdmin {
 		sourceMonitor += ` AND t.owner_id=?`
@@ -126,35 +123,55 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		COALESCE(wc.severity,'info') AS severity, COALESCE(wc.old_value,'') AS old_value,
 		COALESCE(wc.new_value,'') AS new_value, COALESCE(wc.metadata,'{}') AS metadata,
 		COALESCE(wc.detected_at,'') AS detected_at,
-		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at
+		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at,
+		COALESCE(wc.old_status,0) AS old_status, COALESCE(wc.new_status,0) AS new_status
 		FROM watch_round_changes wc JOIN targets t ON t.id=wc.target_id
 		WHERE 1=1`
-		if !watchDetail {
-			sourceWatch += ` AND wc.change_type='new_subdomain'`
-		}
 	if !isAdmin {
 		sourceWatch += ` AND t.owner_id=?`
 		args = append(args, uid)
 	}
 
-	// A pending event is a proposal, not landed scope. Rejected events are
-	// shown as dismissed so the feed never claims a change that was denied.
-	scopeType := `CASE WHEN se.status='pending' THEN 'scope_proposed'
-		WHEN se.status='rejected' THEN 'scope_rejected'
-		WHEN se.event_type='added' THEN 'scope_landed'
+	// Event type and decision state are separate facts. A pending addition is
+	// still an addition; its review state travels in scope_status.
+	scopeType := `CASE WHEN se.event_type='added' THEN 'scope_landed'
 		WHEN se.event_type='modified' THEN 'scope_modified'
 		WHEN se.event_type='removed' THEN 'scope_removed'
+		WHEN se.event_type='rule_added' THEN 'scope_rule_added'
+		WHEN se.event_type='rule_removed' THEN 'scope_rule_removed'
 		ELSE COALESCE(se.event_type,'') END`
 	sourceScope := `SELECT se.id, 'bounty' AS source, se.target_id, COALESCE(t.domain,'') AS target_name, '' AS task_id,
 		COALESCE(se.identifier,'') AS url, ` + scopeType + ` AS change_type, ` + changeCategoryExpr(scopeType) + ` AS category,
 		'info' AS severity, COALESCE(se.old_json,'') AS old_value, COALESCE(se.new_json,'') AS new_value,
 		COALESCE(se.new_json,'{}') AS metadata, COALESCE(se.detected_at,'') AS detected_at,
 		COALESCE(se.program_id,'') AS program_id, COALESCE(se.program_asset_id,'') AS program_asset_id,
-		COALESCE(se.status,'') AS scope_status, COALESCE(se.resolved_at,'') AS resolved_at
+		COALESCE(se.status,'') AS scope_status, COALESCE(se.resolved_at,'') AS resolved_at,
+		0 AS old_status, 0 AS new_status
 		FROM bounty_scope_events se JOIN targets t ON t.id=se.target_id
-		WHERE se.event_type IN ('added','modified','removed')`
+		WHERE se.event_type IN ('added','modified','removed','rule_added','rule_removed')`
 	if !isAdmin {
 		sourceScope += ` AND t.owner_id=?`
+		args = append(args, uid)
+	}
+
+	// Watch scope landings are a distinct origin. They keep their recorded
+	// event type (landed, re_eligible, or out_of_scope); current eligibility is
+	// separate metadata, so a later loss of scope cannot rewrite history.
+	sourceWatchScope := `SELECT we.id, 'watch_scope' AS source, we.target_id,
+		COALESCE(t.domain,'') AS target_name,
+		COALESCE(json_extract(we.metadata,'$.task_id'),'') AS task_id,
+		COALESCE(we.identifier,'') AS url,
+		CASE WHEN we.event_type='landed' THEN 'scope_landed'
+		     WHEN we.event_type='re_eligible' THEN 'scope_re_eligible'
+		     ELSE COALESCE(we.event_type,'') END AS change_type,
+		'assets' AS category, 'info' AS severity, '' AS old_value,
+		COALESCE(we.identifier,'') AS new_value, COALESCE(we.metadata,'{}') AS metadata,
+		COALESCE(we.detected_at,'') AS detected_at,
+		COALESCE(we.program_id,'') AS program_id, COALESCE(we.asset_id,'') AS program_asset_id,
+		'' AS scope_status, '' AS resolved_at, 0 AS old_status, 0 AS new_status
+		FROM watch_scope_events we JOIN targets t ON t.id=we.target_id WHERE 1=1`
+	if !isAdmin {
+		sourceWatchScope += ` AND t.owner_id=?`
 		args = append(args, uid)
 	}
 
@@ -164,7 +181,7 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		` + changeCategoryExpr("n.type") + ` AS category,
 		COALESCE(n.severity,'info') AS severity, '' AS old_value, COALESCE(n.body,'') AS new_value,
 		COALESCE(n.metadata,'{}') AS metadata, COALESCE(n.created_at,'') AS detected_at,
-		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at
+		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at, 0 AS old_status, 0 AS new_status
 		FROM notifications n LEFT JOIN targets t ON t.id=n.target_id
 		WHERE COALESCE(n.type,'') IN ('watch_failed','watch_kind_conflict','monitor_failed',
 			'monitor_escalation_started','scan_auto_paused','bounty_scope_change','new_host')`
@@ -175,7 +192,7 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	}
 
 	unionSQL := `( ` + sourceMonitor + ` UNION ALL ` + sourceWatch + ` UNION ALL ` +
-		sourceScope + ` UNION ALL ` + sourceNotification + ` )`
+		sourceScope + ` UNION ALL ` + sourceWatchScope + ` UNION ALL ` + sourceNotification + ` )`
 
 	// Build derived status codes in a wrapper around the UNION. Source aliases
 	// (mc/wc/se/n) differ and the sources are not uniform, so referencing x.*
@@ -199,7 +216,11 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	// Apply it before COUNT and LIMIT so pagination and Mark all read cannot
 	// hide behind a page of routine monitor diffs (A11).
 	if q.Get("default_view") == "1" {
-		filters = append(filters, `((x.source IN ('watch','bounty') OR (x.source='notification' AND x.change_type='new_host')) OR (x.source='monitor' AND x.change_type IN ('http_change','status_change')))`)
+		filters = append(filters, `((x.source='watch' AND x.change_type IN ('new_subdomain','status_change')) OR x.source IN ('bounty','watch_scope') OR (x.source='notification' AND x.change_type='new_host')) OR (x.source='monitor' AND x.change_type IN ('http_change','status_change')))`)
+	}
+	if eventID := q.Get("event_id"); eventID != "" {
+		filters = append(filters, `x.id=?`)
+		filterArgs = append(filterArgs, eventID)
 	}
 	targetID := forcedTargetID
 	if targetID == "" {
@@ -400,7 +421,7 @@ func (h *Handler) listChanges(w http.ResponseWriter, r *http.Request, forcedTarg
 	dataArgs = append(dataArgs, limit, offset)
 	rows, err := h.db.QueryContext(r.Context(), `SELECT x.id, x.source, x.target_id, x.target_name, x.task_id,
 		x.url, x.change_type, x.category, x.severity, x.old_value, x.new_value, x.metadata, x.detected_at,
-		x.program_id, x.program_asset_id, x.scope_status, x.resolved_at,
+		x.program_id, x.program_asset_id, x.scope_status, x.resolved_at, x.old_status, x.new_status,
 		CASE WHEN cs.change_id IS NULL THEN 0 ELSE 1 END AS seen
 		FROM `+inner+` LEFT JOIN change_seen cs ON cs.change_id=x.id AND cs.user_id=? `+
 		whereSQL+` ORDER BY x.detected_at DESC, x.id DESC LIMIT ? OFFSET ?`, dataArgs...)
@@ -416,7 +437,7 @@ func (h *Handler) listChanges(w http.ResponseWriter, r *http.Request, forcedTarg
 		var metadata string
 		if err := rows.Scan(&e.ID, &e.Source, &e.TargetID, &e.TargetName, &e.TaskID,
 			&e.URL, &e.ChangeType, &e.Category, &e.Severity, &e.OldValue, &e.NewValue,
-			&metadata, &e.DetectedAt, &e.ProgramID, &e.ProgramAssetID, &e.ScopeStatus, &e.ResolvedAt, &e.Seen); err != nil {
+			&metadata, &e.DetectedAt, &e.ProgramID, &e.ProgramAssetID, &e.ScopeStatus, &e.ResolvedAt, &e.OldStatus, &e.NewStatus, &e.Seen); err != nil {
 			h.writeError(w, http.StatusInternalServerError, "scan failed")
 			return
 		}

@@ -411,7 +411,7 @@ func TestListChangesNewFilters(t *testing.T) {
 		{"code 200", "/api/changes?status_code=200", []string{"mc-deep", "wc-watch", "mc-title", "mc-pct"}},
 		{"code 403", "/api/changes?status_code=403", []string{"mc-deep"}},
 		{"multi category", "/api/changes?category=scripts,alerts", []string{"wc-js", "n-alert"}},
-		{"all plus category", "/api/changes?category=all,http", []string{"mc-deep", "mc-title", "wc-removed", "mc-longcode", "mc-plain", "mc-pct"}},
+		{"all plus category", "/api/changes?category=all,http", []string{"mc-deep", "mc-title", "wc-removed", "wc-watch", "mc-longcode", "mc-plain", "mc-pct"}},
 		{"q plain", "/api/changes?q=Forbidden", []string{"mc-deep"}},
 		{"q literal percent", "/api/changes?q=%25", []string{"mc-pct"}},
 	}
@@ -670,7 +670,7 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAll := []string{
-		"mc-any", "wc-new", "n-watch-failed", "n-watch-kind", "n-monitor-failed",
+		"mc-any", "wc-new", "wc-detail", "wc-removed", "n-watch-failed", "n-watch-kind", "n-monitor-failed",
 		"n-escalation", "n-auto-paused", "n-bounty-scope", "n-new-host-allowed", "se-added", "se-modified", "se-removed",
 	}
 	cases := []struct {
@@ -680,7 +680,7 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 	}{
 		{"all", "/api/changes", wantAll},
 		{"source monitor", "/api/changes?source=monitor", []string{"mc-any"}},
-		{"source watch", "/api/changes?source=watch", []string{"wc-new"}},
+		{"source watch", "/api/changes?source=watch", []string{"wc-new", "wc-detail", "wc-removed"}},
 		{"source notification", "/api/changes?source=notification", []string{
 			"n-watch-failed", "n-watch-kind", "n-monitor-failed", "n-escalation", "n-auto-paused", "n-bounty-scope", "n-new-host-allowed",
 		}},
@@ -748,10 +748,15 @@ func TestChangesFeedSourceAllowLists(t *testing.T) {
 			t.Errorf("se-added metadata = %+v, want value=new.example", row.Metadata)
 		}
 	}
-	// A pending upstream proposal is surfaced as scope_proposed. Only an
-	// approved event is described as landed (A10).
-	if types["se-added"] != "scope_proposed" || types["se-modified"] != "scope_proposed" || types["se-removed"] != "scope_proposed" {
-		t.Errorf("scope change types = %v, want scope_proposed for pending events", types)
+	// Event type and decision state stay separate. A pending addition is still
+	// an addition; pending state is returned in scope_status.
+	if types["se-added"] != "scope_landed" || types["se-modified"] != "scope_modified" || types["se-removed"] != "scope_removed" {
+		t.Errorf("scope change types = %v, want landed/modified/removed", types)
+	}
+	for _, row := range env.Data {
+		if row.ID == "se-added" && row.ScopeStatus != "pending" {
+			t.Errorf("se-added scope_status=%q, want pending", row.ScopeStatus)
+		}
 	}
 }
 
@@ -849,5 +854,86 @@ func TestParseChangesSince(t *testing.T) {
 		if got := parseChangesSince(in); got != want {
 			t.Errorf("parseChangesSince(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Watch scope landings are their own feed origin. A landing keeps its original
+// event type, and a later loss of eligibility is a separate historical event.
+func TestChangesFeedIncludesWatchScopeHistory(t *testing.T) {
+	h, _ := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, bob.ID)
+	for _, row := range []string{
+		`'ws-landed','t1','p1','a.example','landed','a1','{"task_id":"round-9"}','2026-05-01 00:00:00'`,
+		`'ws-lost','t1','p1','a.example','out_of_scope','a1','{"out_of_scope":1}','2026-05-02 00:00:00'`,
+	} {
+		stmt := `INSERT INTO watch_scope_events
+			(id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+			VALUES (` + row + `)`
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("insert watch scope event: %v", err)
+		}
+	}
+
+	rec := serveChanges(t, h, sid, "/api/changes?target_id=t1&source=watch_scope", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []ChangeEntry `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	types := map[string]ChangeEntry{}
+	for _, row := range resp.Data {
+		types[row.ID] = row
+	}
+	landed, ok := types["ws-landed"]
+	if !ok || landed.ChangeType != "scope_landed" || landed.Source != "watch_scope" || landed.TaskID != "round-9" {
+		t.Fatalf("landing = %+v, want watch_scope/scope_landed/round-9", landed)
+	}
+	lost, ok := types["ws-lost"]
+	if !ok || lost.ChangeType != "out_of_scope" {
+		t.Fatalf("loss = %+v, want out_of_scope", lost)
+	}
+}
+
+func TestChangesFeedReturnsNumericStatusColumns(t *testing.T) {
+	h, _ := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, bob.ID)
+	h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+		VALUES ('mc-1','t1','https://a.example','status_change','status=403 title=Forbidden','status=200 title=OK','medium',403,200,'2026-06-01 00:00:00')`)
+	h.db.Exec(`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+		VALUES ('wc-1','t1','round-1','https://b.example','status_change','status=200 title=OK','status=403 title=Forbidden','medium',200,403,'2026-06-02 00:00:00')`)
+	rec := serveChanges(t, h, sid, "/api/changes?status_only=1", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]int{}
+	for _, e := range env.Data {
+		got[e.ID] = [2]int{e.OldStatus, e.NewStatus}
+	}
+	if got["mc-1"] != [2]int{403, 200} || got["wc-1"] != [2]int{200, 403} {
+		t.Fatalf("numeric status columns = %v, want mc=403/200 wc=200/403", got)
 	}
 }

@@ -324,3 +324,23 @@ func TestTelegramFindingsListsOnlyValidatedResultsAcrossStores(t *testing.T) {
 		t.Fatalf("cross-store finding totals are wrong: %s", status)
 	}
 }
+
+func TestNotifyNewHostsDeduplicatesReplayByEventID(t *testing.T) {
+	h, _ := newIsoHandler(t)
+	bot := NewTelegramBot(h)
+	if _, err := h.db.Exec(`INSERT INTO telegram_config(id,encrypted_bot_token,enabled) VALUES(1,'test-token',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bot.AddChat(context.Background(), TelegramChat{ChatID: "1009", Label: "ops", Role: "operator"}); err != nil {
+		t.Fatal(err)
+	}
+	bot.NotifyNewHosts("newhost:deep-event-1", "2 new hosts", []string{"a.example.test", "b.example.test"}, "target-1")
+	bot.NotifyNewHosts("newhost:deep-event-1", "2 new hosts", []string{"a.example.test", "b.example.test"}, "target-1")
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM telegram_outbox WHERE event_key='newhost:deep-event-1'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("outbox rows = %d, want one per enabled chat", n)
+	}
+}

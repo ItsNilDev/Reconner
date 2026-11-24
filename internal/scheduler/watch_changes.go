@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -110,10 +111,10 @@ func diffWatchHTTP(before, after map[string]watchHTTPSnapshot, _ bool, _ bool) [
 		if old.StatusCode != cur.StatusCode {
 			changes = append(changes, watchChange{
 				URL: raw, ChangeType: "status_change",
-				OldValue: fmt.Sprintf("status=%d title=%s", old.StatusCode, old.Title),
-				NewValue: fmt.Sprintf("status=%d title=%s", cur.StatusCode, cur.Title),
-				Severity: watchStatusSeverity(old.StatusCode, cur.StatusCode),
-				Metadata: fmt.Sprintf(`{"old_code":%d,"new_code":%d}`, old.StatusCode, cur.StatusCode),
+				OldValue:  fmt.Sprintf("status=%d title=%s", old.StatusCode, old.Title),
+				NewValue:  fmt.Sprintf("status=%d title=%s", cur.StatusCode, cur.Title),
+				Severity:  watchStatusSeverity(old.StatusCode, cur.StatusCode),
+				Metadata:  fmt.Sprintf(`{"old_code":%d,"new_code":%d}`, old.StatusCode, cur.StatusCode),
 				OldStatus: old.StatusCode, NewStatus: cur.StatusCode,
 			})
 		}
@@ -193,6 +194,14 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	}
 	rows.Close()
 
+	// Manual breadth projects use the project's effective scope. Linked
+	// projects add program eligibility as a separate requirement. A scope read
+	// failure leaves eligibility unknown, so the host is not announced.
+	state, scopeErr := s.loadTaskScopeState(ctx, targetID)
+	if scopeErr != nil {
+		s.logger.Warn("watch new-host: scope could not be read", "error", scopeErr)
+	}
+
 	candidates := make([]watchHostCandidate, 0, len(raw))
 	for _, c := range raw {
 		if !c.alive {
@@ -206,9 +215,17 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 				WHERE target_id=? AND host=?`, targetID, c.host)
 			continue
 		}
-		inScope, programID, assetID := scanner.IsWatchScopeHostEligible(ctx, s.db, targetID, c.host)
-		if !inScope {
-			programID, assetID = c.programID, c.assetID
+		inScope, programID, assetID := false, c.programID, c.assetID
+		switch {
+		case scopeErr != nil:
+			inScope = false
+		case state.linked:
+			inScope, programID, assetID = scanner.IsWatchScopeHostEligible(ctx, s.db, targetID, c.host)
+			if !inScope {
+				programID, assetID = c.programID, c.assetID
+			}
+		default:
+			inScope = state.allowsProjectHost(ctx, c.host)
 		}
 		svc := watchHTTPServiceForHost(ctx, s.db, targetID, c.host)
 		candidates = append(candidates, watchHostCandidate{
@@ -273,9 +290,16 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 				hosts = append(hosts, h)
 			}
 		}
+		statusLabel := "DNS discovery"
+		statusKnown := false
+		if scanner.ValidHTTPStatus(g.Service.StatusCode) {
+			statusLabel = fmt.Sprintf("HTTP %d", g.Service.StatusCode)
+			statusKnown = true
+		}
 		meta := map[string]any{
 			"host": g.Host, "hosts": hosts, "members": memberRows, "fleet.size": len(hosts),
-			"status": g.Service.StatusCode, "title": g.Service.Title,
+			"status": g.Service.StatusCode, "status_label": statusLabel,
+			"status_known": statusKnown, "title": g.Service.Title,
 			"server": g.Service.Server, "tech": watchTechList(g.Service.Technologies),
 			"ip": "", "source": "watch", "in_scope": g.InScope,
 			"first_seen_at": g.FirstSeenAt, "first_alive_at": g.FirstAliveAt,
@@ -345,8 +369,14 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	// but never reach the bell or Telegram.
 	notifyHosts := make([]string, 0, len(visible))
 	for _, g := range visible {
-		if g.InScope {
-			notifyHosts = append(notifyHosts, g.Host)
+		for _, m := range members[g.Fingerprint] {
+			if host, ok := m["host"].(string); ok && !scanner.IsWildcardScopePattern(host) {
+				// Per-member scope wins over the fleet-level flag.
+				inScope, _ := m["in_scope"].(bool)
+				if inScope {
+					notifyHosts = append(notifyHosts, host)
+				}
+			}
 		}
 	}
 	if len(notifyHosts) > 0 {
@@ -369,18 +399,61 @@ func (s *Scheduler) baselineWatchHosts(ctx context.Context, targetID string) {
 	}
 }
 
-func watchHTTPServiceForHost(ctx context.Context, db *database.DB, targetID, host string) watchHTTPSnapshot {
+func normalizeWatchedHost(raw string) string {
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host
+}
+
+func scanWatchService(scannerRow interface {
+	Scan(dest ...any) error
+}) (watchHTTPSnapshot, error) {
 	var h watchHTTPSnapshot
 	var tech string
-	err := db.QueryRowContext(ctx, `SELECT COALESCE(url,''),COALESCE(status_code,0),COALESCE(title,''),
-		COALESCE(server,''),COALESCE(technologies,'[]'),COALESCE(redirect_url,'')
-		FROM http_services WHERE target_id=? AND (url LIKE 'https://'||?||'%' OR url LIKE 'http://'||?||'%')
-		ORDER BY url LIMIT 1`, targetID, host, host).Scan(&h.URL, &h.StatusCode, &h.Title, &h.Server, &tech, &h.RedirectURL)
+	err := scannerRow.Scan(&h.URL, &h.StatusCode, &h.Title, &h.Server, &tech, &h.RedirectURL)
 	if err != nil {
-		return h
+		return watchHTTPSnapshot{}, err
 	}
 	h.Technologies = joinWatchTechnologies(tech)
-	return h
+	return h, nil
+}
+
+// watchHTTPServiceForHost matches a host exactly. A prefix LIKE would let
+// a.example.test.evil borrow the service of a.example.test. The subdomain_id
+// relation is authoritative when present; otherwise the URL host is compared
+// after normalization.
+func watchHTTPServiceForHost(ctx context.Context, db *database.DB, targetID, host string) watchHTTPSnapshot {
+	wanted := normalizeWatchedHost(host)
+	if wanted == "" {
+		return watchHTTPSnapshot{}
+	}
+	selectCols := `SELECT COALESCE(s.url,''),COALESCE(s.status_code,0),COALESCE(s.title,''),
+		COALESCE(s.server,''),COALESCE(s.technologies,'[]'),COALESCE(s.redirect_url,'')`
+	if h, err := scanWatchService(db.QueryRowContext(ctx, selectCols+`
+		FROM http_services s JOIN subdomains d ON d.id=s.subdomain_id
+		WHERE s.target_id=? AND LOWER(d.subdomain)=? ORDER BY s.url LIMIT 1`, targetID, wanted)); err == nil {
+		return h
+	}
+
+	rows, err := db.QueryContext(ctx, selectCols+`
+		FROM http_services s WHERE s.target_id=? AND COALESCE(s.status_code,0)>0
+		  AND INSTR(LOWER(s.url), ?) > 0 ORDER BY s.url LIMIT 200`, targetID, wanted)
+	if err != nil {
+		return watchHTTPSnapshot{}
+	}
+	defer rows.Close()
+	for rows.Next() {
+		h, err := scanWatchService(rows)
+		if err != nil {
+			continue
+		}
+		if normalizeWatchedHost(scanner.URLHost(h.URL)) == wanted {
+			return h
+		}
+	}
+	return watchHTTPSnapshot{}
 }
 
 func watchTechList(raw string) []string {

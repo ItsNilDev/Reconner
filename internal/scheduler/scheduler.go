@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -328,6 +329,7 @@ func New(db *database.DB, hub *websocket.Hub, cfg *config.Config, log *logger.Lo
 	bc := s.broadcastAndScore
 
 	s.subdomainScanner = scanner.NewSubdomainScanner(db, exec, cfg, log, bc)
+	s.subdomainScanner.SetBroadcast(bc)
 	s.httpScanner = scanner.NewHTTPScanner(db, exec, cfg, log)
 	s.httpScanner.SetBroadcast(bc)
 	s.jsScanner = scanner.NewJSScanner(db, exec, cfg, log, bc)
@@ -418,6 +420,31 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 			_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,'') FROM notifications
 				WHERE target_id=? AND type=? ORDER BY created_at DESC LIMIT 1`, targetID, changeType).Scan(&title, &rawURL)
 		}
+		if s.notifier == nil {
+			return
+		}
+		// A deep DNS discovery reaches the New hosts channel with the event id
+		// as its outbox key. Replaying the same event cannot enqueue a second
+		// Telegram item, and the bell row already carries the same change_id.
+		if changeType == "new_host" {
+			hosts := []string{}
+			switch raw := m["hosts"].(type) {
+			case []string:
+				hosts = raw
+			case []any:
+				for _, v := range raw {
+					if h, ok := v.(string); ok {
+						hosts = append(hosts, h)
+					}
+				}
+			}
+			preview := hosts
+			if len(preview) > 20 {
+				preview = preview[:20]
+			}
+			s.notifier.NotifyNewHosts("newhost:"+changeID, newVal, preview, targetID)
+			return
+		}
 		// Only a real status transition belongs on the HTTP status channel.
 		// A title-only write keeps the same code (200/200); it must not
 		// produce a "status change" alert with two identical codes.
@@ -426,7 +453,7 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 			oldVal = fmt.Sprintf("HTTP %d", oldStatus)
 			newVal = fmt.Sprintf("HTTP %d", newStatus)
 		}
-		if statusTransition && (changeType == "http_change" || changeType == "status_change") {
+		if statusTransition && (changeType == "http_change" || changeType == "status_change" || changeType == "page_change") {
 			s.notifier.NotifyHTTPStatus(targetID, domain, changeType, title, rawURL, oldVal, newVal, changeID)
 		} else {
 			s.notifier.NotifyMonitorChange(targetID, domain, changeType, title, rawURL, oldVal, newVal, changeID)
@@ -1759,6 +1786,53 @@ func shouldWriteWatchDiff(taskType string, skipped, timedOut bool, phaseErr, mod
 	return taskType == watchScanType && !skipped && !timedOut && phaseErr == nil && modCtxErr == nil && ready
 }
 
+// failTaskPreflight marks a task failed before any phase runs. It is used when
+// current scope cannot be read or a queued per-asset scope is no longer valid.
+// The error is persisted so the UI shows why no request was sent.
+func (s *Scheduler) failTaskPreflight(taskID, targetID, reason string) {
+	_, _ = s.db.Exec(`UPDATE tasks SET status='failed', error=?, progress=0, current_module='',
+		finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, reason, taskID)
+	s.refreshTargetScanStatus(targetID, "failed", false)
+	s.hub.Broadcast("task_finished", map[string]string{
+		"task_id": taskID, "target_id": targetID, "status": "failed",
+	})
+	s.logger.Error("Task blocked before I/O", "task_id", taskID, "reason", reason)
+}
+
+// validateScopeOverrideE revalidates a queued per-asset scope at execution time.
+// The asset must still exist, be approved, carry a current grant, and remain
+// eligible under current exclusions and program scope. History rows for a
+// revoked asset are left untouched; they simply no longer seed requests.
+func (s *Scheduler) validateScopeOverrideE(ctx context.Context, targetID, scopeOverride string, state taskScopeState) error {
+	value := strings.TrimSpace(scopeOverride)
+	if value == "" {
+		return nil
+	}
+	host := scanner.URLHost(value)
+	if scanner.IsWildcardScopePattern(value) {
+		if roots := normalizeSubdomainRoots([]string{value}); len(roots) > 0 {
+			host = roots[0]
+		}
+	}
+	var approval, metadata string
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(approval_status,'approved'), COALESCE(metadata,'')
+		FROM assets WHERE target_id=? AND value IN (?,?) ORDER BY id LIMIT 1`,
+		targetID, value, host).Scan(&approval, &metadata)
+	if err != nil {
+		return fmt.Errorf("scope asset %q no longer exists", scopeOverride)
+	}
+	if approval != "approved" {
+		return fmt.Errorf("scope asset %q is no longer approved", scopeOverride)
+	}
+	if assetMarkedOutOfScope(metadata) {
+		return fmt.Errorf("scope asset %q is marked out of scope", scopeOverride)
+	}
+	if !state.allowsHost(ctx, host) {
+		return fmt.Errorf("scope asset %q is not eligible under current scope", scopeOverride)
+	}
+	return nil
+}
+
 func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	var targetID, modulesJSON, taskStatus, kind, taskType, scopeOverride string
 	var target struct{ Domain string }
@@ -1785,7 +1859,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// The task context carries operator/shutdown cancellation. A separate
 	// watchdog is attached to each phase below, so forward progress resets the
 	// clock instead of a fixed deadline terminating a healthy long scan.
-	ctx := parentCtx
+	ctx := scanner.WithTaskID(parentCtx, taskID)
 	// The task may have been cancelled (e.g. target deletion) after it was
 	// queued but before it started — don't run it.
 	if taskStatus == "cancelled" {
@@ -1794,6 +1868,41 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	}
 	if taskType == "guided_capture" {
 		s.executeGuidedTask(ctx, taskID, targetID, scopeOverride)
+		return
+	}
+
+	// A cancelled context must stay cancelled. A scope read on a cancelled
+	// context returns an error, but that error is not a scope failure.
+	if parentCtx.Err() != nil {
+		// Graceful shutdown parks the row as interrupted; auto-resume owns it.
+		// An operator cancellation becomes cancelled and counts as a monitor
+		// attempt so the due scheduler does not recreate the same pass.
+		finalStatus := "cancelled"
+		if taskStatus == InterruptedStatus {
+			finalStatus = InterruptedStatus
+		}
+		_, _ = s.db.Exec(`UPDATE tasks SET status=?, progress=0, current_module='',
+			finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, finalStatus, taskID)
+		if taskType == monitorWatchType && finalStatus == "cancelled" {
+			_, _ = s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID)
+		}
+		s.refreshTargetScanStatus(targetID, "idle", false)
+		s.hub.Broadcast("task_finished", map[string]string{
+			"task_id": taskID, "target_id": targetID, "status": finalStatus,
+		})
+		return
+	}
+
+	// Load current scope before any seed, request, or module. A read failure or
+	// a revoked per-asset scope blocks the task with a visible error and sends
+	// zero requests.
+	state, err := s.loadTaskScopeState(ctx, targetID)
+	if err != nil {
+		s.failTaskPreflight(taskID, targetID, err.Error())
+		return
+	}
+	if err := s.validateScopeOverrideE(ctx, targetID, scopeOverride, state); err != nil {
+		s.failTaskPreflight(taskID, targetID, err.Error())
 		return
 	}
 
@@ -1838,11 +1947,23 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	managedNoAssets := false
 	seeded := webHosts
 	if !networkTask && scopeOverride == "" {
-		if managed := s.loadProjectWebSeeds(ctx, targetID); len(managed) > 0 {
+		managed, err := s.loadProjectWebSeedsE(ctx, targetID, state)
+		if err != nil {
+			s.failTaskPreflight(taskID, targetID, err.Error())
+			return
+		}
+		if len(managed) > 0 {
 			seeded = managed
-		} else if s.projectHasManagedScope(ctx, targetID) {
-			seeded = nil
-			managedNoAssets = true
+		} else {
+			managedProject, err := s.projectHasManagedScopeE(ctx, targetID)
+			if err != nil {
+				s.failTaskPreflight(taskID, targetID, err.Error())
+				return
+			}
+			if managedProject {
+				seeded = nil
+				managedNoAssets = true
+			}
 		}
 	}
 	if !networkTask && len(seeded) == 0 && webPrimary != "" && !managedNoAssets {
@@ -1854,7 +1975,11 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// used to enumerate only the first asset in a multi-asset target (issue #7).
 	var subdomainRoots []string
 	if !networkTask {
-		subdomainRoots = s.loadSubdomainRoots(ctx, targetID, effectiveScope, scopeOverride)
+		subdomainRoots, err = s.loadSubdomainRootsE(ctx, targetID, effectiveScope, scopeOverride, state)
+		if err != nil {
+			s.failTaskPreflight(taskID, targetID, err.Error())
+			return
+		}
 	}
 	// A scope token may be a bare host (example.com) OR a full ENDPOINT URL
 	// (https://x.com/appointment?h=…). Seed the HOST into subdomains so http_probe
@@ -1865,13 +1990,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// Exclusions are the single choke point for every request the pipeline
 	// makes. Load them once here and attach them to the task context below, then
 	// skip seeds that are already out of scope before any row is written (A1).
-	excl := scanner.LoadExclusions(ctx, s.db, targetID)
+	excl := state.exclusions
 	var endpointSeeds []string
 	for _, tok := range seeded {
 		if tok = strings.TrimSpace(tok); tok == "" {
-			continue
-		}
-		if excl.ExcludesDestination(ctx, scanner.URLHost(tok)) {
 			continue
 		}
 		host, didSeed := scanner.SeedEndpointURL(ctx, s.db, targetID, tok)
@@ -1886,6 +2008,12 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 				host = roots[0]
 			}
 			didSeed = false
+		}
+		// Apply exclusions AND the current positive project scope to every
+		// seed. A previously excluded or revoked service stays in history but
+		// gets no new request from this task.
+		if !state.allowsProjectHost(ctx, host) {
+			continue
 		}
 		if didSeed {
 			if n := scanner.NormalizeEndpointURL(tok); n != "" {
@@ -2022,10 +2150,8 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		// Program-linked rounds use the strict apex/wildcard boundary before
 		// probing, so a descendant of an exact asset is never requested. Manual
 		// watch projects keep the broad matcher because they have no program.
-		if len(scopeOverride) == 0 {
-			if entries, linked, err := scanner.LoadWatchEligibleScope(ctx, s.db, targetID); err == nil && linked {
-				ctx = scanner.WithStrictWatchScope(ctx, entries)
-			}
+		if len(scopeOverride) == 0 && state.linked && len(state.entries) > 0 {
+			ctx = scanner.WithStrictWatchScope(ctx, state.entries)
 		}
 	}
 	// Single-endpoint mode: confine the pipeline to the seeded endpoint URL(s) and
@@ -2416,14 +2542,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			}
 		}
 
-		// A watch HTTP probe is the one phase whose before/after state carries a
-		// daily signal: real status transitions. Snapshot before the request so
-		// the diff sees the stored baseline, not the value the probe just wrote.
-		watchDiff := taskType == watchScanType && module == ModuleHTTPProbe
-		var watchBefore map[string]watchHTTPSnapshot
-		if watchDiff {
-			watchBefore, _ = snapshotWatchHTTP(ctx, s.db, targetID)
-		}
+		// Breadth status, title, technology and redirect changes are recorded
+		// per observation in the HTTP scanner. The old before/after snapshot
+		// diff is gone: its alphabetical 5,000-row cap hid real transitions.
+		isWatchHTTP := taskType == watchScanType && module == ModuleHTTPProbe
 		s.startTaskPhase(taskID, module)
 		resultCh := make(chan phaseRunResult, 1)
 		go func() {
@@ -2435,22 +2557,13 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		if forced {
 			logFn("warn", "scheduler", fmt.Sprintf("Phase %q did not stop within %s after cancellation; force-released scheduler ownership.", module, phaseStopGrace))
 		}
-		modCtxErr := modCtx.Err()
 		skipped, timedOut := finishPhase()
 		phaseStatus, phaseReason := phaseOutcome(err, skipped, timedOut, ctx.Err())
 		// The single new-host event is emitted once, after a successful HTTP
-		// probe phase. The detail diff below writes status/page/tech/redirect
-		// rows only; it never writes a new-host row, so the two writers cannot
-		// duplicate an announcement.
-		if watchDiff && err == nil && !forced && !skipped && !timedOut {
+		// probe phase. Status and detail events were already committed with each
+		// observation, including observations from a phase that later failed.
+		if isWatchHTTP && err == nil && !forced && !skipped && !timedOut {
 			s.emitWatchNewHosts(ctx, taskID, targetID)
-			if shouldWriteWatchDiff(taskType, skipped, timedOut, err, modCtxErr, true) {
-				if after, derr := snapshotWatchHTTP(ctx, s.db, targetID); derr == nil {
-					if changes := diffWatchHTTP(watchBefore, after, false, false); len(changes) > 0 {
-						s.insertWatchRoundChanges(ctx, taskID, targetID, changes)
-					}
-				}
-			}
 		}
 
 		s.finishTaskPhase(taskID, module, phaseStatus, phaseReason, time.Since(phaseStartedAt))
@@ -2623,10 +2736,128 @@ func (s *Scheduler) refreshTargetScanStatus(targetID, terminal string, touchLast
 		targetID, targetID, targetID, terminal, targetID)
 }
 
-// projectHasManagedScope reports whether a project owns a managed asset list or
-// a linked program. A managed project with zero approved assets must never fall
-// back to targets.domain: an operator suspended the last asset on purpose.
-func (s *Scheduler) projectHasManagedScope(ctx context.Context, targetID string) bool {
+// assetMarkedOutOfScope reads the out_of_scope marker written by the watch
+// sweep. It keeps revoked hosts in history but out of the seed set.
+func assetMarkedOutOfScope(metadata string) bool {
+	if strings.TrimSpace(metadata) == "" {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(metadata), &m); err != nil {
+		return false
+	}
+	switch v := m["out_of_scope"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		return v == "1" || strings.EqualFold(v, "true")
+	}
+	return false
+}
+
+// taskScopeState holds the current, authoritative scope inputs for a task.
+// It is loaded once per task and shared by every seed and eligibility check.
+type taskScopeState struct {
+	exclusions scanner.ExclusionSet
+	entries    []scanner.WatchScopeEntry
+	linked     bool
+	webHosts   []string // approved project assets, normalized to apex hosts
+	fallback   string   // legacy targets.domain, used only for unmanaged projects
+}
+
+// loadTaskScopeState reads operator exclusions and current linked-program
+// eligibility. A read error is returned so the caller can block the task before
+// it sends any request. Permissive defaults are not allowed here.
+func (s *Scheduler) loadTaskScopeState(ctx context.Context, targetID string) (taskScopeState, error) {
+	excl, err := scanner.LoadExclusionsE(ctx, s.db, targetID)
+	if err != nil {
+		return taskScopeState{}, fmt.Errorf("load exclusions: %w", err)
+	}
+	entries, linked, err := scanner.LoadWatchEligibleScope(ctx, s.db, targetID)
+	if err != nil {
+		return taskScopeState{}, fmt.Errorf("load program scope: %w", err)
+	}
+	assetRows, err := s.db.QueryContext(ctx, `SELECT value FROM assets WHERE target_id=?
+		AND COALESCE(approval_status,'approved')='approved'
+		AND COALESCE(asset_type,'domain') IN ('domain','wildcard','url','page','js','api')`, targetID)
+	if err != nil {
+		return taskScopeState{}, fmt.Errorf("load approved assets: %w", err)
+	}
+	assetValues := []string{}
+	for assetRows.Next() {
+		var value string
+		if err := assetRows.Scan(&value); err != nil {
+			_ = assetRows.Close()
+			return taskScopeState{}, fmt.Errorf("scan approved asset: %w", err)
+		}
+		assetValues = append(assetValues, value)
+	}
+	_ = assetRows.Close()
+	if err := assetRows.Err(); err != nil {
+		return taskScopeState{}, fmt.Errorf("read approved assets: %w", err)
+	}
+	var fallback string
+	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(domain,'') FROM targets WHERE id=?`, targetID).Scan(&fallback)
+	return taskScopeState{
+		exclusions: excl, entries: entries, linked: linked,
+		webHosts: normalizeSubdomainRoots(assetValues), fallback: fallback,
+	}, nil
+}
+
+// allowsHost reports whether a value is currently allowed by exclusions and,
+// for linked projects, by program eligibility. A positive rule never overrides
+// an applicable deny.
+func (st taskScopeState) allowsHost(ctx context.Context, value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	host := scanner.URLHost(value)
+	if st.exclusions.ExcludesDestination(ctx, host) {
+		return false
+	}
+	if st.linked {
+		if _, _, ok := scanner.HostMatchesWatchScope(st.entries, host); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// allowsProjectHost adds the positive project scope to allowsHost. Manual
+// projects use approved assets and apex descendants. Linked projects already
+// got an exact/wildcard decision from program eligibility in allowsHost.
+func (st taskScopeState) allowsProjectHost(ctx context.Context, value string) bool {
+	if !st.allowsHost(ctx, value) {
+		return false
+	}
+	if st.linked {
+		return true
+	}
+	allowed := st.webHosts
+	if len(allowed) == 0 && st.fallback != "" {
+		allowed = normalizeSubdomainRoots([]string{st.fallback})
+	}
+	if len(allowed) == 0 {
+		return true // no positive scope is known; deny rules still apply
+	}
+	host := strings.ToLower(strings.TrimSuffix(scanner.URLHost(value), "."))
+	for _, root := range allowed {
+		root = strings.ToLower(strings.TrimSuffix(root, "."))
+		if host == root || strings.HasSuffix(host, "."+root) {
+			return true
+		}
+	}
+	return false
+}
+
+// projectHasManagedScopeE reports whether a project owns a managed asset list
+// or a linked program. A managed project with zero approved assets must never
+// fall back to targets.domain: an operator suspended the last asset on purpose.
+// A read error is returned instead of becoming an unmanaged (permissive) result.
+func (s *Scheduler) projectHasManagedScopeE(ctx context.Context, targetID string) (bool, error) {
 	var managed int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT CASE WHEN EXISTS(SELECT 1 FROM targets WHERE id=? AND managed_scope=1) THEN 1
@@ -2634,26 +2865,36 @@ func (s *Scheduler) projectHasManagedScope(ctx context.Context, targetID string)
 		      WHEN EXISTS(SELECT 1 FROM project_programs WHERE target_id=?) THEN 1
 		      ELSE 0 END`,
 		targetID, targetID, targetID).Scan(&managed)
-	return err == nil && managed == 1
+	if err != nil {
+		return false, err
+	}
+	return managed == 1, nil
 }
 
-// loadProjectWebSeeds keeps a target-level scan aligned with the editable
+func (s *Scheduler) projectHasManagedScope(ctx context.Context, targetID string) bool {
+	managed, _ := s.projectHasManagedScopeE(ctx, targetID)
+	return managed
+}
+
+// loadProjectWebSeedsE keeps a target-level scan aligned with the editable
 // Project asset list. It includes exact page/API/JS URLs (not just DNS roots),
-// and excludes pending/suspended or non-web assets.
-func (s *Scheduler) loadProjectWebSeeds(ctx context.Context, targetID string) []string {
-	rows, err := s.db.QueryContext(ctx, `SELECT value FROM assets WHERE target_id=?
+// and excludes pending/suspended, out-of-scope, excluded, and currently
+// ineligible program assets. Watch-landed assets stay in history when they lose
+// eligibility, but they no longer seed a scan.
+func (s *Scheduler) loadProjectWebSeedsE(ctx context.Context, targetID string, state taskScopeState) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(metadata,'') FROM assets WHERE target_id=?
 		AND COALESCE(approval_status,'approved')='approved'
 		AND COALESCE(asset_type,'domain') IN ('domain','wildcard','url','page','js','api')
 		ORDER BY created_at ASC,id ASC`, targetID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 	seen := map[string]bool{}
 	out := []string{}
 	for rows.Next() {
-		var v string
-		if rows.Scan(&v) != nil {
+		var v, metadata string
+		if rows.Scan(&v, &metadata) != nil {
 			continue
 		}
 		v = strings.TrimSpace(v)
@@ -2663,10 +2904,28 @@ func (s *Scheduler) loadProjectWebSeeds(ctx context.Context, targetID string) []
 		if !assets.IsScannableWebAsset("url", v) {
 			continue
 		}
+		if assetMarkedOutOfScope(metadata) {
+			continue
+		}
+		if !state.allowsHost(ctx, v) {
+			continue
+		}
 		seen[v] = true
 		out = append(out, v)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Scheduler) loadProjectWebSeeds(ctx context.Context, targetID string) []string {
+	state, err := s.loadTaskScopeState(ctx, targetID)
+	if err != nil {
+		return nil
+	}
+	values, _ := s.loadProjectWebSeedsE(ctx, targetID, state)
+	return values
 }
 
 // loadSubdomainRoots returns the domain roots that a target-level subdomain
@@ -2675,30 +2934,55 @@ func (s *Scheduler) loadProjectWebSeeds(ctx context.Context, targetID string) []
 // targets.domain string may then be stale. A per-asset task remains pinned to its
 // scope_override. IP/CIDR assets are intentionally omitted from DNS enumeration.
 func (s *Scheduler) loadSubdomainRoots(ctx context.Context, targetID, fallbackScope, scopeOverride string) []string {
+	state, err := s.loadTaskScopeState(ctx, targetID)
+	if err != nil {
+		return nil
+	}
+	values, _ := s.loadSubdomainRootsE(ctx, targetID, fallbackScope, scopeOverride, state)
+	return values
+}
+
+// loadSubdomainRootsE is the error-returning form of loadSubdomainRoots.
+func (s *Scheduler) loadSubdomainRootsE(ctx context.Context, targetID, fallbackScope, scopeOverride string, state taskScopeState) ([]string, error) {
 	if strings.TrimSpace(scopeOverride) != "" {
-		return normalizeSubdomainRoots([]string{scopeOverride})
+		if !state.allowsHost(ctx, scopeOverride) {
+			return nil, nil
+		}
+		return normalizeSubdomainRoots([]string{scopeOverride}), nil
 	}
 
 	var values []string
-	rows, err := s.db.QueryContext(ctx, `SELECT value FROM assets WHERE target_id=?
+	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(metadata,'') FROM assets WHERE target_id=?
 		AND COALESCE(approval_status,'approved')='approved'
 		AND COALESCE(asset_type,'domain') IN ('domain','wildcard')
 		ORDER BY created_at ASC, id ASC`, targetID)
-	if err == nil {
-		for rows.Next() {
-			var value string
-			if rows.Scan(&value) == nil && strings.TrimSpace(value) != "" && assets.IsScannableWebAsset("domain", value) {
-				values = append(values, value)
-			}
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var value, metadata string
+		if rows.Scan(&value, &metadata) == nil && strings.TrimSpace(value) != "" &&
+			assets.IsScannableWebAsset("domain", value) && !assetMarkedOutOfScope(metadata) &&
+			state.allowsHost(ctx, value) {
+			values = append(values, value)
 		}
-		rows.Close()
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	// A managed project with zero approved roots stays empty. Falling back to
 	// targets.domain here would rescan a suspended asset in the DNS phase.
-	if len(values) == 0 && assets.IsScannableWebAsset("domain", fallbackScope) && !s.projectHasManagedScope(ctx, targetID) {
-		values = []string{fallbackScope}
+	if len(values) == 0 && assets.IsScannableWebAsset("domain", fallbackScope) {
+		managed, err := s.projectHasManagedScopeE(ctx, targetID)
+		if err != nil {
+			return nil, err
+		}
+		if !managed {
+			values = []string{fallbackScope}
+		}
 	}
-	return normalizeSubdomainRoots(values)
+	return normalizeSubdomainRoots(values), nil
 }
 
 // normalizeSubdomainRoots turns asset values (bare hosts, URLs, wildcards or

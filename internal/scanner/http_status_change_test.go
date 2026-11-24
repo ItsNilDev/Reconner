@@ -42,7 +42,7 @@ func TestStoreHTTPServiceCapturesStatusBaseline(t *testing.T) {
 	var oldStatus, newStatus int
 	var oldValue, newValue string
 	if err := db.QueryRow(`SELECT old_status,new_status,old_value,new_value FROM monitoring_changes
-		WHERE target_id=? AND change_type='http_change'`, tid).Scan(&oldStatus, &newStatus, &oldValue, &newValue); err != nil {
+		WHERE target_id=? AND change_type='status_change'`, tid).Scan(&oldStatus, &newStatus, &oldValue, &newValue); err != nil {
 		t.Fatalf("no status change row: %v", err)
 	}
 	if oldStatus != 403 || newStatus != 200 {
@@ -57,7 +57,7 @@ func TestStoreHTTPServiceCapturesStatusBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='http_change'`, tid).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='status_change'`, tid).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {

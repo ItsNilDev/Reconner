@@ -35,9 +35,14 @@ export function openNotification(
     // landing page (B4).
     const hosts = n.metadata?.hosts
     const first = Array.isArray(hosts) && typeof hosts[0] === 'string' ? hosts[0] : ''
-    navigate(first
-      ? `/targets/${n.target_id}?tab=monitor&q=${encodeURIComponent(first)}`
-      : `/targets/${n.target_id}`)
+    const eventID = n.metadata?.change_id || n.metadata?.event_id || n.change_id
+    if (typeof eventID === 'string' && eventID) {
+      navigate(`/targets/${n.target_id}?tab=monitor&event=${encodeURIComponent(eventID)}`)
+    } else {
+      navigate(first
+        ? `/targets/${n.target_id}?tab=monitor&q=${encodeURIComponent(first)}`
+        : `/targets/${n.target_id}`)
+    }
   }
   else if (n.url.startsWith('/') && !n.url.startsWith('//')) navigate(n.url)
   else if (/^https?:\/\//i.test(n.url)) window.open(n.url, '_blank', 'noopener,noreferrer')

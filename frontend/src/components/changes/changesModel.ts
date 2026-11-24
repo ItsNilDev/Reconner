@@ -27,6 +27,9 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   new_subdomain: 'assets',
   new_host: 'assets',
   scope_proposed: 'assets',
+  scope_rule_added: 'assets',
+  scope_rule_removed: 'assets',
+  scope_re_eligible: 'assets',
   scope_landed: 'assets',
   scope_modified: 'assets',
   scope_removed: 'assets',
@@ -51,10 +54,10 @@ export const NOTIFICATION_ALLOWED_TYPES = [
 
 export const BOUNTY_SCOPE_TYPES = [
   'scope_proposed', 'scope_landed', 'scope_modified', 'scope_removed', 'scope_rejected',
+  'scope_rule_added', 'scope_rule_removed', 'scope_re_eligible',
 ] as const
 
 const notificationTypes: ReadonlySet<string> = new Set(NOTIFICATION_ALLOWED_TYPES)
-const bountyScopeTypes: ReadonlySet<string> = new Set(BOUNTY_SCOPE_TYPES)
 
 // isDefaultFeedRow keeps the default view free of routine monitor noise even
 // when the server sends a wider feed. Category chips opt out of this filter so
@@ -65,7 +68,7 @@ export function isDefaultFeedRow(row: { source?: string; change_type?: string })
   // stay out of the default view (A8).
   if (row.source === 'monitor') return type === 'http_change' || type === 'status_change'
   if (row.source === 'watch') return type === 'new_subdomain'
-  if (row.source === 'bounty') return bountyScopeTypes.has(type)
+  if (row.source === 'watch_scope' || row.source === 'bounty') return isScopeEvent(row)
   if (row.source === 'notification') return notificationTypes.has(type)
   return false
 }
@@ -169,4 +172,131 @@ export function inlineDiffPieces(oldValue: string, newValue: string): InlineDiff
     kind: part.added ? 'added' : part.removed ? 'removed' : 'same',
     text: part.value,
   }))
+}
+
+// Scope events carry JSON snapshots in old_value/new_value. The feed also
+// ships legacy scope_landed bell rows. A dedicated renderer reads these fields
+// once, so neither the card nor the Details drawer prints serialized JSON.
+const SCOPE_EVENT_TYPES = new Set([
+  'scope_landed', 'scope_proposed', 'scope_modified', 'scope_removed',
+  'scope_rule_added', 'scope_rule_removed', 'scope_rejected',
+])
+
+export function isScopeEvent(row: { change_type?: string }): boolean {
+  return !!row.change_type && SCOPE_EVENT_TYPES.has(row.change_type)
+}
+
+type ScopeSnapshot = Record<string, unknown>
+
+// parseScopeSnapshot accepts any JSON object. Malformed or non-object input
+// returns null, so callers fall back to the event label and asset identifier.
+export function parseScopeSnapshot(raw: string | undefined | null): ScopeSnapshot | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as ScopeSnapshot
+    }
+  } catch {
+    // Fall through to the label/identifier fallback.
+  }
+  return null
+}
+
+const SCOPE_FIELD_LABELS: Record<string, string> = {
+  identifier: 'Host',
+  asset_type: 'Asset type',
+  category: 'Category',
+  in_scope: 'In scope',
+  eligible_submission: 'Eligible submission',
+  eligible_bounty: 'Eligible bounty',
+  max_severity: 'Max severity',
+  instruction: 'Instruction',
+  active: 'Active',
+  is_wildcard: 'Wildcard',
+  program_id: 'Program',
+  status: 'Status',
+}
+
+const SCOPE_VERBS: Record<string, string> = {
+  scope_landed: 'Host landed.',
+  scope_proposed: 'Scope proposed.',
+  scope_modified: 'Scope modified.',
+  scope_removed: 'Scope removed.',
+  scope_rejected: 'Proposal rejected.',
+  scope_re_eligible: 'Host re-eligible.',
+  scope_rule_added: 'Rule added.',
+  scope_rule_removed: 'Rule withdrawn.',
+}
+
+function scopeDisplayValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '—'
+  if (typeof value === 'boolean') return value ? 'yes' : 'no'
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value)
+}
+
+export interface ScopeChangedField {
+  field: string
+  before: string
+  after: string
+}
+
+// scopeChangedFields compares only parsed snapshots. It never returns the raw
+// JSON text, so the renderer cannot leak a serialized payload by accident.
+export function scopeChangedFields(oldRaw: string | undefined, newRaw: string | undefined): ScopeChangedField[] {
+  const before = parseScopeSnapshot(oldRaw)
+  const after = parseScopeSnapshot(newRaw)
+  if (!before || !after) return []
+  const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+  const fields: ScopeChangedField[] = []
+  for (const key of keys) {
+    const oldValue = scopeDisplayValue(before[key])
+    const newValue = scopeDisplayValue(after[key])
+    if (oldValue === newValue) continue
+    fields.push({ field: SCOPE_FIELD_LABELS[key] ?? key, before: oldValue, after: newValue })
+  }
+  return fields
+}
+
+// scopeIdentifier prefers the snapshot's identifier. Legacy rows and rows with
+// an unparseable snapshot fall back to url, which the feed sets to the asset
+// identifier.
+export function scopeIdentifier(item: { url?: string; program_asset_id?: string; old_value?: string; new_value?: string }): string {
+  const snapshots = [parseScopeSnapshot(item.new_value), parseScopeSnapshot(item.old_value)]
+  for (const snapshot of snapshots) {
+    const value = snapshot?.identifier
+    if (typeof value === 'string' && value.trim()) return value
+  }
+  return (item.url || item.program_asset_id || '').trim()
+}
+
+// scopeEventSummary builds "api.example.test · Example Program · Host landed."
+export function scopeEventSummary(
+  item: { change_type?: string; url?: string; program_id?: string; program_asset_id?: string; old_value?: string; new_value?: string },
+  programName?: string,
+): string {
+  const identifier = scopeIdentifier(item)
+  const program = (programName || item.program_id || '').trim()
+  const type = item.change_type || ''
+  const verb = SCOPE_VERBS[type] || `${type.replace(/_/g, ' ')}.`
+  return [identifier, program, verb].filter(Boolean).join(' · ')
+}
+
+const SCOPE_STATUS_LABELS: Record<string, string> = {
+  pending: 'Pending',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  superseded: 'Superseded',
+}
+
+export function scopeReviewLabel(status: string | undefined): string {
+  if (!status) return ''
+  return SCOPE_STATUS_LABELS[status] || status
 }

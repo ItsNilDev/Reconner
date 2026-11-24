@@ -54,6 +54,7 @@ func (s *Scheduler) pruneOrphanChangeSeen() {
 		WHERE NOT EXISTS (SELECT 1 FROM monitoring_changes m WHERE m.id = cs.change_id)
 		  AND NOT EXISTS (SELECT 1 FROM watch_round_changes w WHERE w.id = cs.change_id)
 		  AND NOT EXISTS (SELECT 1 FROM watch_scope_events e WHERE e.id = cs.change_id)
+		  AND NOT EXISTS (SELECT 1 FROM bounty_scope_events b WHERE b.id = cs.change_id)
 		  AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.id = cs.change_id)
 		LIMIT 5000
 	)`

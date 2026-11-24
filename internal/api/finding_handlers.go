@@ -140,10 +140,14 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 	search := q.Get("search")
 	statusFilter := q.Get("status")
 
+	// A seed becomes an observed service only after a valid code and a probe
+	// tier are committed with it. Status-zero seeds stay out of this view.
+	const observed = `((COALESCE(source,'probe')='probe' AND status_code BETWEEN 100 AND 599)
+		OR (COALESCE(source,'')='seed' AND status_code BETWEEN 100 AND 599 AND COALESCE(probe_tier,'')<>''))`
 	query := `SELECT id, target_id, url, status_code, title, server, content_type,
 		content_length, redirect_url, technologies, response_time_ms, last_seen, created_at,
 		COALESCE(waf,''), COALESCE(cms,'')
-		FROM http_services WHERE target_id = ? AND COALESCE(source,'probe') = 'probe'`
+		FROM http_services WHERE target_id = ? AND ` + observed
 	args := []any{id}
 
 	if search != "" {
@@ -162,7 +166,7 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 	}
 
 	var total int
-	h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM http_services WHERE target_id = ? AND COALESCE(source,'probe') = 'probe'", id).Scan(&total)
+	h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM http_services WHERE target_id = ? AND "+observed, id).Scan(&total)
 
 	query += " ORDER BY url LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)

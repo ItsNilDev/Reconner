@@ -159,7 +159,9 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 
 	if len(hosts) == 0 {
 		logFn("info", "http_probe", "No subdomains found to probe")
-		return nil
+		// An empty input is not a clean negative result. Report it as a blocked
+		// phase so the UI can distinguish it from a healthy round with no changes.
+		return BlockedPhase("no eligible hosts in current scope")
 	}
 
 	logFn("info", "http_probe", fmt.Sprintf("Probing %d hosts with httpx...", len(hosts)))
@@ -232,6 +234,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 
 	var mu sync.Mutex
 	probed := 0
+	corruptLines := 0
 	// Watch tier: the hosts that came back from the HTTP phase. Only these are
 	// considered for scope landing — a host that was never probed is not
 	// verified and must not become approved scope.
@@ -247,17 +250,25 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		err = s.exec.RunWithCallback(ctx, targetID, func(line string) {
 			var out httpxOutput
 			if err := json.Unmarshal([]byte(line), &out); err != nil {
+				mu.Lock()
+				corruptLines++
+				mu.Unlock()
 				return
 			}
 
+			stored := false
 			if err := s.storeHTTPService(ctx, targetID, out); err != nil {
 				s.logger.Error("Failed to store HTTP service", "error", err)
-			} else if watchMode {
-				_, _ = s.db.Exec(`UPDATE http_services SET probe_tier='watch' WHERE target_id=? AND url=?`, targetID, out.URL)
+			} else {
+				stored = true
 			}
 
-			if err := s.updateSubdomainAlive(targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
-				s.logger.Error("Failed to update subdomain", "error", err)
+			// Only a committed, valid observation advances liveness. A
+			// status-zero response is not proof that the host is alive.
+			if stored && ValidHTTPStatus(out.StatusCode) {
+				if err := s.updateSubdomainAlive(targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
+					s.logger.Error("Failed to update subdomain", "error", err)
+				}
 			}
 
 			mu.Lock()
@@ -311,6 +322,9 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 			`SELECT COUNT(*) FROM http_services WHERE target_id = ? AND COALESCE(source,'probe')='probe'`,
 			targetID).Scan(&recovered)
 		logFn("info", "http_probe", fmt.Sprintf("Native prober recovered %d live HTTP service(s).", recovered))
+	}
+	if corruptLines > 0 {
+		logFn("warn", "http_probe", fmt.Sprintf("Ignored %d malformed httpx output line(s)", corruptLines))
 	}
 	if watchMode && probed == 0 && len(hosts) > 0 {
 		logFn("warn", "http_probe", "httpx produced no live services — nothing is landed from this round (the native prober is skipped in watch mode).")
@@ -445,83 +459,37 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 	}
 }
 
-// captureProbeStatusChange records an HTTP status/title transition at the write
-// boundary. It writes one monitoring_changes row with numeric codes and a bell
-// notification, then publishes the same event the monitor bridge consumes. Seed
-// rows (status=0) are a baseline, not a change.
-func (s *HTTPScanner) captureProbeStatusChange(ctx context.Context, targetID, rawURL string, newCode int, newTitle string) {
-	var oldCode int
-	var oldTitle string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT status_code, COALESCE(title,'') FROM http_services WHERE target_id=? AND url=?`,
-		targetID, rawURL).Scan(&oldCode, &oldTitle)
-	if err != nil || oldCode == 0 || (oldCode == newCode && oldTitle == newTitle) {
-		return
-	}
-	severity := "info"
-	if oldCode != newCode {
-		severity = "medium"
-	}
-	oldValue := fmt.Sprintf("status=%d title=%s", oldCode, oldTitle)
-	newValue := fmt.Sprintf("status=%d title=%s", newCode, newTitle)
-	changeID := uuid.New().String()
-	_, _ = s.db.ExecContext(ctx, `INSERT INTO monitoring_changes
-		(id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
-		VALUES(?,?,?,'http_change',?,?,?,?,?,CURRENT_TIMESTAMP)`,
-		changeID, targetID, rawURL, oldValue, newValue, severity, oldCode, newCode)
-	notifyWithIdentity(s.db, targetID, "http_change",
-		fmt.Sprintf("HTTP status changed on %s", URLHost(rawURL)),
-		fmt.Sprintf("%d → %d", oldCode, newCode), rawURL, severity, "{}",
-		changeID, oldValue, newValue)
-	if s.broadcast != nil {
-		s.broadcast("notification_created", map[string]any{
-			"target_id":  targetID,
-			"type":       "http_change",
-			"severity":   severity,
-			"change_id":  changeID,
-			"old_value":  oldValue,
-			"new_value":  newValue,
-			"old_status": oldCode,
-			"new_status": newCode,
-			"url":        rawURL,
-		})
-	}
-}
-
 func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out httpxOutput) error {
-	// Read the stored baseline BEFORE the blind upsert. The deep planner runs
-	// http_probe ahead of monitor, so without this the monitor compares the new
-	// value with itself and never records the transition (A7).
-	if !watchModeEnabled(ctx) {
-		s.captureProbeStatusChange(ctx, targetID, out.URL, out.StatusCode, out.Title)
-	}
-	id := uuid.New().String()
 	sortedTechs := append([]string(nil), out.Technologies...)
 	sort.Strings(sortedTechs)
-	techs := models.StringSliceToJSON(sortedTechs)
 
 	var subID string
-	_ = s.db.QueryRow("SELECT id FROM subdomains WHERE target_id = ? AND subdomain = ?",
+	_ = s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
 		targetID, out.subdomain()).Scan(&subID)
 
-	_, err := s.db.Exec(`
-		INSERT INTO http_services 
-			(id, target_id, subdomain_id, url, status_code, title, server, content_type, content_length, redirect_url, technologies, response_time_ms, probe_tier, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'deep', CURRENT_TIMESTAMP)
-		ON CONFLICT(target_id, url) DO UPDATE SET
-			status_code = excluded.status_code,
-			title = excluded.title,
-			server = excluded.server,
-			content_type = excluded.content_type,
-			content_length = excluded.content_length,
-			redirect_url = excluded.redirect_url,
-			technologies = excluded.technologies,
-			probe_tier = excluded.probe_tier,
-			last_seen = CURRENT_TIMESTAMP
-	`, id, targetID, subID, out.URL, out.StatusCode, out.Title, out.WebServer,
-		out.ContentType, out.ContentLength, out.RedirectURL, techs, 0)
-
-	return err
+	obsType := ObservationDeep
+	tier := "deep"
+	if watchModeEnabled(ctx) {
+		obsType = ObservationWatch
+		tier = "watch"
+	}
+	return s.recordObservation(ctx, HTTPObservation{
+		TargetID:      targetID,
+		TaskID:        taskIDFromContext(ctx),
+		URL:           out.URL,
+		Host:          out.subdomain(),
+		SubdomainID:   subID,
+		StatusCode:    out.StatusCode,
+		Title:         out.Title,
+		Server:        out.WebServer,
+		Technologies:  models.StringSliceToJSON(sortedTechs),
+		RedirectURL:   out.RedirectURL,
+		ContentType:   out.ContentType,
+		ContentLength: out.ContentLength,
+		Source:        "probe",
+		ProbeTier:     tier,
+		Type:          obsType,
+	})
 }
 
 func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int, techs []string, server string) error {
@@ -638,12 +606,23 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 
 			for _, scheme := range []string{"https", "http"} {
 				url := fmt.Sprintf("%s://%s", scheme, h)
-				svc := probeURL(url)
+				// Apply the same host gate to native fallback requests. A
+				// redirect is checked again inside probeURLWithContext.
+				if !urlHostInScope(ctx, url) {
+					continue
+				}
+				svc := probeURLWithContext(ctx, url)
 				if svc != nil {
 					svc.ID = uuid.New().String()
 					svc.TargetID = targetID
 					if err := s.storeBasicService(ctx, svc); err != nil {
 						s.logger.Error("Store basic service failed", "error", err)
+					} else if ValidHTTPStatus(svc.StatusCode) {
+						// Native fallback shares the committed success path with
+						// the tool probe: inventory and host liveness advance together.
+						if err := s.updateSubdomainAlive(targetID, h, svc.StatusCode, nil, svc.Server); err != nil {
+							s.logger.Error("Update native probe liveness failed", "error", err)
+						}
 					}
 				}
 			}
@@ -655,18 +634,26 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 }
 
 func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPService) error {
-	if !watchModeEnabled(ctx) {
-		s.captureProbeStatusChange(ctx, svc.TargetID, svc.URL, svc.StatusCode, svc.Title)
+	obsType := ObservationDeep
+	tier := "deep"
+	if watchModeEnabled(ctx) {
+		obsType = ObservationWatch
+		tier = "watch"
 	}
-	_, err := s.db.Exec(`
-		INSERT INTO http_services (id, target_id, url, status_code, title, server, content_type, content_length, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(target_id, url) DO UPDATE SET
-			status_code = excluded.status_code,
-			title = excluded.title,
-			last_seen = CURRENT_TIMESTAMP
-	`, svc.ID, svc.TargetID, svc.URL, svc.StatusCode, svc.Title, svc.Server, svc.ContentType, svc.ContentLength)
-	return err
+	return s.recordObservation(ctx, HTTPObservation{
+		TargetID:      svc.TargetID,
+		TaskID:        taskIDFromContext(ctx),
+		URL:           svc.URL,
+		Host:          URLHost(svc.URL),
+		StatusCode:    svc.StatusCode,
+		Title:         svc.Title,
+		Server:        svc.Server,
+		ContentType:   svc.ContentType,
+		ContentLength: svc.ContentLength,
+		Source:        "probe",
+		ProbeTier:     tier,
+		Type:          obsType,
+	})
 }
 
 func (s *HTTPScanner) RunWithCallback(ctx context.Context, taskID string, callback func(line string), args ...string) error {

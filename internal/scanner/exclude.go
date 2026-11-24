@@ -300,9 +300,20 @@ func FilterExcludedIPs(ips []string, e ExclusionSet) (kept []string, dropped int
 	return kept, dropped
 }
 
-// LoadExclusions reads and compiles a target's exclude_scope.
-func LoadExclusions(ctx context.Context, db *database.DB, targetID string) ExclusionSet {
+// LoadExclusionsE reads and compiles a target's exclude_scope. It returns the
+// read error so a task can block before it sends any request. A read failure
+// must never become an empty (permissive) exclusion set.
+func LoadExclusionsE(ctx context.Context, db *database.DB, targetID string) (ExclusionSet, error) {
 	var raw string
-	_ = db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&raw)
-	return ParseExclusions(raw)
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&raw); err != nil {
+		return ExclusionSet{}, err
+	}
+	return ParseExclusions(raw), nil
+}
+
+// LoadExclusions reads and compiles a target's exclude_scope. Callers that can
+// act on a read error should use LoadExclusionsE instead.
+func LoadExclusions(ctx context.Context, db *database.DB, targetID string) ExclusionSet {
+	e, _ := LoadExclusionsE(ctx, db, targetID)
+	return e
 }

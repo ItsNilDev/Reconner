@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gorilla/mux"
+
+	"github.com/recon-platform/internal/scanner"
 )
 
 // ── Breadth ("watch") coverage ───────────────────────────────────────────────
@@ -311,28 +314,59 @@ func (h *Handler) handlePromoteWatchScope(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Scope reads must fail closed. A failed lookup cannot prove that a landed
+	// host is still allowed, so promotion is refused with a conflict.
+	exclusions, err := scanner.LoadExclusionsE(r.Context(), h.db, id)
+	if err != nil {
+		h.writeError(w, http.StatusConflict, fmt.Sprintf("current scope could not be verified: %v", err))
+		return
+	}
+	entries, linked, err := scanner.LoadWatchEligibleScope(r.Context(), h.db, id)
+	if err != nil {
+		h.writeError(w, http.StatusConflict, fmt.Sprintf("current program eligibility could not be verified: %v", err))
+		return
+	}
+
+	// Only rows the watch tier landed are promoted; a program-imported asset
+	// keeps its own type. Revalidate every row against current policy before
+	// the UPDATE, so a revoked asset cannot become a deep seed.
 	placeholders := make([]string, 0, len(req.Values))
 	args := []any{id}
+	seen := map[string]bool{}
+	blocked := []string{}
 	for _, v := range req.Values {
 		v = strings.ToLower(strings.TrimSpace(v))
-		if v == "" {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		eligible, err := h.watchLandingEligible(r.Context(), id, v, exclusions, entries, linked)
+		if err != nil {
+			h.writeError(w, http.StatusConflict, fmt.Sprintf("eligibility for %s could not be verified: %v", v, err))
+			return
+		}
+		if !eligible {
+			blocked = append(blocked, v)
 			continue
 		}
 		placeholders = append(placeholders, "?")
 		args = append(args, v)
+	}
+	if len(blocked) > 0 {
+		h.writeError(w, http.StatusConflict,
+			"current scope no longer allows promotion: "+strings.Join(blocked, ", "))
+		return
 	}
 	if len(placeholders) == 0 {
 		h.writeError(w, http.StatusBadRequest, "values is required")
 		return
 	}
 
-	// Only rows the watch tier landed are promoted; a program-imported asset
-	// keeps its own type.
 	res, err := h.db.ExecContext(r.Context(), `
 		UPDATE assets
 		SET asset_type = 'url',
 		    monitor_enabled = 0,
-		    metadata = json_set(COALESCE(metadata,'{}'), '$.promoted_to_deep', 1),
+		    metadata = json_set(COALESCE(metadata,'{}'), '$.promoted_to_deep', 1, '$.out_of_scope', 0),
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE target_id = ? AND source = 'watch:scope' AND value IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
@@ -342,4 +376,35 @@ func (h *Handler) handlePromoteWatchScope(w http.ResponseWriter, r *http.Request
 	n, _ := res.RowsAffected()
 	h.hub.Broadcast("target_updated", map[string]string{"id": id})
 	h.writeSuccess(w, map[string]any{"promoted": n})
+}
+
+// watchLandingEligible reports whether a landed Watch host may become a deep
+// seed now. Current policy wins over the stored out_of_scope marker: a marker
+// left by an earlier sweep is cleared when the grant returns. A wildcard scope
+// pattern is never a host and is never promoted.
+func (h *Handler) watchLandingEligible(ctx context.Context, targetID, value string,
+	exclusions scanner.ExclusionSet, entries []scanner.WatchScopeEntry, linked bool) (bool, error) {
+	var approval, metadata string
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COALESCE(approval_status,'approved'), COALESCE(metadata,'{}')
+		FROM assets WHERE target_id=? AND source='watch:scope' AND value=?`,
+		targetID, value).Scan(&approval, &metadata)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if approval != "approved" || scanner.IsWildcardScopePattern(value) {
+		return false, nil
+	}
+	if exclusions.ExcludesDestination(ctx, scanner.URLHost(value)) {
+		return false, nil
+	}
+	if linked {
+		if _, _, ok := scanner.HostMatchesWatchScope(entries, value); !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }

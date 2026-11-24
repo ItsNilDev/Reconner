@@ -353,6 +353,12 @@ func TestExecuteTaskScopedTaskNeverEntersPrioritizedBranch(t *testing.T) {
 	}
 	// Two live hosts on the target — if the per-asset branch ran, it would
 	// have something to iterate over and current_asset would get set.
+	if _, err := s.db.Exec(`INSERT INTO assets (id,target_id,value,asset_type,approval_status)
+		VALUES (?,?,?,'domain','approved'),(?,?,?,'domain','approved')`,
+		uuid.NewString(), "scoped-target", "example.com",
+		uuid.NewString(), "scoped-target", "other.example.com"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.db.Exec(`INSERT INTO subdomains (id,target_id,subdomain,is_alive,status_code) VALUES
 		(?,?,?,1,200),(?,?,?,1,200)`,
 		uuid.NewString(), "scoped-target", "example.com",

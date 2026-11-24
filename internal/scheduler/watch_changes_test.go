@@ -249,7 +249,7 @@ func TestEmitWatchNewHostsBaselineMarksWithoutFeedRows(t *testing.T) {
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
-			t.Fatalf("setup: %v", err)
+			t.Fatalf("setup %q: %v", stmt, err)
 		}
 	}
 
@@ -354,6 +354,7 @@ func TestEmitWatchNewHostsSkipsWildcardScopePatterns(t *testing.T) {
 	ctx := context.Background()
 	stmts := []string{
 		`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`,
+		`INSERT INTO bounty_programs (id, provider, external_id, handle, name) VALUES ('p1','hackerone','p1','p1','P1')`,
 		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
 			VALUES ('round-0','t1','watch_scan','finished',1,'[]',1)`,
 		// The bad row a wildcard asset used to create in the seed loop.
@@ -454,6 +455,7 @@ func TestPruneOrphanChangeSeen(t *testing.T) {
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 	stmts := []string{
 		`INSERT INTO targets (id, domain) VALUES ('t1','example.com')`,
+		`INSERT INTO bounty_programs (id, provider, external_id, handle, name) VALUES ('p1','hackerone','p1','p1','P1')`,
 		`INSERT INTO tasks (id, target_id, type, status, priority, modules, total)
 			VALUES ('round-1','t1','watch_scan','finished',1,'[]',2)`,
 		`INSERT INTO monitoring_changes (id,target_id,url,change_type,detected_at)
@@ -463,15 +465,17 @@ func TestPruneOrphanChangeSeen(t *testing.T) {
 			VALUES ('wc-1','t1','round-1','https://a.example','new_subdomain','','a.example','medium','{}','` + now + `')`,
 		`INSERT INTO watch_scope_events (id,target_id,identifier,event_type,detected_at)
 			VALUES ('we-1','t1','a.example','landed','` + now + `')`,
+		`INSERT INTO bounty_scope_events (id,target_id,program_id,event_type,identifier,detected_at)
+			VALUES ('be-1','t1','p1','rule_added','a.example','` + now + `')`,
 		`INSERT INTO notifications (id,target_id,type,title,created_at)
 			VALUES ('n-1','t1','watch_failed','Round failed','` + now + `')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
-			t.Fatalf("setup: %v", err)
+			t.Fatalf("setup %q: %v", stmt, err)
 		}
 	}
-	for _, id := range []string{"mc-1", "wc-1", "we-1", "n-1", "dead-1"} {
+	for _, id := range []string{"mc-1", "wc-1", "we-1", "be-1", "n-1", "dead-1"} {
 		if _, err := s.db.Exec(`INSERT INTO change_seen (change_id,user_id,seen_at) VALUES (?,1,?)`, id, now); err != nil {
 			t.Fatalf("insert seen %s: %v", id, err)
 		}
@@ -492,7 +496,7 @@ func TestPruneOrphanChangeSeen(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	want := []string{"mc-1", "n-1", "wc-1", "we-1"}
+	want := []string{"be-1", "mc-1", "n-1", "wc-1", "we-1"}
 	if len(ids) != len(want) {
 		t.Fatalf("remaining ids = %v, want %v", ids, want)
 	}
@@ -538,5 +542,70 @@ func TestShouldWriteWatchDiffGates(t *testing.T) {
 	}
 	if shouldWriteWatchDiff(watchScanType, false, false, nil, nil, false) {
 		t.Fatal("missing snapshots must not write a diff")
+	}
+}
+
+func TestWatchHTTPServiceForHostMatchesExactHost(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('exact-t','example.test')`)
+	_, _ = s.db.Exec(`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES
+		('s-a','exact-t','a.example.test',1), ('s-b','exact-t','a.example.test.evil.test',1)`)
+	_, _ = s.db.Exec(`INSERT INTO http_services (id,target_id,subdomain_id,url,status_code,title)
+		VALUES ('h-a','exact-t','s-a','https://a.example.test/',200,'Good'),
+		       ('h-b','exact-t','s-b','https://a.example.test.evil.test/',403,'Impostor')`)
+
+	got := watchHTTPServiceForHost(ctx, s.db, "exact-t", "a.example.test")
+	if got.URL != "https://a.example.test/" || got.StatusCode != 200 || got.Title != "Good" {
+		t.Fatalf("service = %+v, want the exact host's service", got)
+	}
+	other := watchHTTPServiceForHost(ctx, s.db, "exact-t", "a.example.test.evil.test")
+	if other.URL != "https://a.example.test.evil.test/" || other.StatusCode != 403 {
+		t.Fatalf("service = %+v, want the overlapping host's own service", other)
+	}
+}
+
+func TestEmitWatchNewHostsManualProjectUsesProjectScope(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	stmts := []string{
+		`INSERT INTO targets (id, domain) VALUES ('manual-t','example.test')`,
+		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
+			VALUES ('round-0','manual-t','watch_scan','finished',1,'[]',1)`,
+		`INSERT INTO assets (id,target_id,value,asset_type,approval_status) VALUES ('a-in','manual-t','in.example.test','domain','approved')`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES
+			('manual-t','in.example.test','2026-01-01 00:00:00','2026-01-02 00:00:00'),
+			('manual-t','out.example.test','2026-01-01 00:00:00','2026-01-02 00:00:00')`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES
+			('s-in','manual-t','in.example.test',1), ('s-out','manual-t','out.example.test',1)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	got := s.emitWatchNewHosts(ctx, "round-2", "manual-t")
+	if len(got) != 1 {
+		t.Fatalf("events = %+v, want one grouped event", got)
+	}
+	var meta struct {
+		Members []struct {
+			Host    string `json:"host"`
+			InScope bool   `json:"in_scope"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal([]byte(got[0].Metadata), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Members) != 2 {
+		t.Fatalf("members = %+v, want both hosts with separate scope flags", meta.Members)
+	}
+	scopeByHost := map[string]bool{}
+	for _, m := range meta.Members {
+		scopeByHost[m.Host] = m.InScope
+	}
+	if !scopeByHost["in.example.test"] || scopeByHost["out.example.test"] {
+		t.Fatalf("members = %+v, want only the project asset in scope", meta.Members)
 	}
 }

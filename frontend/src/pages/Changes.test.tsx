@@ -18,7 +18,9 @@ const changeRows: ChangeEntry[] = [
     id: 'c2', source: 'bounty', target_id: 't2', target_name: 'beta.test',
     task_id: '', url: 'beta.test/scope', change_type: 'scope_modified',
     category: 'assets', severity: 'info', seen: false,
-    old_value: 'old.scope', new_value: 'new.scope',
+    old_value: JSON.stringify({ identifier: 'api.beta.test', in_scope: false }),
+    new_value: JSON.stringify({ identifier: 'api.beta.test', in_scope: true }),
+    program_id: 'Example Program',
     detected_at: '2026-01-01 09:00:00',
   },
   {
@@ -111,12 +113,12 @@ describe('global Changes page', () => {
 
     await screen.findByRole('heading', { name: 'Changes' })
     expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
-    expect(screen.getByText('SCOPE MODIFIED')).toBeInTheDocument()
+    expect(screen.getByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
     expect(screen.getByText('WATCH FAILED')).toBeInTheDocument()
     expect(screen.getAllByText('Watch').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Bounty').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Bell').length).toBeGreaterThan(0)
-    expect(screen.getByTitle(/Old: old\.scope/)).toBeInTheDocument()
+    expect(screen.getByText('In scope:')).toBeInTheDocument()
     expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
     expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument()
   })

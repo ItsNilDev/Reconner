@@ -204,6 +204,7 @@ func RunMigrations(db *DB) error {
 		alterBountyScopeEventsAddProposedRawHash,
 		// Four signal categories plus Scan activity replace the broad switches.
 		alterTelegramChatsAddSignalPrefs,
+		createHTTPObservationBaselinesTable,
 	}
 
 	for i, m := range migrations {
@@ -2112,3 +2113,22 @@ const alterBountyScopeEventsAddProposedRawHash = `ALTER TABLE bounty_scope_event
 const alterTelegramChatsAddSignalPrefs = `
 ALTER TABLE telegram_chats ADD COLUMN notify_program_scope INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE telegram_chats ADD COLUMN notify_http_status INTEGER NOT NULL DEFAULT 1;`
+
+// http_observation_baselines holds the last compared observation for each
+// service and observation path. http_services is the latest inventory only; it
+// cannot tell which tier made the last observation, so a single shared row
+// would coalesce a breadth 302 and a deep 200 into one false transition.
+const createHTTPObservationBaselinesTable = `
+CREATE TABLE IF NOT EXISTS http_observation_baselines (
+	target_id TEXT NOT NULL,
+	service_url TEXT NOT NULL,
+	observation_type TEXT NOT NULL,
+	status_code INTEGER NOT NULL DEFAULT 0,
+	title TEXT NOT NULL DEFAULT '',
+	server TEXT NOT NULL DEFAULT '',
+	technologies TEXT NOT NULL DEFAULT '',
+	redirect_url TEXT NOT NULL DEFAULT '',
+	body_hash TEXT NOT NULL DEFAULT '',
+	detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (target_id, service_url, observation_type)
+);`

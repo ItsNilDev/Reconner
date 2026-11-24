@@ -44,6 +44,10 @@ func NewSubdomainScanner(db *database.DB, exec *tools.Executor, cfg *config.Conf
 	return &SubdomainScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
+// SetBroadcast wires the scheduler event bridge without changing the
+// constructor used by the many direct scanner tests.
+func (s *SubdomainScanner) SetBroadcast(fn BroadcastFunc) { s.broadcast = fn }
+
 func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, logFn LogFunc) error {
 	logFn("info", "subdomain_enum", fmt.Sprintf("Starting subdomain enumeration for %s", domain))
 
@@ -313,9 +317,21 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 		afterNames := s.existingSubdomainSet(ctx, targetID)
 		newNames := newSubdomainNames(beforeNames, afterNames)
 		if n := len(newNames); n > 0 {
-			notifyWithMetadata(s.db, targetID, "new_host", notificationTitle("new_host"),
-				fmt.Sprintf("%d new subdomain(s) found on %s", n, domain), domain, "medium",
-				newSubdomainMetadata(newNames, n))
+			body := fmt.Sprintf("%d new subdomain(s) found on %s", n, domain)
+			meta := newSubdomainMetadata(newNames, n)
+			changeID := uuid.NewString()
+			notifyWithIdentity(s.db, targetID, "new_host", notificationTitle("new_host"),
+				body, domain, "medium", meta, changeID, "", body)
+			// One authoritative feed event carries the discovery. Bell and
+			// Telegram summaries attach to the same durable id, so replaying
+			// delivery cannot create a second announcement.
+			if s.broadcast != nil {
+				s.broadcast("notification_created", map[string]any{
+					"target_id": targetID, "type": "new_host", "severity": "medium",
+					"change_id": changeID, "old_value": "", "new_value": body,
+					"url": domain, "hosts": newNames,
+				})
+			}
 		}
 	}
 
@@ -362,19 +378,22 @@ func newSubdomainNames(before, after map[string]bool) []string {
 // kept. A malformed-free compact JSON string is always returned.
 func newSubdomainMetadata(hosts []string, total int) string {
 	truncated := total > len(hosts)
-	stored := hosts
-	if stored == nil {
-		stored = []string{}
+	all := hosts
+	if all == nil {
+		all = []string{}
 	}
+	stored := all
 	if len(stored) > newSubdomainMetadataCap {
 		stored = stored[:newSubdomainMetadataCap]
 		truncated = true
 	}
 	payload := struct {
-		Hosts     []string `json:"hosts"`
+		Hosts     []string `json:"hosts"`      // preview for cards and alerts
+		AllHosts  []string `json:"all_hosts"`  // complete membership for search
+		Omitted   int      `json:"omitted"`    // names kept only in all_hosts
 		Truncated bool     `json:"truncated"`
 		Total     int      `json:"total"`
-	}{Hosts: stored, Truncated: truncated, Total: total}
+	}{Hosts: stored, AllHosts: all, Omitted: total - len(stored), Truncated: truncated, Total: total}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return "{}"

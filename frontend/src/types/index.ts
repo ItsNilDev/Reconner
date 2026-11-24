@@ -346,6 +346,8 @@ export interface ChangeEntry {
   program_asset_id?: string
   scope_status?: string
   resolved_at?: string
+  old_status?: number
+  new_status?: number
   seen: boolean
   detected_at: string
 }

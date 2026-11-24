@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { changes, targets as targetsApi, watchApi } from '../../lib/api'
+import { bounty, changes, targets as targetsApi, watchApi } from '../../lib/api'
 import type { ChangeEntry, Target, WatchRound } from '../../types'
 import { Badge, Button, CopyButton, Empty, SkeletonRows } from '../ui'
 import { cn, safeHref, timeAgo } from '../../lib/utils'
 import { ws } from '../../lib/websocket'
 import {
-  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isDefaultFeedRow, type ChangeFilter,
+  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isDefaultFeedRow, isScopeEvent,
+  scopeEventSummary, type ChangeFilter,
 } from './changesModel'
 import InlineChangeDiff from './InlineChangeDiff'
+import ScopeEventView from './ScopeEventView'
 import { ChangeDiffViewer } from '../targets/ChangeDiffViewer'
 
 type DiffView = { targetId: string; url: string; kind: 'css' | 'js' }
@@ -233,9 +235,10 @@ function SourceBadge({ source }: { source: string }) {
 interface Props {
   targetId?: string
   compact?: boolean
+  initialEventId?: string
 }
 
-export default function ChangeLog({ targetId, compact }: Props) {
+export default function ChangeLog({ targetId, compact, initialEventId }: Props) {
   const [hours, setHours] = useState('0')
   const [customSince, setCustomSince] = useState('')
   const [categories, setCategories] = useState<Set<ChangeFilter>>(() => new Set<ChangeFilter>(['all']))
@@ -257,6 +260,7 @@ export default function ChangeLog({ targetId, compact }: Props) {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [serverTotal, setServerTotal] = useState(0)
+  const [programNames, setProgramNames] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<ChangeCard | null>(null)
   const [diffView, setDiffView] = useState<DiffView | null>(null)
 
@@ -283,10 +287,10 @@ export default function ChangeLog({ targetId, compact }: Props) {
   // buildParams, so reads and Mark all read agree even inside the debounce
   // window (A11, review findings #2 and #6).
   const isDefaultView = useCallback((searchText: string, codesText: string) =>
-    categories.has('all') && !source && !severity && !selectedTaskId &&
+    categories.has('all') && !source && !severity && !selectedTaskId && !initialEventId &&
     !searchText.trim() && !statusOnly && statusClasses.size === 0 &&
     parseStatusCodes(codesText).length === 0,
-    [categories, source, severity, selectedTaskId, statusOnly, statusClasses])
+    [categories, source, severity, selectedTaskId, statusOnly, statusClasses, initialEventId])
 
   const defaultView = isDefaultView(debouncedQ, debouncedCodes)
 
@@ -308,13 +312,22 @@ export default function ChangeLog({ targetId, compact }: Props) {
     if (source) p.source = source
     if (severity) p.severity = severity
     if (selectedTaskId) p.task_id = selectedTaskId
+    if (initialEventId) p.event_id = initialEventId
     const t = targetId || selectedTargetId
     if (t) p.target_id = t
     return p
-  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, isDefaultView])
+  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, initialEventId, isDefaultView])
 
   const params = useCallback((): Record<string, string> => buildParams(debouncedQ, debouncedCodes),
     [buildParams, debouncedQ, debouncedCodes])
+
+  useEffect(() => {
+    bounty.list().then(r => {
+      const names: Record<string, string> = {}
+      for (const p of r.programs || []) names[p.id] = p.name
+      setProgramNames(names)
+    }).catch(() => {})
+  }, [])
 
   const load = useCallback(async (mode: LoadMode = 'refresh') => {
     if (inFlight.current) {
@@ -337,7 +350,10 @@ export default function ChangeLog({ targetId, compact }: Props) {
     try {
       const [changeRows, roundRows] = await Promise.all([
         targetId
-          ? changes.forTarget(targetId, p)
+          ? changes.forTargetPage(targetId, { ...p, page: '1', limit: String(PAGE) }).then(page => {
+              fetchedTotal = page.total
+              return page.data
+            })
           : Promise.all(
             Array.from({ length: pageCount.current }, (_, i) =>
               changes.listPage({ ...p, page: String(i + 1), limit: String(PAGE) })),
@@ -395,12 +411,20 @@ export default function ChangeLog({ targetId, compact }: Props) {
     }
   }, [load])
 
+  useEffect(() => {
+    if (!initialEventId) return
+    const found = rows.find(r => r.id === initialEventId)
+    if (found) setDetail(groupIntoCards([found])[0] || null)
+  }, [initialEventId, rows])
+
   const loadMore = async () => {
     const next = pageCount.current + 1
     const seq = ++requestSeq.current
     setLoading(true)
     try {
-      const res = await changes.listPage({ ...params(), page: String(next), limit: String(PAGE) })
+      const res = targetId
+        ? await changes.forTargetPage(targetId, { ...params(), page: String(next), limit: String(PAGE) })
+        : await changes.listPage({ ...params(), page: String(next), limit: String(PAGE) })
       if (seq !== requestSeq.current) return
       pageCount.current = next
       setServerTotal(res.total)
@@ -620,7 +644,7 @@ export default function ChangeLog({ targetId, compact }: Props) {
       {/* Slim watch round strip. Status word stays visible, not just the dot. */}
       {rounds.length > 0 && (
         <div className="flex items-center gap-1.5 overflow-x-auto py-1.5">
-          <span className="shrink-0 mr-1 text-[10px] uppercase tracking-wide text-text-muted">Rounds</span>
+          <span className="shrink-0 mr-1 text-[10px] uppercase tracking-wide text-text-muted">Breadth rounds</span>
           {rounds.slice(0, 20).map(r => (
             <button
               key={r.id}
@@ -701,6 +725,9 @@ export default function ChangeLog({ targetId, compact }: Props) {
 
                 <div className="mt-2 space-y-1.5 pl-1">
                   {card.items.map((item, i) => {
+                    if (isScopeEvent(item)) {
+                      return <ScopeEventView key={`${item.id}-${i}`} item={item} variant="card" programName={item.program_id ? programNames[item.program_id] : undefined} />
+                    }
                     const hosts = changeHosts(item)
                     const singleHost = hosts?.length === 1 ? hosts[0] : null
                     return (
@@ -713,14 +740,9 @@ export default function ChangeLog({ targetId, compact }: Props) {
                             {singleHost}
                           </span>
                         ) : (
-                          <InlineChangeDiff oldValue={item.old_value} newValue={item.new_value} changeType={item.change_type} />
+                          <InlineChangeDiff oldValue={item.old_value} newValue={item.new_value} changeType={item.change_type} oldStatus={item.old_status} newStatus={item.new_status} />
                         )}
                         <Badge variant={changeBadgeVariant(item)}>{item.severity}</Badge>
-                        {item.scope_status && (
-                          <span className="text-[10px] text-text-muted">
-                            {item.scope_status}{item.program_id ? ` · ${item.program_id}` : ''}
-                          </span>
-                        )}
                       </div>
                     )
                   })}
@@ -771,7 +793,11 @@ export default function ChangeLog({ targetId, compact }: Props) {
           >
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <h3 className="text-sm font-semibold">{fieldLabel(detail.items[0]?.change_type || '')}</h3>
+                <h3 className="text-sm font-semibold">
+                  {detail.items[0] && isScopeEvent(detail.items[0])
+                    ? scopeEventSummary(detail.items[0])
+                    : fieldLabel(detail.items[0]?.change_type || '')}
+                </h3>
                 <p className="mt-1 break-all text-xs text-text-muted">{detail.url || detail.target_name}</p>
               </div>
               <Button size="sm" variant="ghost" onClick={() => setDetail(null)}>Close</Button>
@@ -799,7 +825,11 @@ export default function ChangeLog({ targetId, compact }: Props) {
             <NewHostsSection items={detail.items} />
 
             <div className="mt-4 space-y-3">
-              {detail.items.map((item, i) => (
+              {detail.items.map((item, i) => {
+                if (isScopeEvent(item)) {
+                  return <ScopeEventView key={`${item.id}-${i}`} item={item} variant="details" programName={item.program_id ? programNames[item.program_id] : undefined} />
+                }
+                return (
                 <div key={`${item.id}-${i}`} className="rounded-lg border border-white/[.06] bg-white/[.02] p-3">
                   <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
                     {fieldLabel(item.change_type)} · {item.severity}
@@ -826,7 +856,8 @@ export default function ChangeLog({ targetId, compact }: Props) {
                     </pre>
                   )}
                 </div>
-              ))}
+                )
+              })}
             </div>
 
             <div className="mt-5 flex items-center gap-3">

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChangeLog from './ChangeLog'
 import { ws } from '../../lib/websocket'
@@ -27,7 +28,10 @@ const bountyScope: ChangeEntry = {
   id: 'c1', source: 'bounty', target_id: 't2', target_name: 'beta.test',
   task_id: '', url: 'beta.test/scope', change_type: 'scope_modified',
   category: 'assets', severity: 'info', seen: false,
-  old_value: 'old.example', new_value: 'new.example',
+  old_value: JSON.stringify({ identifier: 'api.beta.test', in_scope: false }),
+  new_value: JSON.stringify({ identifier: 'api.beta.test', in_scope: true }),
+  program_id: 'Example Program',
+  scope_status: 'approved',
   detected_at: '2026-01-04 10:00:00',
 }
 
@@ -197,7 +201,7 @@ describe('ChangeLog default feed', () => {
     installFetch({ rows: [...noiseRows, bountyScope] })
     render(<ChangeLog />)
 
-    expect(await screen.findByText('SCOPE MODIFIED')).toBeInTheDocument()
+    expect(await screen.findByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
     expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
     expect(screen.queryByText('TECHNOLOGIES')).not.toBeInTheDocument()
     expect(screen.queryByText('FINDING')).not.toBeInTheDocument()
@@ -207,7 +211,7 @@ describe('ChangeLog default feed', () => {
   it('only renders http(s) links and promotes bare hosts', async () => {
     installFetch({ rows: [bountyScope, { ...alertRow, url: 'javascript:alert(1)' }] })
     render(<ChangeLog />)
-    expect(await screen.findByText('SCOPE MODIFIED')).toBeInTheDocument()
+    expect(await screen.findByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
 
     const hostLink = screen.getByText('beta.test/scope').closest('a')
     expect(hostLink).toHaveAttribute('href', 'https://beta.test/scope')
@@ -293,5 +297,44 @@ describe('ChangeLog filter controls', () => {
     await vi.waitFor(() => {
       expect(lastSeenAllUrl(fetchMock)).toContain('q=Forbidden')
     })
+  })
+})
+
+describe('ChangeLog scope event renderer', () => {
+  // A legacy scope_landed bell row carries an asset snapshot as JSON in both
+  // value fields. The feed must render it as a readable scope event in the
+  // card and in the Details drawer, never as serialized payload.
+  const legacyLanded: ChangeEntry = {
+    id: 'legacy-landed', source: 'notification', target_id: 't3', target_name: 'legacy.test',
+    task_id: '', url: 'api.legacy.test', change_type: 'scope_landed',
+    category: 'assets', severity: 'info', seen: false,
+    old_value: '{}',
+    new_value: JSON.stringify({ identifier: 'api.legacy.test', in_scope: true, asset_type: 'domain' }),
+    metadata: { identifier: 'api.legacy.test', in_scope: true },
+    program_id: 'Example Program',
+    scope_status: 'approved',
+    detected_at: '2026-01-05 10:00:00',
+  }
+
+  it('shows a readable summary in the card and Details drawer without raw JSON', async () => {
+    installFetch({ rows: [legacyLanded] })
+    render(<MemoryRouter><ChangeLog /></MemoryRouter>)
+
+    // Legacy notification rows are hidden in the default view. All history
+    // exposes them so the renderer can be exercised.
+    fireEvent.click(screen.getByRole('button', { name: 'Assets & scope' }))
+    const summary = 'api.legacy.test · Example Program · Host landed.'
+    expect(await screen.findByText(summary)).toBeInTheDocument()
+    expect(screen.getByText('Approved')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('"identifier"')
+    expect(document.body.textContent).not.toContain('"in_scope"')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    // The drawer repeats the formatted summary and shows no serialized payload.
+    expect(screen.getAllByText(summary).length).toBeGreaterThanOrEqual(1)
+    expect(screen.getAllByText('In scope:').length).toBeGreaterThanOrEqual(1)
+    expect(screen.getAllByText('yes').length).toBeGreaterThanOrEqual(1)
+    expect(document.body.textContent).not.toContain('"identifier"')
+    expect(document.body.textContent).not.toContain('"in_scope"')
   })
 })

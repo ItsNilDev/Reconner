@@ -428,6 +428,8 @@ export const changes = {
   list: (params?: Record<string, string>) => fetchAllPaged<ChangeEntry>('/changes', params),
   forTarget: (id: string, params?: Record<string, string>) =>
     fetchAllPaged<ChangeEntry>(`/targets/${id}/changes`, params),
+  forTargetPage: (id: string, params?: Record<string, string>) =>
+    fetchPage<ChangeEntry>(`/targets/${id}/changes`, params),
   setSeen: (ids: string[], seen: boolean) =>
     req<{ updated: number }>('/changes/seen', {
       method: 'POST', body: JSON.stringify({ ids, seen }),
@@ -608,6 +610,7 @@ export interface Notification {
   url: string
   severity: string
   is_read: boolean
+  change_id?: string
   metadata?: Record<string, unknown>
   created_at: string
 }

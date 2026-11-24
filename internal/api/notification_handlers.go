@@ -19,6 +19,7 @@ type notification struct {
 	Severity  string         `json:"severity"`
 	IsRead    bool           `json:"is_read"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+	ChangeID  string         `json:"change_id,omitempty"`
 	CreatedAt string         `json:"created_at"`
 }
 
@@ -119,7 +120,7 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 	}
 	rows, err := h.db.QueryContext(r.Context(), `
 		SELECT id, COALESCE(target_id,''), type, title, COALESCE(body,''), COALESCE(url,''),
-		       COALESCE(severity,'info'), `+readExpr+`, COALESCE(n.metadata,'{}'), created_at
+		       COALESCE(severity,'info'), `+readExpr+`, COALESCE(n.metadata,'{}'), COALESCE(n.change_id,''), created_at
 		FROM notifications n`+scope+`
 		ORDER BY created_at DESC
 		LIMIT 100`, args...)
@@ -134,7 +135,7 @@ func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request
 		var n notification
 		var read int
 		var metadata string
-		if rows.Scan(&n.ID, &n.TargetID, &n.Type, &n.Title, &n.Body, &n.URL, &n.Severity, &read, &metadata, &n.CreatedAt) == nil {
+		if rows.Scan(&n.ID, &n.TargetID, &n.Type, &n.Title, &n.Body, &n.URL, &n.Severity, &read, &metadata, &n.ChangeID, &n.CreatedAt) == nil {
 			n.IsRead = read == 1
 			n.Metadata = map[string]any{}
 			_ = json.Unmarshal([]byte(metadata), &n.Metadata)

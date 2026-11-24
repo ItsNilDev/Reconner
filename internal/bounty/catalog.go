@@ -746,12 +746,39 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	// unmarked rules survive, so a sync never widens or narrows them by accident.
 	var excludeRaw string
 	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&excludeRaw)
-	other, _, manual := splitManagedExclusions(excludeRaw, programID)
+	other, mine, manual := splitManagedExclusions(excludeRaw, programID)
 	merged := append(manual, other...)
-	merged = append(merged, programDenyRules(p)...)
+	newDenyRules := programDenyRules(p)
+	merged = append(merged, newDenyRules...)
 	_, _ = s.db.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID)
-	if added+removed+modified > 0 {
-		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified)
+
+	// A deny rule can be added or withdrawn without any asset row. Record the
+	// rule itself as an approved upstream event so Changes shows the real edit.
+	previousRules := map[string]string{}
+	for _, rule := range mine {
+		previousRules[strings.TrimPrefix(rule, bountyExclusionMarker)] = rule
+	}
+	currentRules := map[string]string{}
+	for _, rule := range newDenyRules {
+		currentRules[strings.TrimPrefix(rule, bountyExclusionMarker)] = rule
+	}
+	ruleAdded, ruleRemoved := 0, 0
+	for identifier, rule := range previousRules {
+		if _, ok := currentRules[identifier]; !ok {
+			if s.createRuleEvent(ctx, targetID, p.ID, "rule_removed", identifier, rule, "{}") {
+				ruleRemoved++
+			}
+		}
+	}
+	for identifier, rule := range currentRules {
+		if _, ok := previousRules[identifier]; !ok {
+			if s.createRuleEvent(ctx, targetID, p.ID, "rule_added", identifier, "{}", rule) {
+				ruleAdded++
+			}
+		}
+	}
+	if added+removed+modified+ruleAdded+ruleRemoved > 0 {
+		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified, %d rules added, %d rules withdrawn. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified, ruleAdded, ruleRemoved)
 		_, _ = s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium")
 	}
 	return nil
@@ -810,6 +837,23 @@ func programDenyRules(p Program) []string {
 		out = append(out, programExclusionLine(p.ID, a.Identifier))
 	}
 	return out
+}
+
+// createRuleEvent records an upstream deny-rule change with no approval step.
+// A repeat sync of the same rule set must not add another event.
+func (s *Service) createRuleEvent(ctx context.Context, targetID, programID, eventType, identifier, oldJSON, newJSON string) bool {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bounty_scope_events
+		WHERE target_id=? AND program_id=? AND event_type=? AND identifier=? AND new_json=?`,
+		targetID, programID, eventType, identifier, newJSON).Scan(&n)
+	if err == nil && n > 0 {
+		return false
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO bounty_scope_events
+		(id,target_id,program_id,event_type,identifier,old_json,new_json,status,detected_at,resolved_at)
+		VALUES(?,?,?,?,?,?,?,'approved',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+		uuid.New().String(), targetID, programID, eventType, identifier, oldJSON, newJSON)
+	return err == nil
 }
 
 // scopeEventFingerprint identifies one specific scope state. "added" and
