@@ -769,6 +769,25 @@ func TestReconcileRecordsDenyRuleEvents(t *testing.T) {
 	if countRules("rule_removed") != 1 {
 		t.Fatalf("rule_removed events=%d, want 1", countRules("rule_removed"))
 	}
+
+	// Restore then withdraw the same rule again. A genuine second change must
+	// not be suppressed by an older decision on the same identifier.
+	p.Assets = append(p.Assets, Asset{
+		ExternalID: "scope-out", Identifier: "admin.acme.test", AssetType: "DOMAIN",
+		InScope: false, EligibleSubmission: false, Active: true,
+	})
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	p.Assets = p.Assets[:1]
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if countRules("rule_removed") != 2 {
+		t.Fatalf("rule_removed events=%d after second withdraw, want 2", countRules("rule_removed"))
+	}
 }
 
 func TestListScopeEventsHidesNonWebHistory(t *testing.T) {

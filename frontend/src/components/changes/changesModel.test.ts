@@ -6,6 +6,7 @@ import {
   groupMonitorChanges,
   inlineDiffPieces,
   isDefaultFeedRow,
+  isScopeEvent,
   monitorRowKind,
   NOTIFICATION_ALLOWED_TYPES,
   parseStatusTransition,
@@ -185,5 +186,13 @@ describe('inlineDiffPieces', () => {
     expect(removed).toContain('nginx')
     expect(added).toContain('apache')
     expect(pieces.some(p => p.kind === 'same' && p.text.includes('Server'))).toBe(true)
+  })
+})
+
+describe('scope event recognition', () => {
+  it('recognizes re-eligible and out-of-scope watch events', () => {
+    expect(isScopeEvent({ change_type: 'scope_re_eligible' })).toBe(true)
+    expect(isScopeEvent({ change_type: 'out_of_scope' })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'watch_scope', change_type: 'scope_re_eligible' })).toBe(true)
   })
 })

@@ -185,6 +185,30 @@ func compareObservation(b observationBaseline, obs HTTPObservation) []observedCh
 	return out
 }
 
+// upsertObservationBaseline advances a comparison baseline. An unknown code
+// must never replace a valid sample: a failed connect (status 0) would erase
+// the baseline and hide the next real transition.
+type execContexter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func upsertObservationBaseline(ctx context.Context, exec execContexter, targetID, serviceURL, obsType string,
+	statusCode int, title, server, technologies, redirectURL, bodyHash string) error {
+	if !ValidHTTPStatus(statusCode) {
+		return nil
+	}
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO http_observation_baselines
+			(target_id,service_url,observation_type,status_code,title,server,technologies,redirect_url,body_hash,detected_at)
+		VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(target_id,service_url,observation_type) DO UPDATE SET
+			status_code=excluded.status_code, title=excluded.title, server=excluded.server,
+			technologies=excluded.technologies, redirect_url=excluded.redirect_url,
+			body_hash=excluded.body_hash, detected_at=CURRENT_TIMESTAMP`,
+		targetID, serviceURL, obsType, statusCode, title, server, technologies, redirectURL, bodyHash)
+	return err
+}
+
 // recordObservation commits the comparison baseline, the change events, the
 // bell entries and the service inventory in one transaction. Nothing is
 // published until commit, so a failed event write cannot advance the baseline
@@ -250,16 +274,8 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 		events = append(events, c)
 	}
 
-	if _, err = tx.ExecContext(ctx, `
-		INSERT INTO http_observation_baselines
-			(target_id,service_url,observation_type,status_code,title,server,technologies,redirect_url,body_hash,detected_at)
-		VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
-		ON CONFLICT(target_id,service_url,observation_type) DO UPDATE SET
-			status_code=excluded.status_code, title=excluded.title, server=excluded.server,
-			technologies=excluded.technologies, redirect_url=excluded.redirect_url,
-			body_hash=excluded.body_hash, detected_at=CURRENT_TIMESTAMP`,
-		obs.TargetID, serviceURL, obs.Type, obs.StatusCode, obs.Title,
-		obs.Server, obs.Technologies, obs.RedirectURL, obs.BodyHash); err != nil {
+	if err = upsertObservationBaseline(ctx, tx, obs.TargetID, serviceURL, obs.Type,
+		obs.StatusCode, obs.Title, obs.Server, obs.Technologies, obs.RedirectURL, obs.BodyHash); err != nil {
 		return fmt.Errorf("update observation baseline: %w", err)
 	}
 

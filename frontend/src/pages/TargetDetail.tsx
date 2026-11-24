@@ -1476,7 +1476,7 @@ export default function TargetDetail() {
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
         {tab === 'monitor'
-          ? <div className="p-3"><ChangeLog targetId={id} compact initialEventId={initialEventId} /></div>
+          ? <div className="p-3"><ChangeLog targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} /></div>
           : dataError && !tabLoading
           ? <div className="p-4 text-sm text-severity-high" role="alert">{dataError}</div>
           : tabLoading

@@ -23,6 +23,15 @@ export function onNotificationsChanged(handler: () => void): () => void {
 
 // Shared bell navigation. Both TopBar and the Changes notifications panel use
 // the same mark-read call and route rules.
+
+// Only these types carry a bell change_id that equals a feed row id. New hosts,
+// findings and program notices use other identities, so an event deep link for
+// them would open an empty Changes view.
+const FEED_EVENT_TYPES = new Set([
+  'status_change', 'http_change', 'page_change', 'tech_change',
+  'redirect_change', 'content_change', 'js_change', 'css_change',
+  'security_header_removed', 'header_regression', 'content_security_change',
+])
 export function openNotification(
   n: Notification,
   navigate: (path: string) => void,
@@ -36,7 +45,7 @@ export function openNotification(
     const hosts = n.metadata?.hosts
     const first = Array.isArray(hosts) && typeof hosts[0] === 'string' ? hosts[0] : ''
     const eventID = n.metadata?.change_id || n.metadata?.event_id || n.change_id
-    if (typeof eventID === 'string' && eventID) {
+    if (FEED_EVENT_TYPES.has(n.type) && typeof eventID === 'string' && eventID) {
       navigate(`/targets/${n.target_id}?tab=monitor&event=${encodeURIComponent(eventID)}`)
     } else {
       navigate(first

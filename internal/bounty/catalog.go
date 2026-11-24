@@ -842,11 +842,16 @@ func programDenyRules(p Program) []string {
 // createRuleEvent records an upstream deny-rule change with no approval step.
 // A repeat sync of the same rule set must not add another event.
 func (s *Service) createRuleEvent(ctx context.Context, targetID, programID, eventType, identifier, oldJSON, newJSON string) bool {
-	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bounty_scope_events
-		WHERE target_id=? AND program_id=? AND event_type=? AND identifier=? AND new_json=?`,
-		targetID, programID, eventType, identifier, newJSON).Scan(&n)
-	if err == nil && n > 0 {
+	// A repeat sync sees the same diff and must not add another event. A real
+	// withdraw after a restore is a new edit, so compare with the latest event
+	// for this identifier instead of any event in history.
+	var latest string
+	err := s.db.QueryRowContext(ctx, `SELECT event_type FROM bounty_scope_events
+		WHERE target_id=? AND program_id=? AND identifier=?
+		  AND event_type IN ('rule_added','rule_removed')
+		ORDER BY detected_at DESC, rowid DESC LIMIT 1`,
+		targetID, programID, identifier).Scan(&latest)
+	if err == nil && latest == eventType {
 		return false
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO bounty_scope_events

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1789,14 +1790,67 @@ func shouldWriteWatchDiff(taskType string, skipped, timedOut bool, phaseErr, mod
 // failTaskPreflight marks a task failed before any phase runs. It is used when
 // current scope cannot be read or a queued per-asset scope is no longer valid.
 // The error is persisted so the UI shows why no request was sent.
-func (s *Scheduler) failTaskPreflight(taskID, targetID, reason string) {
-	_, _ = s.db.Exec(`UPDATE tasks SET status='failed', error=?, progress=0, current_module='',
-		finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, reason, taskID)
-	s.refreshTargetScanStatus(targetID, "failed", false)
+// finalizeBlockedTask applies the same terminal bookkeeping the normal end
+// path uses. A task stopped before I/O must still close its phase ledger and
+// advance the due schedule; otherwise a watch round is retried every tick.
+func (s *Scheduler) finalizeBlockedTask(taskID, targetID, reason, finalStatus string) {
+	var taskType, domain string
+	var started sql.NullTime
+	_ = s.db.QueryRow(`SELECT COALESCE(type,''), started_at,
+		(SELECT domain FROM targets WHERE id=?) FROM tasks WHERE id=?`, targetID, taskID).
+		Scan(&taskType, &started, &domain)
+	startedAt := started.Time
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+
+	phaseStatus, phaseReason := "blocked", reason
+	switch finalStatus {
+	case "cancelled":
+		phaseStatus, phaseReason = "cancelled", "task cancelled before phase completed"
+	case InterruptedStatus:
+		phaseReason = "service stopped; remaining phases moved to the resume task"
+	}
+	s.finishUnresolvedTaskPhases(taskID, phaseStatus, phaseReason)
+
+	storedError := reason
+	if finalStatus == InterruptedStatus {
+		storedError = ""
+	}
+	_, _ = s.db.Exec(`UPDATE tasks SET status=?, error=?, progress=0, current_module='',
+		finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, finalStatus, storedError, taskID)
+
+	if taskType == monitorWatchType && finalStatus != InterruptedStatus {
+		// A blocked monitoring attempt must let the due scheduler back off.
+		// Graceful interruption keeps its auto-resume restart window.
+		_, _ = s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID)
+	}
+	if taskType == watchScanType {
+		s.applyWatchTerminalRules(targetID, finalStatus)
+	}
+	terminalTargetStatus := "idle"
+	if finalStatus == "failed" {
+		terminalTargetStatus = "failed"
+	}
+	s.refreshTargetScanStatus(targetID, terminalTargetStatus, false)
+
 	s.hub.Broadcast("task_finished", map[string]string{
-		"task_id": taskID, "target_id": targetID, "status": "failed",
+		"task_id": taskID, "target_id": targetID, "status": finalStatus,
 	})
-	s.logger.Error("Task blocked before I/O", "task_id", taskID, "reason", reason)
+	if s.notifier != nil && finalStatus != InterruptedStatus {
+		s.notifyScanDone(taskID, targetID, domain, taskType, finalStatus, startedAt)
+	}
+	if taskType == monitorWatchType && finalStatus == "failed" {
+		_, _ = s.db.Exec(`INSERT INTO notifications(id,target_id,type,title,body,url,severity,is_read)
+			VALUES(?,?,'monitor_failed','Monitoring pass failed',?,?,'medium',0)`,
+			uuid.NewString(), targetID, reason, "/targets/"+targetID)
+		s.hub.Broadcast("notification_created", map[string]any{"target_id": targetID, "type": "monitor_failed", "severity": "medium"})
+	}
+	s.logger.Error("Task stopped before I/O", "task_id", taskID, "status", finalStatus, "reason", reason)
+}
+
+func (s *Scheduler) failTaskPreflight(taskID, targetID, reason string) {
+	s.finalizeBlockedTask(taskID, targetID, reason, "failed")
 }
 
 // validateScopeOverrideE revalidates a queued per-asset scope at execution time.
@@ -1881,15 +1935,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		if taskStatus == InterruptedStatus {
 			finalStatus = InterruptedStatus
 		}
-		_, _ = s.db.Exec(`UPDATE tasks SET status=?, progress=0, current_module='',
-			finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, finalStatus, taskID)
-		if taskType == monitorWatchType && finalStatus == "cancelled" {
-			_, _ = s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID)
-		}
-		s.refreshTargetScanStatus(targetID, "idle", false)
-		s.hub.Broadcast("task_finished", map[string]string{
-			"task_id": taskID, "target_id": targetID, "status": finalStatus,
-		})
+		s.finalizeBlockedTask(taskID, targetID, "task cancelled before I/O", finalStatus)
 		return
 	}
 

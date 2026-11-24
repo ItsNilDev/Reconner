@@ -69,7 +69,8 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 	// Check HTTP services for changes
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, url, status_code, title, content_length, hash,
-		       COALESCE(norm_hash,''), COALESCE(security_snapshot,''), COALESCE(server,'')
+		       COALESCE(norm_hash,''), COALESCE(security_snapshot,''), COALESCE(server,''),
+		       COALESCE(technologies,'[]'), COALESCE(redirect_url,'')
 		FROM http_services WHERE target_id = ? AND COALESCE(source,'probe')='probe'
 	`, targetID)
 	if err != nil {
@@ -86,12 +87,14 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		NormHash      string
 		SecSnapshot   string
 		Server        string
+		Technologies  string
+		RedirectURL   string
 	}
 	excl := LoadExclusions(ctx, s.db, targetID)
 	var services []svcRecord
 	for rows.Next() {
 		var r svcRecord
-		if err := rows.Scan(&r.ID, &r.URL, &r.StatusCode, &r.Title, &r.ContentLength, &r.Hash, &r.NormHash, &r.SecSnapshot, &r.Server); err != nil {
+		if err := rows.Scan(&r.ID, &r.URL, &r.StatusCode, &r.Title, &r.ContentLength, &r.Hash, &r.NormHash, &r.SecSnapshot, &r.Server, &r.Technologies, &r.RedirectURL); err != nil {
 			rows.Close()
 			return err
 		}
@@ -230,6 +233,11 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, last_seen=CURRENT_TIMESTAMP
 			WHERE id=?
 		`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID)
+		// Keep the deep-probe baseline in step with the committed observation.
+		// Otherwise the next http_probe compares the new inventory status with
+		// its older baseline and emits a second status event and alert.
+		_ = upsertObservationBaseline(ctx, s.db, targetID, NormalizeServiceURL(svc.URL),
+			ObservationDeep, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash)
 	}
 
 	if harvested > 0 {

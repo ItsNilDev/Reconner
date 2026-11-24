@@ -236,9 +236,10 @@ interface Props {
   targetId?: string
   compact?: boolean
   initialEventId?: string
+  initialQuery?: string
 }
 
-export default function ChangeLog({ targetId, compact, initialEventId }: Props) {
+export default function ChangeLog({ targetId, compact, initialEventId, initialQuery = '' }: Props) {
   const [hours, setHours] = useState('0')
   const [customSince, setCustomSince] = useState('')
   const [categories, setCategories] = useState<Set<ChangeFilter>>(() => new Set<ChangeFilter>(['all']))
@@ -246,7 +247,7 @@ export default function ChangeLog({ targetId, compact, initialEventId }: Props) 
   const [statusClasses, setStatusClasses] = useState<Set<string>>(() => new Set<string>())
   const [statusCodes, setStatusCodes] = useState('')
   const debouncedCodes = useDebounced(statusCodes, 300)
-  const [q, setQ] = useState('')
+  const [q, setQ] = useState(initialQuery)
   const debouncedQ = useDebounced(q, 300)
   const [source, setSource] = useState('')
   const [severity, setSeverity] = useState('')
@@ -262,6 +263,7 @@ export default function ChangeLog({ targetId, compact, initialEventId }: Props) 
   const [serverTotal, setServerTotal] = useState(0)
   const [programNames, setProgramNames] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<ChangeCard | null>(null)
+  const handledEventRef = useRef('')
   const [diffView, setDiffView] = useState<DiffView | null>(null)
 
   const requestSeq = useRef(0)
@@ -412,9 +414,11 @@ export default function ChangeLog({ targetId, compact, initialEventId }: Props) 
   }, [load])
 
   useEffect(() => {
-    if (!initialEventId) return
+    if (!initialEventId || handledEventRef.current === initialEventId) return
     const found = rows.find(r => r.id === initialEventId)
-    if (found) setDetail(groupIntoCards([found])[0] || null)
+    if (!found) return
+    handledEventRef.current = initialEventId
+    setDetail(groupIntoCards([found])[0] || null)
   }, [initialEventId, rows])
 
   const loadMore = async () => {
@@ -773,7 +777,7 @@ export default function ChangeLog({ targetId, compact, initialEventId }: Props) 
         )}
       </div>
 
-      {!targetId && rows.length < serverTotal && (
+      {rows.length < serverTotal && (
         <div className="flex justify-center">
           <Button size="sm" variant="ghost" onClick={() => void loadMore()} disabled={loading}>
             Load {Math.min(PAGE, serverTotal - rows.length)} more

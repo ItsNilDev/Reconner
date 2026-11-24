@@ -180,6 +180,7 @@ export function inlineDiffPieces(oldValue: string, newValue: string): InlineDiff
 const SCOPE_EVENT_TYPES = new Set([
   'scope_landed', 'scope_proposed', 'scope_modified', 'scope_removed',
   'scope_rule_added', 'scope_rule_removed', 'scope_rejected',
+  'scope_re_eligible', 'out_of_scope',
 ])
 
 export function isScopeEvent(row: { change_type?: string }): boolean {

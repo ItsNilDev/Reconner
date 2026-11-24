@@ -23,3 +23,13 @@ describe('openNotification', () => {
     expect(navigate).toHaveBeenCalledWith('/targets/t1?tab=monitor&q=a.example')
   })
 })
+
+it('does not use the event route for new_host change ids', () => {
+  const navigate = vi.fn()
+  openNotification(note({
+    type: 'new_host',
+    change_id: 'bell-row-id',
+    metadata: { hosts: ['a.example'] },
+  }), navigate, async () => [])
+  expect(navigate).toHaveBeenCalledWith('/targets/t1?tab=monitor&q=a.example')
+})
