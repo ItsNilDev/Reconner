@@ -679,6 +679,7 @@ func (h *Handler) deleteTargetByID(id string) error {
 		"DELETE FROM actions WHERE target_id = ?",
 		"DELETE FROM object_relationships WHERE target_id = ?",
 		"DELETE FROM workflow_variables WHERE target_id = ?",
+		"DELETE FROM http_observation_baselines WHERE target_id = ?",
 	} {
 		if _, err := tx.Exec(statement, id); err != nil {
 			return err

@@ -229,15 +229,26 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		if newServer != "" {
 			storeServer = newServer
 		}
-		_, _ = s.db.Exec(`
+		if _, err := s.db.ExecContext(ctx, `
 			UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, last_seen=CURRENT_TIMESTAMP
 			WHERE id=?
-		`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID)
-		// Keep the deep-probe baseline in step with the committed observation.
-		// Otherwise the next http_probe compares the new inventory status with
-		// its older baseline and emits a second status event and alert.
-		_ = upsertObservationBaseline(ctx, s.db, targetID, NormalizeServiceURL(svc.URL),
-			ObservationDeep, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash)
+		`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID); err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("update service baseline: %v", err))
+			continue
+		}
+		// Keep the deep-probe and monitor baselines in step with the committed
+		// observation, so the next probe cannot emit a duplicate status event.
+		baselineURL := NormalizeServiceURL(svc.URL)
+		if err := upsertObservationBaseline(ctx, s.db, targetID, baselineURL,
+			ObservationDeep, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("sync deep baseline: %v", err))
+			continue
+		}
+		if err := upsertObservationBaseline(ctx, s.db, targetID, baselineURL,
+			ObservationMonitor, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("sync monitor baseline: %v", err))
+			continue
+		}
 	}
 
 	if harvested > 0 {
@@ -641,28 +652,52 @@ func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, h
 
 // recordChange inserts a monitoring_changes row with a severity classification,
 // and raises a matching notification so the operator sees it in the bell menu.
-func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal, severity string) {
+func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal, severity string) error {
 	changeID := uuid.New().String()
 	oldStatus := statusCodeFromValue(oldVal)
 	newStatus := statusCodeFromValue(newVal)
-	_, _ = s.db.Exec(`
+	_, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO monitoring_changes (id, target_id, url, change_type, old_value, new_value, severity, old_status, new_status, detected_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		changeID, targetID, url, changeType, oldVal, newVal, severity, oldStatus, newStatus)
+	if err != nil {
+		return err
+	}
 
-	title := notificationTitle(changeType)
-	body := url
-	if newVal != "" {
-		body = url + " — " + newVal
-	}
-	notifyWithIdentity(s.db, targetID, changeType, title, body, url, severity, "{}", changeID, oldVal, newVal)
+	// Only real status transitions and security/script/header changes ring the
+	// bell. Routine title and body drift stays in monitoring_changes and Changes.
 	if s.broadcast != nil {
-		s.broadcast("notification_created", map[string]any{
-			"target_id": targetID, "type": changeType, "severity": severity,
-			"change_id": changeID, "old_value": oldVal, "new_value": newVal,
-			"old_status": oldStatus, "new_status": newStatus, "url": url,
-		})
+		s.broadcast("changes_written", map[string]any{"target_id": targetID, "count": 1})
 	}
+	if monitorAlertableChange(changeType, oldStatus, newStatus) {
+		title := notificationTitle(changeType)
+		body := url
+		if newVal != "" {
+			body = url + " — " + newVal
+		}
+		notifyWithIdentity(s.db, targetID, changeType, title, body, url, severity, "{}", changeID, oldVal, newVal)
+		if s.broadcast != nil {
+			s.broadcast("notification_created", map[string]any{
+				"target_id": targetID, "type": changeType, "severity": severity,
+				"change_id": changeID, "old_value": oldVal, "new_value": newVal,
+				"old_status": oldStatus, "new_status": newStatus, "url": url,
+			})
+		}
+	}
+	return nil
+}
+
+// monitorAlertableChange reports whether a monitoring change is a real signal
+// for the bell and Telegram. Equal codes with a changed title are detail rows.
+func monitorAlertableChange(changeType string, oldStatus, newStatus int) bool {
+	if ValidHTTPStatus(oldStatus) && ValidHTTPStatus(newStatus) && oldStatus != newStatus {
+		return true
+	}
+	if strings.HasPrefix(changeType, "security:") || strings.HasSuffix(changeType, "_header_removed") ||
+		strings.Contains(changeType, "header_regression") || changeType == "js_change" || changeType == "css_change" {
+		return true
+	}
+	return false
 }
 
 // notificationTitle maps a monitoring change_type to a human, English headline.

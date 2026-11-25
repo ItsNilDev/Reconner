@@ -136,6 +136,10 @@ func readBaseline(ctx context.Context, tx *sql.Tx, targetID, serviceURL, obsType
 		reliable = reliable && (tier == "watch" || tier == "")
 	} else if obsType == ObservationDeep {
 		reliable = reliable && (tier == "deep" || tier == "")
+	} else if obsType == ObservationMonitor {
+		// The monitor compares against its own committed view. A watch-round
+		// row is never a valid monitor baseline.
+		reliable = reliable && (tier == "deep" || tier == "")
 	}
 	if !reliable {
 		return observationBaseline{}, false, nil
@@ -221,6 +225,11 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 	if obs.Type != ObservationWatch && obs.Type != ObservationDeep && obs.Type != ObservationMonitor {
 		return fmt.Errorf("unknown HTTP observation type %q", obs.Type)
 	}
+	// A status-zero response is not an observation. Never let it replace a
+	// valid baseline or the last good service row.
+	if !ValidHTTPStatus(obs.StatusCode) {
+		return nil
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -258,18 +267,20 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 		if err != nil {
 			return fmt.Errorf("write %s event: %w", c.ChangeType, err)
 		}
-		title := notificationTitle(c.ChangeType)
-		body := serviceURL
-		if c.NewValue != "" {
-			body = serviceURL + " — " + c.NewValue
-		}
-		if _, err = tx.ExecContext(ctx, `
-			INSERT INTO notifications
-				(id,target_id,type,title,body,url,severity,is_read,metadata,change_id,old_value,new_value,created_at)
-			VALUES (?,?,?,?,?,?,?,0,?,?,?,?,CURRENT_TIMESTAMP)`,
-			uuid.NewString(), obs.TargetID, c.ChangeType, title, body, serviceURL,
-			c.Severity, c.Metadata, c.ID, c.OldValue, c.NewValue); err != nil {
-			return fmt.Errorf("write %s bell entry: %w", c.ChangeType, err)
+		if c.ChangeType == "status_change" {
+			title := notificationTitle(c.ChangeType)
+			body := serviceURL
+			if c.NewValue != "" {
+				body = serviceURL + " — " + c.NewValue
+			}
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO notifications
+					(id,target_id,type,title,body,url,severity,is_read,metadata,change_id,old_value,new_value,created_at)
+				VALUES (?,?,?,?,?,?,?,0,?,?,?,?,CURRENT_TIMESTAMP)`,
+				uuid.NewString(), obs.TargetID, c.ChangeType, title, body, serviceURL,
+				c.Severity, c.Metadata, c.ID, c.OldValue, c.NewValue); err != nil {
+				return fmt.Errorf("write %s bell entry: %w", c.ChangeType, err)
+			}
 		}
 		events = append(events, c)
 	}
@@ -292,7 +303,9 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 			status_code=excluded.status_code, title=excluded.title, server=excluded.server,
 			content_type=excluded.content_type, content_length=excluded.content_length,
 			redirect_url=excluded.redirect_url, technologies=excluded.technologies,
-			probe_tier=excluded.probe_tier, last_seen=CURRENT_TIMESTAMP`,
+			probe_tier=excluded.probe_tier, last_seen=CURRENT_TIMESTAMP,
+			subdomain_id=COALESCE(excluded.subdomain_id, http_services.subdomain_id),
+			source=CASE WHEN COALESCE(http_services.source,'')='seed' THEN 'probe' ELSE http_services.source END`,
 		uuid.NewString(), obs.TargetID, nullableString(obs.SubdomainID), serviceURL,
 		obs.StatusCode, obs.Title, obs.Server, obs.ContentType, obs.ContentLength,
 		obs.RedirectURL, obs.Technologies, obs.ProbeTier, source); err != nil {
@@ -302,8 +315,11 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 	if err = tx.Commit(); err != nil {
 		return err
 	}
+	if len(events) > 0 && s.broadcast != nil {
+		s.broadcast("changes_written", map[string]any{"target_id": obs.TargetID, "count": len(events)})
+	}
 	for _, c := range events {
-		if s.broadcast == nil {
+		if s.broadcast == nil || c.ChangeType != "status_change" {
 			continue
 		}
 		s.broadcast("notification_created", map[string]any{

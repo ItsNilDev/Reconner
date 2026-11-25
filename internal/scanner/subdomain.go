@@ -271,7 +271,7 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 	// Parallel admission pass. It returns candidates that had neither a genuine
 	// A/AAAA answer nor an explicit CNAME; wildcard-only answers remain eligible
 	// for vhost proof but are not assets yet.
-	rejected := s.resolveAll(ctx, targetID, found, &mu, wildcardProfile, logFn)
+	rejected, _ := s.resolveAll(ctx, targetID, found, &mu, wildcardProfile, logFn)
 
 	// Virtual-host scan: probe candidate hostnames (that do NOT resolve in DNS)
 	// against the IPs we already know, via the Host header, and record any that
@@ -388,9 +388,9 @@ func newSubdomainMetadata(hosts []string, total int) string {
 		truncated = true
 	}
 	payload := struct {
-		Hosts     []string `json:"hosts"`      // preview for cards and alerts
-		AllHosts  []string `json:"all_hosts"`  // complete membership for search
-		Omitted   int      `json:"omitted"`    // names kept only in all_hosts
+		Hosts     []string `json:"hosts"`     // preview for cards and alerts
+		AllHosts  []string `json:"all_hosts"` // complete membership for search
+		Omitted   int      `json:"omitted"`   // names kept only in all_hosts
 		Truncated bool     `json:"truncated"`
 		Total     int      `json:"total"`
 	}{Hosts: stored, AllHosts: all, Omitted: total - len(stored), Truncated: truncated, Total: total}
@@ -1173,7 +1173,7 @@ func (s *SubdomainScanner) admittedSubdomainNames(ctx context.Context, targetID,
 // resolveAll resolves every discovered subdomain concurrently and updates its
 // IP. Names that resolve to a wildcard IP are kept but logged so HTTP probing
 // can later dedupe them by content.
-func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, found map[string]bool, mu *sync.Mutex, wildcardProfile *wildcardProfile, logFn LogFunc) map[string]bool {
+func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, found map[string]bool, mu *sync.Mutex, wildcardProfile *wildcardProfile, logFn LogFunc) (map[string]bool, map[string]bool) {
 	mu.Lock()
 	names := make([]string, 0, len(found))
 	for n := range found {
@@ -1191,6 +1191,7 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	var resolved, cnameWithIP, cnameOnly, wildcardHits, unresolved, transient int
 	var cmu sync.Mutex
 	rejected := make(map[string]bool)
+	admitted := make(map[string]bool)
 	// Admission writes are COLLECTED and flushed in a single transaction after the
 	// resolution pass instead of one autocommit INSERT per name — on a target with
 	// hundreds/thousands of names the per-name commit was a real serial cost. The
@@ -1230,6 +1231,7 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	admit := func(name, ip, source string) {
 		cmu.Lock()
 		rows = append(rows, resolvedRow{name, ip, source})
+		admitted[name] = true
 		isNew := !preexisting[name]
 		cmu.Unlock()
 		if isNew && ip != "" && s.broadcast != nil {
@@ -1265,18 +1267,12 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	classify := func(name string, ips []string, definitive bool) {
 		ip := wildcardProfile.firstNonWildcardIP(name, ips)
 		if ip == "" {
-			if len(ips) > 0 && wildcardProfile.overlapsWildcardIPs(name, ips) {
-				cmu.Lock()
-				rejected[name] = true
-				wildcardHits++
-				cmu.Unlock()
-				return
-			}
-			// An explicit CNAME is a real DNS asset. Copy the target's A/AAAA
-			// onto the alias so a live alias reaches the web pipeline. dnsx
-			// returns those addresses under the target name, not the alias.
-			// A dangling target keeps an empty IP and stays in takeover checks.
-			if cname := cnameFor(name); cname != "" && !wildcardProfile.isWildcardCNAME(name, cname) {
+			// An explicit CNAME is a real DNS asset. Check it BEFORE the
+			// wildcard-IP rejection: a live CDN alias can share an IP with a
+			// wildcard pool but is still an admitted host.
+			cname := cnameFor(name)
+			hasCNAME := cname != "" && !wildcardProfile.isWildcardCNAME(name, cname)
+			if hasCNAME {
 				if aliasIP, live := classifyCNAMEAlias(name, cname, ipsForCNAME, wildcardProfile); live {
 					cmu.Lock()
 					cnameWithIP++
@@ -1284,6 +1280,16 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 					admit(name, aliasIP, "dns-cname")
 					return
 				}
+			}
+			if len(ips) > 0 && wildcardProfile.overlapsWildcardIPs(name, ips) {
+				cmu.Lock()
+				rejected[name] = true
+				wildcardHits++
+				cmu.Unlock()
+				return
+			}
+			if hasCNAME {
+				// A dangling target keeps an empty IP and stays in takeover checks.
 				cmu.Lock()
 				cnameOnly++
 				cmu.Unlock()
@@ -1378,8 +1384,10 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 		close(progressDone)
 	}
 
-	// Single-transaction flush of all admission writes.
+	// Single-transaction flush of all admission writes. ANY failure falls
+	// back to per-row writes, so one bad statement cannot drop a whole batch.
 	if len(rows) > 0 {
+		committed := false
 		if tx, err := s.db.BeginTx(ctx, nil); err == nil {
 			stmt, perr := tx.PrepareContext(ctx, `
 				INSERT INTO subdomains (id, target_id, subdomain, ip, source, last_seen)
@@ -1391,27 +1399,54 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 					last_seen = CURRENT_TIMESTAMP,
 					miss_count = 0`)
 			if perr == nil {
+				writeErr := error(nil)
 				for _, r := range rows {
-					_, _ = stmt.ExecContext(ctx, uuid.New().String(), targetID, r.name, r.ip, r.source)
+					if _, e := stmt.ExecContext(ctx, uuid.New().String(), targetID, r.name, r.ip, r.source); e != nil {
+						writeErr = e
+						break
+					}
 				}
-				_ = stmt.Close()
-				_ = tx.Commit()
+				if e := stmt.Close(); e != nil && writeErr == nil {
+					writeErr = e
+				}
+				if writeErr == nil {
+					if e := tx.Commit(); e != nil {
+						writeErr = e
+					} else {
+						committed = true
+					}
+				}
+				if writeErr != nil {
+					if e := tx.Rollback(); e != nil {
+						logFn("warn", "subdomain_enum", "subdomain batch rollback failed: "+e.Error())
+					}
+					logFn("warn", "subdomain_enum", "subdomain batch write failed: "+writeErr.Error())
+				}
 			} else {
-				_ = tx.Rollback()
-				// Fall back to per-row writes so a prepare failure never drops assets.
-				for _, r := range rows {
-					_ = s.upsertSubdomainSource(targetID, r.name, r.ip, r.source)
+				if e := tx.Rollback(); e != nil {
+					logFn("warn", "subdomain_enum", "subdomain batch rollback failed: "+e.Error())
 				}
+				logFn("warn", "subdomain_enum", "subdomain batch prepare failed: "+perr.Error())
 			}
 		} else {
+			logFn("warn", "subdomain_enum", "subdomain batch begin failed: "+err.Error())
+		}
+		if !committed {
+			failed := 0
 			for _, r := range rows {
-				_ = s.upsertSubdomainSource(targetID, r.name, r.ip, r.source)
+				if err := s.upsertSubdomainSource(targetID, r.name, r.ip, r.source); err != nil {
+					failed++
+					logFn("warn", "subdomain_enum", "subdomain row write failed for "+r.name+": "+err.Error())
+				}
+			}
+			if failed > 0 {
+				logFn("warn", "subdomain_enum", fmt.Sprintf("subdomain batch fallback missed %d/%d rows", failed, len(rows)))
 			}
 		}
 	}
 
 	logFn("info", "subdomain_enum", fmt.Sprintf("Admission gate: %d A/AAAA verified, %d CNAME aliases with target IP, %d dangling CNAME, %d wildcard-only, %d unresolved (NXDOMAIN), %d transient-miss kept (from %d candidates)", resolved, cnameWithIP, cnameOnly, wildcardHits, unresolved, transient, len(names)))
-	return rejected
+	return rejected, admitted
 }
 
 // existingSubdomainSet returns the set of subdomain names already stored for the
@@ -1494,11 +1529,10 @@ func (s *SubdomainScanner) recursiveEnum(ctx context.Context, targetID, apex str
 			// budget, since up to 50 sub-apexes can run per level.
 			wildcardProfile.detectBranches(ctx, sub, mapKeys(cands), s.resolver, s.wildcardServers(), 3, logFn)
 			var mu sync.Mutex
-			rejected := s.resolveAll(ctx, targetID, cands, &mu, wildcardProfile, logFn)
-			// Names that resolved (A/AAAA or CNAME) are the ones worth descending
-			// into: everything in cands that the admission gate did NOT reject.
+			_, admitted := s.resolveAll(ctx, targetID, cands, &mu, wildcardProfile, logFn)
+			// Descend only into hosts the admission gate actually admitted.
 			for n := range cands {
-				if !rejected[n] && !visited[n] {
+				if admitted[n] && !visited[n] {
 					next = append(next, n)
 				}
 			}
@@ -1719,7 +1753,8 @@ func (s *SubdomainScanner) upsertSubdomainSource(targetID, subdomain, ip, source
 			ip = excluded.ip,
 			source = CASE WHEN COALESCE(subdomains.source,'dns') IN ('seed','vhost')
 				THEN subdomains.source ELSE excluded.source END,
-			last_seen = CURRENT_TIMESTAMP
+			last_seen = CURRENT_TIMESTAMP,
+			miss_count = 0
 	`, id, targetID, subdomain, ip, source)
 	return err
 }

@@ -145,3 +145,105 @@ func TestNormalizeServiceURLKeepsPortPathAndQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusZeroObservationLeavesBaselineAndInventoryIntact(t *testing.T) {
+	s, db, tid := newObservationTestScanner(t)
+	ctx := context.Background()
+	rawURL := "https://zero.example.test/"
+	if err := s.recordObservation(ctx, HTTPObservation{
+		TargetID: tid, URL: rawURL, StatusCode: 200, Title: "OK",
+		Type: ObservationDeep, ProbeTier: "deep", Source: "probe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordObservation(ctx, HTTPObservation{
+		TargetID: tid, URL: rawURL, StatusCode: 0, Title: "",
+		Type: ObservationDeep, ProbeTier: "deep", Source: "probe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status int
+	var title string
+	if err := db.QueryRow(`SELECT status_code,title FROM http_services WHERE target_id=? AND url=?`, tid, NormalizeServiceURL(rawURL)).Scan(&status, &title); err != nil {
+		t.Fatal(err)
+	}
+	if status != 200 || title != "OK" {
+		t.Fatalf("inventory = %d/%q, want 200/OK", status, title)
+	}
+	var events int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=?`, tid).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("status-zero created %d events, want 0", events)
+	}
+}
+
+func TestObservationUpgradesSeedAndKeepsSubdomainLink(t *testing.T) {
+	s, db, tid := newObservationTestScanner(t)
+	rawURL := "https://seed.example.test/"
+	subID := uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO subdomains(id,target_id,subdomain) VALUES(?,?,?)`, subID, tid, "seed.example.test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO http_services(id,target_id,subdomain_id,url,status_code,source)
+		VALUES(?,?,?,?,0,'seed')`, uuid.NewString(), tid, subID, NormalizeServiceURL(rawURL)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordObservation(context.Background(), HTTPObservation{
+		TargetID: tid, URL: rawURL, StatusCode: 200, Title: "OK",
+		Type: ObservationDeep, ProbeTier: "deep", Source: "probe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var source, linked string
+	var status int
+	if err := db.QueryRow(`SELECT COALESCE(source,''),COALESCE(subdomain_id,''),status_code
+		FROM http_services WHERE target_id=? AND url=?`, tid, NormalizeServiceURL(rawURL)).Scan(&source, &linked, &status); err != nil {
+		t.Fatal(err)
+	}
+	if source != "probe" || linked != subID || status != 200 {
+		t.Fatalf("inventory = %q/%q/%d, want probe/%s/200", source, linked, status, subID)
+	}
+}
+
+func TestOnlyStatusChangeWritesBellEntry(t *testing.T) {
+	s, db, tid := newObservationTestScanner(t)
+	ctx := context.Background()
+	rawURL := "https://bell.example.test/"
+	base := HTTPObservation{TargetID: tid, URL: rawURL, StatusCode: 200, Title: "OK", Type: ObservationDeep, ProbeTier: "deep", Source: "probe"}
+	if err := s.recordObservation(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	statusObs := base
+	statusObs.StatusCode = 403
+	statusObs.Title = "Forbidden"
+	if err := s.recordObservation(ctx, statusObs); err != nil {
+		t.Fatal(err)
+	}
+	var bells int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE target_id=?`, tid).Scan(&bells); err != nil {
+		t.Fatal(err)
+	}
+	if bells != 1 {
+		t.Fatalf("bells after status change = %d, want 1", bells)
+	}
+	pageObs := statusObs
+	pageObs.Title = "Different title"
+	if err := s.recordObservation(ctx, pageObs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE target_id=?`, tid).Scan(&bells); err != nil {
+		t.Fatal(err)
+	}
+	if bells != 1 {
+		t.Fatalf("bells after page change = %d, want 1", bells)
+	}
+	var changes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='page_change'`, tid).Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 2 {
+		t.Fatalf("page_change rows = %d, want 2", changes)
+	}
+}

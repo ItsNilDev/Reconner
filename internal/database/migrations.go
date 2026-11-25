@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -183,7 +184,9 @@ func RunMigrations(db *DB) error {
 		alterTelegramChatsAddNotifyNewHost,
 		createChangeSeenTable,
 		createWatchTierIndexes,
-		alterTelegramChatsAddWatchPrefs,
+		alterTelegramChatsAddNotifyWatchScanStarted,
+		alterTelegramChatsAddNotifyWatchScanFinished,
+		alterTelegramChatsAddNotifyScopeLanded,
 		alterNotificationsAddMetadata,
 		// Scope authority: a managed project keeps its provenance after its last
 		// asset is removed, so the original domain can never silently return.
@@ -203,7 +206,8 @@ func RunMigrations(db *DB) error {
 		alterBountyScopeEventsAddProposedHash,
 		alterBountyScopeEventsAddProposedRawHash,
 		// Four signal categories plus Scan activity replace the broad switches.
-		alterTelegramChatsAddSignalPrefs,
+		alterTelegramChatsAddNotifyProgramScope,
+		alterTelegramChatsAddNotifyHTTPStatus,
 		createHTTPObservationBaselinesTable,
 	}
 
@@ -232,6 +236,9 @@ func RunMigrations(db *DB) error {
 	}
 	if err := backfillManagedScope(db); err != nil {
 		return fmt.Errorf("managed scope migration failed: %w", err)
+	}
+	if err := normalizeHTTPServiceURLs(db); err != nil {
+		return fmt.Errorf("HTTP service URL normalization failed: %w", err)
 	}
 
 	return nil
@@ -262,13 +269,13 @@ func backfillWatchHosts(db *DB) error {
 // scan behavior, but they are configuration—not executable phases—and therefore
 // do not get ledger rows or inflate tasks.total.
 type legacyTaskPhaseSource struct {
-	id, status string
-	modules    []string
-	completed  map[string]bool
+	id, taskType, status string
+	modules              []string
+	completed            map[string]bool
 }
 
 func migrateTaskPhases(db *DB) error {
-	rows, err := db.Query(`SELECT id,COALESCE(modules,'[]'),COALESCE(completed_modules,'[]'),COALESCE(status,'pending') FROM tasks`)
+	rows, err := db.Query(`SELECT id,COALESCE(type,''),COALESCE(modules,'[]'),COALESCE(completed_modules,'[]'),COALESCE(status,'pending') FROM tasks`)
 	if err != nil {
 		return err
 	}
@@ -276,7 +283,7 @@ func migrateTaskPhases(db *DB) error {
 	for rows.Next() {
 		var task legacyTaskPhaseSource
 		var raw, rawCompleted string
-		if err := rows.Scan(&task.id, &raw, &rawCompleted, &task.status); err != nil {
+		if err := rows.Scan(&task.id, &task.taskType, &raw, &rawCompleted, &task.status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -307,6 +314,17 @@ func migrateTaskPhases(db *DB) error {
 	}
 	defer tx.Rollback()
 	for _, task := range tasks {
+		if task.taskType == "watch_scan" &&
+			(task.status == "finished" || task.status == "failed" || task.status == "cancelled") {
+			continue
+		}
+		var existingPhases int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_phases WHERE task_id=?`, task.id).Scan(&existingPhases); err != nil {
+			return err
+		}
+		if existingPhases > 0 && len(task.completed) >= len(task.modules) {
+			continue
+		}
 		phaseIndex := 0
 		for _, module := range task.modules {
 			if taskPhaseOption(module) {
@@ -366,10 +384,82 @@ func legacyUnsupportedPhase(module string) bool {
 	}
 }
 
+// normalizeHTTPServiceURLs upgrades legacy bare scheme://host rows to the
+// canonical trailing-slash form. A duplicate is resolved once by keeping the
+// row with a valid status and the newest last_seen value.
+func normalizeHTTPServiceURLs(db *DB) error {
+	rows, err := db.Query(`SELECT id, url FROM http_services WHERE url NOT LIKE '%://%/%'`)
+	if err != nil {
+		return err
+	}
+	type legacyURL struct{ id, raw string }
+	var list []legacyURL
+	for rows.Next() {
+		var u legacyURL
+		if err := rows.Scan(&u.id, &u.raw); err != nil {
+			rows.Close()
+			return err
+		}
+		list = append(list, u)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, u := range list {
+		if !strings.Contains(u.raw, "://") || strings.HasSuffix(u.raw, "/") {
+			continue
+		}
+		normalized := u.raw + "/"
+		var existingID string
+		var existingCode int
+		var existingSeen string
+		err := db.QueryRow(`SELECT id, status_code, COALESCE(last_seen,'') FROM http_services
+			WHERE url=? LIMIT 1`, normalized).Scan(&existingID, &existingCode, &existingSeen)
+		if err == sql.ErrNoRows {
+			if _, err := db.Exec(`UPDATE http_services SET url=? WHERE id=?`, normalized, u.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		var oldCode int
+		var oldSeen string
+		if err := db.QueryRow(`SELECT status_code, COALESCE(last_seen,'') FROM http_services WHERE id=?`, u.id).Scan(&oldCode, &oldSeen); err != nil {
+			return err
+		}
+		keepExisting := existingCode >= 100 && existingCode <= 599
+		if !keepExisting && oldCode >= 100 && oldCode <= 599 {
+			keepExisting = false
+		} else if oldSeen > existingSeen {
+			keepExisting = false
+		}
+		if keepExisting {
+			if _, err := db.Exec(`DELETE FROM http_services WHERE id=?`, u.id); err != nil {
+				return err
+			}
+		} else {
+			if _, err := db.Exec(`DELETE FROM http_services WHERE id=?`, existingID); err != nil {
+				return err
+			}
+			if _, err := db.Exec(`UPDATE http_services SET url=? WHERE id=?`, normalized, u.id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func taskPhaseOption(module string) bool {
 	switch module {
 	case "speed_slow", "speed_normal", "speed_fast", "no_subdomain_brute",
-		"asn_discovery", "no_asn_discovery", "single_endpoint":
+		"asn_discovery", "no_asn_discovery", "single_endpoint",
+		"recursive_subdomain", "prioritized", "classic_order",
+		"network_fast", "network_normal", "network_deep", "full_ports",
+		"wp_cred_authorized", "net_cred_authorized":
 		return true
 	default:
 		return false
@@ -2052,10 +2142,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_target_lower_value ON assets(target_id, LO
 // watch rounds by default (a watch round runs every 30 minutes per project and
 // would otherwise flood the channel), while the scope-landed alert is ON because
 // a newly eligible host is the one event the operator must never miss.
-const alterTelegramChatsAddWatchPrefs = `
-ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_started INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_finished INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE telegram_chats ADD COLUMN notify_scope_landed INTEGER NOT NULL DEFAULT 1;`
+const alterTelegramChatsAddNotifyWatchScanStarted = `ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_started INTEGER NOT NULL DEFAULT 0;`
+const alterTelegramChatsAddNotifyWatchScanFinished = `ALTER TABLE telegram_chats ADD COLUMN notify_watch_scan_finished INTEGER NOT NULL DEFAULT 0;`
+const alterTelegramChatsAddNotifyScopeLanded = `ALTER TABLE telegram_chats ADD COLUMN notify_scope_landed INTEGER NOT NULL DEFAULT 1;`
 
 // A managed project is one that has (or once had) its own asset list or a
 // linked program. Keep that provenance on the target so removing the last
@@ -2110,9 +2199,8 @@ const alterBountyScopeEventsAddProposedRawHash = `ALTER TABLE bounty_scope_event
 // The four user-facing signal categories. Existing chats receive both signal
 // switches enabled so their current coverage is kept; new chats use the quiet
 // lifecycle defaults set in AddChat.
-const alterTelegramChatsAddSignalPrefs = `
-ALTER TABLE telegram_chats ADD COLUMN notify_program_scope INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE telegram_chats ADD COLUMN notify_http_status INTEGER NOT NULL DEFAULT 1;`
+const alterTelegramChatsAddNotifyProgramScope = `ALTER TABLE telegram_chats ADD COLUMN notify_program_scope INTEGER NOT NULL DEFAULT 1;`
+const alterTelegramChatsAddNotifyHTTPStatus = `ALTER TABLE telegram_chats ADD COLUMN notify_http_status INTEGER NOT NULL DEFAULT 1;`
 
 // http_observation_baselines holds the last compared observation for each
 // service and observation path. http_services is the latest inventory only; it

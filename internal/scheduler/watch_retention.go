@@ -29,7 +29,8 @@ const watchLogKeepCount = 100
 func (s *Scheduler) retentionScheduler() {
 	defer s.wg.Done()
 	s.pruneWatchChangeRows()
-	s.pruneWatchRows()
+	s.pruneWatchTargetRows()
+	s.pruneWatchGlobalHistory()
 	s.pruneOrphanChangeSeen()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
@@ -39,7 +40,8 @@ func (s *Scheduler) retentionScheduler() {
 			return
 		case <-ticker.C:
 			s.pruneWatchChangeRows()
-			s.pruneWatchRows()
+			s.pruneWatchTargetRows()
+			s.pruneWatchGlobalHistory()
 			s.pruneOrphanChangeSeen()
 		}
 	}
@@ -107,6 +109,7 @@ func (s *Scheduler) watchOnlyTargets() []string {
 	rows, err := s.db.Query(`
 		SELECT t.id FROM targets t
 		WHERE t.watch_only = 1
+		  AND COALESCE(t.watch_paused,0) = 0 AND t.watch_next_run IS NOT NULL
 		  AND NOT EXISTS (
 			SELECT 1 FROM tasks x WHERE x.target_id = t.id AND COALESCE(x.type,'') <> ?
 		  )
@@ -130,7 +133,7 @@ func (s *Scheduler) watchOnlyTargets() []string {
 //
 // Order matters: http_services has no foreign key to subdomains, but the
 // subdomains row is the parent concept, so the services go first.
-func (s *Scheduler) pruneWatchRows() {
+func (s *Scheduler) pruneWatchTargetRows() {
 	rows := s.watchOnlyTargets()
 	if len(rows) == 0 {
 		return
@@ -139,15 +142,10 @@ func (s *Scheduler) pruneWatchRows() {
 	if s.cfg != nil && s.cfg.WatchRowsRetentionDays > 0 {
 		days = s.cfg.WatchRowsRetentionDays
 	}
-	scopeDays := 180
-	if s.cfg != nil && s.cfg.WatchScopeEventsRetentionDays > 0 {
-		scopeDays = s.cfg.WatchScopeEventsRetentionDays
-	}
-
 	// One transaction for the whole prune: a half-pruned table is worse than a
 	// failed prune. A busy database is retried once.
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := s.pruneWatchRowsTx(rows, days, scopeDays); err != nil {
+		if err := s.pruneWatchRowsTx(rows, days); err != nil {
 			if attempt == 0 && strings.Contains(strings.ToLower(err.Error()), "busy") {
 				time.Sleep(2 * time.Second)
 				continue
@@ -159,7 +157,7 @@ func (s *Scheduler) pruneWatchRows() {
 	}
 }
 
-func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) error {
+func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -183,8 +181,10 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 		// http_services first: it references subdomains by id but has no
 		// foreign key, so the parent row may go away independently.
 		{"http_services", fmt.Sprintf(`DELETE FROM http_services WHERE target_id IN (%s)
+			AND COALESCE(source,'') NOT IN ('seed','vhost')
 			AND COALESCE(last_seen,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, inList)},
 		{"subdomains", fmt.Sprintf(`DELETE FROM subdomains WHERE target_id IN (%s)
+			AND COALESCE(source,'') NOT IN ('seed','vhost')
 			AND COALESCE(last_seen,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, inList)},
 		{"monitoring_changes", fmt.Sprintf(`DELETE FROM monitoring_changes WHERE target_id IN (%s)
 			AND COALESCE(detected_at,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, inList)},
@@ -192,10 +192,20 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 			AND COALESCE(created_at,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, inList)},
 		{"browser_states", fmt.Sprintf(`DELETE FROM browser_states WHERE target_id IN (%s)
 			AND COALESCE(created_at,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, inList)},
+		{"http_observation_baselines", `DELETE FROM http_observation_baselines
+			WHERE NOT EXISTS (SELECT 1 FROM http_services hs
+				WHERE hs.target_id = http_observation_baselines.target_id
+				  AND hs.url = http_observation_baselines.service_url)`},
+	}
+	ageArgsForStep := func(stepName string) []any {
+		if stepName == "http_observation_baselines" {
+			return nil
+		}
+		return ageArgs
 	}
 
 	for _, step := range steps {
-		res, err := tx.Exec(step.sql, ageArgs...)
+		res, err := tx.Exec(step.sql, ageArgsForStep(step.name)...)
 		if err != nil {
 			return fmt.Errorf("%s: %w", step.name, err)
 		}
@@ -204,10 +214,37 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 		}
 	}
 
-	// Task logs and phases of watch tasks, except the most recent ones the
-	// operator still reads in the UI. The keep list is PER PROJECT: a single
-	// global top-N would let a busy project push another project's rounds out
-	// of the keep set and delete their logs.
+	return tx.Commit()
+}
+
+// pruneWatchGlobalHistory removes old watch logs, phases, scope events and
+// finished task rows. It runs even when no watch-only target remains: mixed
+// projects and projects flipped back to deep still leave watch history behind.
+func (s *Scheduler) pruneWatchGlobalHistory() {
+	scopeDays := 180
+	if s.cfg != nil && s.cfg.WatchScopeEventsRetentionDays > 0 {
+		scopeDays = s.cfg.WatchScopeEventsRetentionDays
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := s.pruneWatchGlobalHistoryTx(scopeDays); err != nil {
+			if attempt == 0 && strings.Contains(strings.ToLower(err.Error()), "busy") {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			s.logger.Warn("Watch global history prune failed", "error", err)
+			return
+		}
+		return
+	}
+}
+
+func (s *Scheduler) pruneWatchGlobalHistoryTx(scopeDays int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	keepSQL := `
 		SELECT id FROM (
 			SELECT id, ROW_NUMBER() OVER (
@@ -227,9 +264,16 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 			keep[id] = true
 		}
 	}
+	if err := keepRows.Err(); err != nil {
+		keepRows.Close()
+		return fmt.Errorf("keep list rows: %w", err)
+	}
 	keepRows.Close()
 
-	logRows, err := tx.Query(`SELECT id FROM tasks WHERE type = ?`, watchScanType)
+	// A running watch task must keep its logs and phases. Only finished,
+	// failed or cancelled rounds are candidates for removal.
+	logRows, err := tx.Query(`SELECT id FROM tasks WHERE type = ?
+		AND status IN ('finished','failed','cancelled')`, watchScanType)
 	if err != nil {
 		return fmt.Errorf("watch tasks: %w", err)
 	}
@@ -240,9 +284,12 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 			pruneTaskIDs = append(pruneTaskIDs, id)
 		}
 	}
+	if err := logRows.Err(); err != nil {
+		logRows.Close()
+		return fmt.Errorf("watch task rows: %w", err)
+	}
 	logRows.Close()
 	for _, id := range pruneTaskIDs {
-		// task_logs and task_phases cascade from the task row.
 		if _, err := tx.Exec(`DELETE FROM task_logs WHERE task_id=?`, id); err != nil {
 			return fmt.Errorf("task_logs: %w", err)
 		}
@@ -254,18 +301,15 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 		s.logger.Info("Watch retention prune", "table", "task_logs/task_phases", "tasks", len(pruneTaskIDs))
 	}
 
-	// The scope landing audit trail has its own, longer window.
 	res, err := tx.Exec(`DELETE FROM watch_scope_events
 		WHERE COALESCE(detected_at,CURRENT_TIMESTAMP) < datetime('now','-' || ? || ' days')`, scopeDays)
 	if err != nil {
 		return fmt.Errorf("watch_scope_events: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		s.logger.Info("Watch retention prune", "table", "watch_scope_events", "rows", n)
 	}
 
-	// Finished watch task rows older than the window. Their logs and phases
-	// cascade with them.
 	res, err = tx.Exec(`DELETE FROM tasks WHERE type = ?
 		AND status IN ('finished','failed','cancelled')
 		AND COALESCE(finished_at,created_at) < datetime('now','-' || ? || ' days')`,
@@ -273,9 +317,8 @@ func (s *Scheduler) pruneWatchRowsTx(targetIDs []string, days, scopeDays int) er
 	if err != nil {
 		return fmt.Errorf("tasks: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		s.logger.Info("Watch retention prune", "table", "tasks", "rows", n)
 	}
-
 	return tx.Commit()
 }

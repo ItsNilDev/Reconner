@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -269,21 +270,20 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 				if err := s.updateSubdomainAlive(targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
 					s.logger.Error("Failed to update subdomain", "error", err)
 				}
-			}
-
-			mu.Lock()
-			probed++
-			if watchMode {
-				host := out.subdomain()
-				if host != "" && !seenHost[host] {
-					seenHost[host] = true
-					probedHosts = append(probedHosts, host)
+				mu.Lock()
+				probed++
+				if watchMode {
+					host := out.subdomain()
+					if host != "" && !seenHost[host] {
+						seenHost[host] = true
+						probedHosts = append(probedHosts, host)
+					}
 				}
+				if probed%20 == 0 {
+					logFn("info", "http_probe", fmt.Sprintf("Probed %d hosts...", probed))
+				}
+				mu.Unlock()
 			}
-			if probed%20 == 0 {
-				logFn("info", "http_probe", fmt.Sprintf("Probed %d hosts...", probed))
-			}
-			mu.Unlock()
 		}, "httpx", args...)
 
 		if err != nil && ctx.Err() == nil {
@@ -499,7 +499,6 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 	hasHTTPS := 0
 	hasHTTP := 0
 
-	var rows *dbRow
 	// Match the exact host (scheme + host, optional port/path) instead of a
 	// loose substring, so `api` no longer matches `myapi.example.com`.
 	r := s.db.QueryRow(`
@@ -514,7 +513,9 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 	`, targetID, host, host, host, host, host, host)
 
 	var httpsCount, httpCount *int
-	r.Scan(&httpsCount, &httpCount)
+	if err := r.Scan(&httpsCount, &httpCount); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	if httpsCount != nil && *httpsCount > 0 {
 		hasHTTPS = 1
 	}
@@ -525,7 +526,12 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 	sortedTechs := append([]string(nil), techs...)
 	sort.Strings(sortedTechs)
 	techsJSON := models.StringSliceToJSON(sortedTechs)
-	_, err := s.db.Exec(`
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(context.Background(), `
 		UPDATE subdomains SET
 			is_alive = 1,
 			status_code = ?,
@@ -537,22 +543,20 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 			last_alive_at = CURRENT_TIMESTAMP,
 			alive_misses = 0
 		WHERE target_id = ? AND subdomain = ?
-	`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, host)
-	if err != nil {
-		_ = rows
+	`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, host); err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`
+	if _, err = tx.ExecContext(context.Background(), `
 		INSERT INTO watch_hosts(target_id,host,first_seen_at,first_alive_at,last_alive_at,alive_misses)
 		VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)
 		ON CONFLICT(target_id,host) DO UPDATE SET
 			first_alive_at=COALESCE(watch_hosts.first_alive_at,excluded.first_alive_at),
 			last_alive_at=excluded.last_alive_at,
 			alive_misses=0
-	`, targetID, host)
-
-	_ = rows
-	return err
+	`, targetID, host); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // recordWatchMisses advances the liveness state of hosts that were probed but
@@ -587,8 +591,6 @@ func recordWatchMisses(ctx context.Context, db *database.DB, targetID string, pr
 		logFn("info", "http_probe", fmt.Sprintf("%d probed host(s) gave no HTTP response; liveness state updated", missed))
 	}
 }
-
-type dbRow = interface{}
 
 func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts []string, logFn LogFunc) error {
 	sem := make(chan struct{}, 10)
@@ -634,6 +636,11 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 }
 
 func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPService) error {
+	var subID string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
+		svc.TargetID, URLHost(svc.URL)).Scan(&subID); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	obsType := ObservationDeep
 	tier := "deep"
 	if watchModeEnabled(ctx) {
@@ -645,6 +652,8 @@ func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPSer
 		TaskID:        taskIDFromContext(ctx),
 		URL:           svc.URL,
 		Host:          URLHost(svc.URL),
+		SubdomainID:   subID,
+		Technologies:  "[]",
 		StatusCode:    svc.StatusCode,
 		Title:         svc.Title,
 		Server:        svc.Server,

@@ -152,8 +152,9 @@ func TestWatchRoundKeepsAllRoots(t *testing.T) {
 
 func TestWatchOnlyTargetsExcludeDeepProjects(t *testing.T) {
 	s := newTestScheduler(t)
-	// w5: only watch tasks -> eligible for prune.
-	if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only) VALUES ('w5','w5.example',1)`); err != nil {
+	// w5: only watch tasks -> eligible for prune. An unscheduled target is not
+	// eligible, so give it a due time.
+	if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only,watch_next_run) VALUES ('w5','w5.example',1,'2026-01-01 00:00:00')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`INSERT INTO tasks (id,target_id,type,status) VALUES ('t1','w5','watch_scan','finished')`); err != nil {

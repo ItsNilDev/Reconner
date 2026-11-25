@@ -151,11 +151,19 @@ func (s *HTTPScanner) rescueChallengedHosts(ctx context.Context, targetID string
 		if looksLikeWAFBlock(0, title) || bodyLooksLikeWAFBlock(body) {
 			continue // still challenged — likely needs human interaction; leave as httpx saw it
 		}
-		if _, err := s.db.Exec(`UPDATE http_services SET title=?, content_length=? WHERE target_id=? AND url=?`,
-			title, len(body), targetID, c.url); err == nil {
-			rescued++
-			logFn("info", "http_probe", fmt.Sprintf("Recovered real content behind bot-challenge on %s (probe saw status %d): now titled %q", c.url, c.status, title))
+		if _, err := s.db.ExecContext(ctx, `UPDATE http_services SET title=?, content_length=? WHERE target_id=? AND url=?`,
+			title, len(body), targetID, c.url); err != nil {
+			logFn("warn", "http_probe", fmt.Sprintf("Failed to store rescued content for %s: %v", c.url, err))
+			continue
 		}
+		normalized := NormalizeServiceURL(c.url)
+		if _, err := s.db.ExecContext(ctx, `UPDATE http_observation_baselines SET title=? WHERE target_id=? AND service_url=?`,
+			title, targetID, normalized); err != nil {
+			logFn("warn", "http_probe", fmt.Sprintf("Failed to sync rescued title baseline for %s: %v", c.url, err))
+			continue
+		}
+		rescued++
+		logFn("info", "http_probe", fmt.Sprintf("Recovered real content behind bot-challenge on %s (probe saw status %d): now titled %q", c.url, c.status, title))
 	}
 	if rescued > 0 {
 		logFn("info", "http_probe", fmt.Sprintf("Bot-challenge retry recovered real content on %d/%d host(s).", rescued, len(candidates)))
