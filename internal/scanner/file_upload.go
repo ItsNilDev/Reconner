@@ -44,7 +44,7 @@ const (
 	fileUploadMaxResponse = 256 * 1024
 )
 
-var fileUploadClient = newPooledClient(18*time.Second, false)
+var fileUploadClient = ScannerClient(18 * time.Second)
 
 type FileUploadScanner struct {
 	db        *database.DB

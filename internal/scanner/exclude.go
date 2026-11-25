@@ -2,10 +2,13 @@ package scanner
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net"
 	"net/url"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/recon-platform/internal/database"
 )
 
@@ -53,96 +56,107 @@ func normalizeExclusionHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
-// ParseExclusions compiles a raw exclude_scope string into an ExclusionSet.
-func ParseExclusions(raw string) ExclusionSet {
-	e := ExclusionSet{
-		hosts:     map[string]bool{},
-		endpoints: map[string]map[string]bool{},
+// ParseManualExclusionPatterns splits a manual exclusion string on commas,
+// whitespace, newlines, or semicolons, trimming tokens and deduplicating while
+// preserving order.
+func ParseManualExclusionPatterns(raw string) []string {
+	tokens := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == ';'
+	})
+	if len(tokens) == 0 {
+		return nil
 	}
-	// A managed rule is one whole line: its identifier may contain commas or
-	// spaces. Tokenize only non-managed lines.
-	var tokens []string
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "#bounty:") {
-			tokens = append(tokens, line)
-			continue
-		}
-		tokens = append(tokens, strings.FieldsFunc(line, func(r rune) bool {
-			return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == ';'
-		})...)
-	}
+	seen := make(map[string]struct{}, len(tokens))
+	out := make([]string, 0, len(tokens))
 	for _, tok := range tokens {
 		tok = strings.TrimSpace(tok)
 		if tok == "" {
 			continue
 		}
-		if strings.HasPrefix(tok, "#bounty:") {
-			parts := strings.SplitN(tok, "|", 2)
-			if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-				continue
-			}
-			tok = strings.TrimSpace(parts[1])
+		if _, ok := seen[tok]; ok {
+			continue
 		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	return out
+}
 
-		// A full URL keeps its host-wide meaning. The path and any explicit
-		// port are deliberately ignored so the rule cannot be narrowed by a
-		// different path on the same host.
-		if strings.Contains(tok, "://") {
-			if u, err := url.Parse(tok); err == nil && u.Hostname() != "" {
-				tok = u.Hostname()
-			}
-		}
-
-		// CIDR. Normalize before parsing so IPv6 and casing behave. A token
-		// with a slash that is not a CIDR is a schemeless path rule; let it
-		// fall through to the host-wide truncation below.
-		if strings.Contains(tok, "/") {
-			if _, n, err := net.ParseCIDR(strings.ToLower(strings.TrimSpace(tok))); err == nil {
-				e.cidrs = append(e.cidrs, n)
-				continue
-			}
-		}
-
-		// A schemeless rule such as admin.example.com/panel or
-		// *.staging.example.com/* excludes the whole host. Paths never narrow
-		// an exclusion, so drop everything after the first slash.
-		if !strings.Contains(tok, "://") && strings.Contains(tok, "/") {
-			tok = strings.SplitN(tok, "/", 2)[0]
+// CompileExclusions compiles a slice of exclusion patterns into an ExclusionSet.
+func CompileExclusions(patterns []string) ExclusionSet {
+	e := ExclusionSet{
+		hosts:     map[string]bool{},
+		endpoints: map[string]map[string]bool{},
+	}
+	for _, rawPattern := range patterns {
+		for _, tok := range ParseManualExclusionPatterns(rawPattern) {
 			if tok == "" {
 				continue
 			}
-		}
 
-		// Leading-dot and "*.x" forms both mean the apex and all descendants.
-		if strings.HasPrefix(tok, "*.") || strings.HasPrefix(tok, ".") {
-			suf := strings.TrimPrefix(strings.TrimPrefix(tok, "*."), ".")
-			suf = normalizeExclusionHost(suf)
-			if suf != "" {
-				e.hosts[suf] = true
-				e.suffixes = append(e.suffixes, "."+suf)
-			}
-			continue
-		}
-
-		// Bare host:port (keeps bracketed IPv6 working).
-		if host, port, err := net.SplitHostPort(tok); err == nil && port != "" {
-			host = normalizeExclusionHost(host)
-			if host != "" {
-				if e.endpoints[host] == nil {
-					e.endpoints[host] = map[string]bool{}
+			// A full URL keeps its host-wide meaning. The path and any explicit
+			// port are deliberately ignored so the rule cannot be narrowed by a
+			// different path on the same host.
+			if strings.Contains(tok, "://") {
+				if u, err := url.Parse(tok); err == nil && u.Hostname() != "" {
+					tok = u.Hostname()
 				}
-				e.endpoints[host][port] = true
 			}
-			continue
-		}
 
-		e.hosts[normalizeExclusionHost(tok)] = true
+			// CIDR. Normalize before parsing so IPv6 and casing behave. A token
+			// with a slash that is not a CIDR is a schemeless path rule; let it
+			// fall through to the host-wide truncation below.
+			if strings.Contains(tok, "/") {
+				if _, n, err := net.ParseCIDR(strings.ToLower(strings.TrimSpace(tok))); err == nil {
+					e.cidrs = append(e.cidrs, n)
+					continue
+				}
+			}
+
+			// A schemeless rule such as admin.example.com/panel or
+			// *.staging.example.com/* excludes the whole host. Paths never narrow
+			// an exclusion, so drop everything after the first slash.
+			if !strings.Contains(tok, "://") && strings.Contains(tok, "/") {
+				tok = strings.SplitN(tok, "/", 2)[0]
+				if tok == "" {
+					continue
+				}
+			}
+
+			// Leading-dot and "*.x" forms both mean the apex and all descendants.
+			if strings.HasPrefix(tok, "*.") || strings.HasPrefix(tok, ".") {
+				suf := strings.TrimPrefix(strings.TrimPrefix(tok, "*."), ".")
+				suf = normalizeExclusionHost(suf)
+				if suf != "" {
+					e.hosts[suf] = true
+					e.suffixes = append(e.suffixes, "."+suf)
+				}
+				continue
+			}
+
+			// Bare host:port (keeps bracketed IPv6 working).
+			if host, port, err := net.SplitHostPort(tok); err == nil && port != "" {
+				host = normalizeExclusionHost(host)
+				if host != "" {
+					if e.endpoints[host] == nil {
+						e.endpoints[host] = map[string]bool{}
+					}
+					e.endpoints[host][port] = true
+				}
+				continue
+			}
+
+			if h := normalizeExclusionHost(tok); h != "" {
+				e.hosts[h] = true
+			}
+		}
 	}
 	return e
+}
+
+// ParseExclusions compiles a raw manual exclusion string into an ExclusionSet.
+func ParseExclusions(raw string) ExclusionSet {
+	return CompileExclusions(ParseManualExclusionPatterns(raw))
 }
 
 // splitExclusionHostPort normalizes a request host and returns the host and an
@@ -154,9 +168,9 @@ func splitExclusionHostPort(host string) (string, string) {
 		host = host[:i]
 	}
 	if h, p, err := net.SplitHostPort(host); err == nil {
-		return strings.ToLower(h), p
+		return normalizeExclusionHost(h), p
 	}
-	return strings.ToLower(host), ""
+	return normalizeExclusionHost(host), ""
 }
 
 // excludesKnown reports whether a normalized host/port pair is excluded using
@@ -325,20 +339,50 @@ func FilterExcludedIPs(ips []string, e ExclusionSet) (kept []string, dropped int
 	return kept, dropped
 }
 
-// LoadExclusionsE reads and compiles a target's exclude_scope. It returns the
-// read error so a task can block before it sends any request. A read failure
-// must never become an empty (permissive) exclusion set.
+// LoadExclusionsE reads and compiles a target's exclusions from target_exclusions.
+// It returns the read error so a task can block before it sends any request. A
+// read failure must never become an empty (permissive) exclusion set.
 func LoadExclusionsE(ctx context.Context, db *database.DB, targetID string) (ExclusionSet, error) {
-	var raw string
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&raw); err != nil {
+	if db == nil {
+		return ExclusionSet{}, errors.New("database is nil")
+	}
+	rows, err := db.QueryContext(ctx, `SELECT pattern FROM target_exclusions WHERE target_id = ?`, targetID)
+	if err != nil {
 		return ExclusionSet{}, err
 	}
-	return ParseExclusions(raw), nil
+	defer rows.Close()
+	var patterns []string
+	for rows.Next() {
+		var pattern string
+		if err := rows.Scan(&pattern); err != nil {
+			return ExclusionSet{}, err
+		}
+		patterns = append(patterns, pattern)
+	}
+	if err := rows.Err(); err != nil {
+		return ExclusionSet{}, err
+	}
+	return CompileExclusions(patterns), nil
 }
 
-// LoadExclusions reads and compiles a target's exclude_scope. Callers that can
-// act on a read error should use LoadExclusionsE instead.
-func LoadExclusions(ctx context.Context, db *database.DB, targetID string) ExclusionSet {
-	e, _ := LoadExclusionsE(ctx, db, targetID)
-	return e
+// ReplaceManualExclusionsTx replaces all manual exclusion rows for targetID
+// while leaving bounty-managed rows intact.
+func ReplaceManualExclusionsTx(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, targetID string, raw string) error {
+	if exec == nil {
+		return errors.New("database executor is nil")
+	}
+	if _, err := exec.ExecContext(ctx, `DELETE FROM target_exclusions WHERE target_id = ? AND source = 'manual'`, targetID); err != nil {
+		return err
+	}
+	for _, pattern := range ParseManualExclusionPatterns(raw) {
+		if _, err := exec.ExecContext(ctx,
+			`INSERT INTO target_exclusions (id, target_id, source, program_id, pattern) VALUES (?, ?, 'manual', '', ?) ON CONFLICT(target_id, source, program_id, pattern) DO NOTHING`,
+			uuid.NewString(), targetID, pattern,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }

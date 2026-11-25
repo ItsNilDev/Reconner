@@ -37,13 +37,7 @@ const gqlIntrospectionBody = `{"query":"query{__schema{queryType{name} mutationT
 // introspection enabled and stores each operation's arguments as JSON-body
 // parameters. Returns the number of operations discovered.
 func (s *ParamScanner) harvestGraphQL(ctx context.Context, targetID string, targetURLs []string, logFn LogFunc) int {
-	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ScannerClient(10 * time.Second)
 	origins := map[string]bool{}
 	for _, u := range targetURLs {
 		if p, err := url.Parse(u); err == nil && p.Host != "" {

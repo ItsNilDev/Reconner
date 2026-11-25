@@ -253,6 +253,23 @@ func IsWatchScopeHostEligible(ctx context.Context, db *database.DB, targetID, ra
 	return ok, programID, assetID
 }
 
+// MatchWatchEligibleHost checks whether rawHost is eligible under the
+// pre-loaded watch scope entries and exclusion set without querying the DB.
+func MatchWatchEligibleHost(ctx context.Context, entries []WatchScopeEntry, excl ExclusionSet, rawHost string) (bool, string, string) {
+	if excl.ExcludesDestination(ctx, rawHost) {
+		return false, "", ""
+	}
+	host, ok := normalizeWatchHost(rawHost)
+	if !ok {
+		return false, "", ""
+	}
+	entry, ok := matchWatchHost(entries, host)
+	if !ok {
+		return false, "", ""
+	}
+	return true, entry.ProgramID, entry.AssetID
+}
+
 // IsWatchScopeHostEligibleE is the error-returning form of
 // IsWatchScopeHostEligible. A scope read failure is returned so a caller that
 // can act on it blocks the task instead of treating the host as out of scope.
@@ -268,18 +285,8 @@ func IsWatchScopeHostEligibleE(ctx context.Context, db *database.DB, targetID, r
 	if !hasProgram || len(entries) == 0 {
 		return false, "", "", nil
 	}
-	if excl.ExcludesDestination(ctx, rawHost) {
-		return false, "", "", nil
-	}
-	host, ok := normalizeWatchHost(rawHost)
-	if !ok {
-		return false, "", "", nil
-	}
-	entry, ok := matchWatchHost(entries, host)
-	if !ok {
-		return false, "", "", nil
-	}
-	return true, entry.ProgramID, entry.AssetID, nil
+	ok, programID, assetID := MatchWatchEligibleHost(ctx, entries, excl, rawHost)
+	return ok, programID, assetID, nil
 }
 
 // HostMatchesWatchScope applies exact and wildcard program rules to raw. A

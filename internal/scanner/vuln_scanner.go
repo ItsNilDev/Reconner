@@ -33,13 +33,7 @@ func NewVulnScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &VulnScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var vulnHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   10 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var vulnHTTPClient = ScannerClient(10 * time.Second)
 
 // Run executes the independent web-behaviour families in parallel. Each family
 // retains its own bounded worker pool, proof replay and negative controls; only

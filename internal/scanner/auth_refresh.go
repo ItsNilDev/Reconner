@@ -137,11 +137,9 @@ func replayForCookies(ctx context.Context, rawRequest string) (string, error) {
 	}
 
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
-		Transport: guardedCredentialTransport,
-		Timeout:   20 * time.Second,
-		Jar:       jar,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := CredentialClient(20*time.Second,
+		WithCredentialCookieJar(jar),
+		WithCredentialRedirectCheck(func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return http.ErrUseLastResponse
 			}
@@ -152,8 +150,8 @@ func replayForCookies(ctx context.Context, rawRequest string) (string, error) {
 				return http.ErrUseLastResponse
 			}
 			return nil
-		},
-	}
+		}),
+	)
 
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()

@@ -61,37 +61,33 @@ func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
 	alive := q.Get("alive")
 	search := q.Get("search")
 
-	query := `SELECT id, target_id, subdomain, ip, is_alive, status_code, page_title,
-		has_https, has_http, response_time_ms, technologies, server, framework, cdn, waf,
-		COALESCE(source,'dns'), last_seen, created_at
-		FROM subdomains WHERE target_id = ? AND COALESCE(catchall,0) = 0`
+	where := " WHERE target_id = ? AND COALESCE(catchall,0) = 0"
 	args := []any{id}
 
 	if alive == "true" {
-		query += " AND is_alive = 1"
+		where += " AND is_alive = 1"
 	} else if alive == "false" {
-		query += " AND is_alive = 0"
+		where += " AND is_alive = 0"
 	}
 
 	if search != "" {
-		query += " AND subdomain LIKE ?"
+		where += " AND subdomain LIKE ?"
 		args = append(args, "%"+search+"%")
 	}
 
 	var total int
-	countQuery := "SELECT COUNT(*) FROM subdomains WHERE target_id = ? AND COALESCE(catchall,0) = 0"
-	countArgs := []any{id}
-	if alive == "true" {
-		countQuery += " AND is_alive = 1"
-	} else if alive == "false" {
-		countQuery += " AND is_alive = 0"
+	if err := h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM subdomains"+where, args...).Scan(&total); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to count subdomains")
+		return
 	}
-	h.db.QueryRowContext(r.Context(), countQuery, countArgs...).Scan(&total)
 
-	query += " ORDER BY subdomain LIMIT ? OFFSET ?"
-	args = append(args, limit, offset)
+	query := `SELECT id, target_id, subdomain, ip, is_alive, status_code, page_title,
+		has_https, has_http, response_time_ms, technologies, server, framework, cdn, waf,
+		COALESCE(source,'dns'), last_seen, created_at
+		FROM subdomains` + where + " ORDER BY subdomain LIMIT ? OFFSET ?"
+	dataArgs := append(append([]any{}, args...), limit, offset)
 
-	rows, err := h.db.QueryContext(r.Context(), query, args...)
+	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to query subdomains")
 		return
@@ -144,14 +140,11 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 	// tier are committed with it. Status-zero seeds stay out of this view.
 	const observed = `((COALESCE(source,'probe')='probe' AND status_code BETWEEN 100 AND 599)
 		OR (COALESCE(source,'')='seed' AND status_code BETWEEN 100 AND 599 AND COALESCE(probe_tier,'')<>''))`
-	query := `SELECT id, target_id, url, status_code, title, server, content_type,
-		content_length, redirect_url, technologies, response_time_ms, last_seen, created_at,
-		COALESCE(waf,''), COALESCE(cms,'')
-		FROM http_services WHERE target_id = ? AND ` + observed
+	where := " WHERE target_id = ? AND " + observed
 	args := []any{id}
 
 	if search != "" {
-		query += " AND (url LIKE ? OR title LIKE ?)"
+		where += " AND (url LIKE ? OR title LIKE ?)"
 		like := "%" + search + "%"
 		args = append(args, like, like)
 	}
@@ -160,18 +153,24 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 		var statusCode int
 		fmt.Sscanf(statusFilter, "%d", &statusCode)
 		if statusCode > 0 {
-			query += " AND status_code = ?"
+			where += " AND status_code = ?"
 			args = append(args, statusCode)
 		}
 	}
 
 	var total int
-	h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM http_services WHERE target_id = ? AND "+observed, id).Scan(&total)
+	if err := h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM http_services"+where, args...).Scan(&total); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to count http services")
+		return
+	}
 
-	query += " ORDER BY url LIMIT ? OFFSET ?"
-	args = append(args, limit, offset)
+	query := `SELECT id, target_id, url, status_code, title, server, content_type,
+		content_length, redirect_url, technologies, response_time_ms, last_seen, created_at,
+		COALESCE(waf,''), COALESCE(cms,'')
+		FROM http_services` + where + " ORDER BY url LIMIT ? OFFSET ?"
+	dataArgs := append(append([]any{}, args...), limit, offset)
 
-	rows, err := h.db.QueryContext(r.Context(), query, args...)
+	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to query http services")
 		return
@@ -275,25 +274,28 @@ func (h *Handler) handleListParameters(w http.ResponseWriter, r *http.Request) {
 	limit := 200
 	offset := (page - 1) * limit
 
-	query := `SELECT id, target_id, url, parameter, value, source, is_reflected, created_at
-		FROM parameters WHERE target_id = ?`
+	where := " WHERE target_id = ?"
 	args := []any{id}
 
 	if reflected == "true" {
-		query += " AND is_reflected = 1"
+		where += " AND is_reflected = 1"
 	}
 	if search != "" {
-		query += " AND parameter LIKE ?"
+		where += " AND parameter LIKE ?"
 		args = append(args, "%"+search+"%")
 	}
 
 	var total int
-	h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM parameters WHERE target_id = ?", id).Scan(&total)
+	if err := h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM parameters"+where, args...).Scan(&total); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to count parameters")
+		return
+	}
 
-	query += " ORDER BY parameter LIMIT ? OFFSET ?"
-	args = append(args, limit, offset)
+	query := `SELECT id, target_id, url, parameter, value, source, is_reflected, created_at
+		FROM parameters` + where + " ORDER BY parameter LIMIT ? OFFSET ?"
+	dataArgs := append(append([]any{}, args...), limit, offset)
 
-	rows, err := h.db.QueryContext(r.Context(), query, args...)
+	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "query failed")
 		return

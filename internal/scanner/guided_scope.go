@@ -16,14 +16,18 @@ func GuidedURLInScope(ctx context.Context, db *database.DB, targetID, raw string
 	if e != nil || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || isBlockedHost(u.Hostname()) {
 		return false
 	}
-	var domain, excluded string
-	if db == nil || db.QueryRowContext(ctx, `SELECT domain,COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&domain, &excluded) != nil {
+	var domain string
+	if db == nil || db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain) != nil {
+		return false
+	}
+	excl, err := LoadExclusionsE(ctx, db, targetID)
+	if err != nil {
+		return false
+	}
+	if excl.ExcludesDestination(ctx, URLHost(raw)) {
 		return false
 	}
 	host := normalizeHost(u.Hostname())
-	if ParseExclusions(excluded).Excludes(host) {
-		return false
-	}
 	hosts, _ := SplitScope(domain)
 	for _, entry := range hosts {
 		entry = strings.TrimSpace(entry)

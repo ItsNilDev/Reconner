@@ -1,5 +1,5 @@
 import { diffWordsWithSpace } from 'diff'
-import type { ChangeCategory, ChangeEntry, MonitoringChange } from '../../types'
+import type { ChangeCategory, ChangeEntry } from '../../types'
 
 export type ChangeFilter = ChangeCategory | 'all'
 
@@ -21,6 +21,7 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   http_change: 'http',
   redirect_change: 'http',
   page_change: 'http',
+  content_change: 'http',
   js_change: 'scripts',
   css_change: 'scripts',
   tech_change: 'tech',
@@ -41,44 +42,6 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   monitor_escalation_started: 'alerts',
   scan_auto_paused: 'alerts',
   bounty_scope_change: 'alerts',
-}
-
-// The default feed and the bell deliberately show a small allow-list. Go
-// mirrors these lists in the feed query, so the API and the UI agree on what
-// counts as a real event. Findings, scan_deep and routine monitor diffs stay
-// out of the default view.
-export const NOTIFICATION_ALLOWED_TYPES = [
-  'watch_failed', 'watch_kind_conflict', 'monitor_failed',
-  'monitor_escalation_started', 'scan_auto_paused',
-  'new_host',
-] as const
-
-export const BOUNTY_SCOPE_TYPES = [
-  'scope_proposed', 'scope_landed', 'scope_modified', 'scope_removed', 'scope_rejected',
-  'scope_rule_added', 'scope_rule_removed', 'scope_re_eligible',
-] as const
-
-
-// isDefaultFeedRow keeps the default view free of routine monitor noise even
-// when the server sends a wider feed. Category chips opt out of this filter so
-// an operator can still inspect deep changes explicitly.
-export function isDefaultFeedRow(row: {
-  source?: string; change_type?: string; old_status?: number; new_status?: number; old_value?: string; new_value?: string
-}): boolean {
-  const type = row.change_type || ''
-  if (row.source === 'watch' && type === 'new_subdomain') return true
-  if (row.source === 'watch' || row.source === 'monitor') {
-    if (type === 'status_change' || type === 'http_change' || type === 'page_change') {
-      const parsed = parseStatusTransition(row.old_value || '', row.new_value || '')
-      const oldCode = row.old_status || parsed.oldCode || 0
-      const newCode = row.new_status || parsed.newCode || 0
-      return oldCode >= 100 && oldCode <= 599 && newCode >= 100 && newCode <= 599 && oldCode !== newCode
-    }
-    return false
-  }
-  if (row.source === 'watch_scope' || row.source === 'bounty') return isScopeEvent(row)
-  if (row.source === 'notification') return type === 'new_host'
-  return false
 }
 
 export function categoryForChangeType(changeType: string): ChangeCategory {
@@ -102,13 +65,6 @@ export function changeHosts(item: Pick<ChangeEntry, 'change_type' | 'metadata'>)
   return out.length > 0 ? out : null
 }
 
-// Bucket order follows the API taxonomy: stylesheet/script markers win before
-// the generic "security:" prefix, and any header change lands in Headers.
-export const monitorRowKind = (c: { change_type?: string }): ChangeFilter => {
-  const ct = typeof c?.change_type === 'string' ? c.change_type : ''
-  return categoryForChangeType(ct)
-}
-
 export type ChangeBadgeVariant = 'critical' | 'high' | 'medium' | 'low' | 'info'
 
 export const changeBadgeVariant = (c: { severity?: string; change_type?: string }): ChangeBadgeVariant => {
@@ -121,40 +77,6 @@ export const changeBadgeVariant = (c: { severity?: string; change_type?: string 
     : ct.startsWith('security') || ct.includes('header') ? 'high'
       : ct === 'tech_change' ? 'low'
         : 'info'
-}
-
-export interface ChangeLike {
-  change_type?: string
-  old_value?: string
-  new_value?: string
-  url?: string
-}
-
-export interface MonitorChangeGroup<T extends ChangeLike = MonitoringChange> {
-  key: string
-  rep: T
-  items: T[]
-  urls: string[]
-}
-
-export const OCCURRENCE_PAGE_SIZE = 200
-
-export type GroupIdentity<T> = string | ((row: T) => string)
-
-export function groupMonitorChanges<T extends ChangeLike>(rows: T[], identity: GroupIdentity<T> = ''): MonitorChangeGroup<T>[] {
-  const groups = new Map<string, MonitorChangeGroup<T>>()
-  for (const c of rows) {
-    const id = typeof identity === 'function' ? identity(c) : identity
-    const prefix = id ? `${id}\u0000` : ''
-    const key = `${prefix}${c.change_type || ''}\u0000${c.old_value || ''}\u0000${c.new_value || ''}`
-    const g = groups.get(key)
-    if (g) g.items.push(c)
-    else groups.set(key, { key, rep: c, items: [c], urls: [] })
-  }
-  for (const g of groups.values()) {
-    g.urls = [...new Set(g.items.map(i => i.url || ''))]
-  }
-  return [...groups.values()]
 }
 
 export function parseStatusTransition(oldValue: string, newValue: string): { oldCode?: number; newCode?: number } {

@@ -29,13 +29,7 @@ func randomCanary() string {
 	return reflectMarker + hex.EncodeToString(b)
 }
 
-var reflectClient = &http.Client{
-	Timeout:   8 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var reflectClient = ScannerClient(8 * time.Second)
 
 // checkParamReflection injects a unique canary into `param` and reports whether it
 // is reflected VERBATIM anywhere in the HTML-rendered body — INCLUDING inside
@@ -263,11 +257,7 @@ func checkOpenRedirectPointWithPayloads(ctx context.Context, ip insertionPoint, 
 }
 
 func followRedirectRequest(ctx context.Context, first *http.Request, originHost string, auth map[string]string) (openRedirectResult, bool) {
-	client := &http.Client{
-		Timeout:       8 * time.Second,
-		Transport:     sharedHTTPTransport,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := ScannerClient(8 * time.Second)
 	cur := first
 	var chain strings.Builder
 	redirected := false
@@ -337,13 +327,7 @@ func followRedirectRequest(ctx context.Context, first *http.Request, originHost 
 // the final Location value seen, a printable chain, and whether any redirect
 // occurred at all.
 func followRedirectChain(startURL string) (finalLoc, chain string, redirected bool) {
-	client := &http.Client{
-		Timeout:   6 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ScannerClient(6 * time.Second)
 	cur := startURL
 	var b strings.Builder
 	for hop := 0; hop < 8; hop++ {
@@ -398,13 +382,7 @@ var jsRedirectRe = regexp.MustCompile(`(?is)(?:window\s*\.\s*)?location\s*(?:\.\
 // the FIRST redirect construct found is considered (that's what the browser acts
 // on), keeping this low-FP: a mere reflected URL elsewhere in the body is ignored.
 func metaOrJSRedirectHost(pageURL string, base *url.URL) string {
-	client := &http.Client{
-		Timeout:   6 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ScannerClient(6 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)

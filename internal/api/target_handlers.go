@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/recon-platform/internal/browser"
+	"github.com/recon-platform/internal/database"
 	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/scanner"
 	"github.com/recon-platform/internal/scheduler"
@@ -124,6 +125,69 @@ func reconcileManualAssetsTx(tx *sql.Tx, targetID string, values []string) error
 	return nil
 }
 
+func loadTargetExclusions(ctx context.Context, db *database.DB, targetID string) (string, []models.ManagedExclusion, error) {
+	manualMap, managedMap, err := loadAllTargetExclusions(ctx, db, []string{targetID})
+	if err != nil {
+		return "", nil, err
+	}
+	return manualMap[targetID], managedMap[targetID], nil
+}
+
+func loadAllTargetExclusions(ctx context.Context, db *database.DB, targetIDs []string) (map[string]string, map[string][]models.ManagedExclusion, error) {
+	manualMap := make(map[string]string, len(targetIDs))
+	managedMap := make(map[string][]models.ManagedExclusion, len(targetIDs))
+	if len(targetIDs) == 0 {
+		return manualMap, managedMap, nil
+	}
+	manualLists := make(map[string][]string, len(targetIDs))
+	const chunkSize = 500
+	for start := 0; start < len(targetIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(targetIDs) {
+			end = len(targetIDs)
+		}
+		chunk := targetIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := db.QueryContext(ctx,
+			`SELECT target_id, source, program_id, pattern FROM target_exclusions WHERE target_id IN (`+placeholders+`) ORDER BY created_at, rowid`,
+			args...,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var targetID, source, programID, pattern string
+			if err := rows.Scan(&targetID, &source, &programID, &pattern); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			switch source {
+			case "manual":
+				manualLists[targetID] = append(manualLists[targetID], pattern)
+			case "bounty":
+				managedMap[targetID] = append(managedMap[targetID], models.ManagedExclusion{
+					ProgramID: programID,
+					Pattern:   pattern,
+				})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		rows.Close()
+	}
+	for targetID, patterns := range manualLists {
+		manualMap[targetID] = strings.Join(patterns, "\n")
+	}
+	return manualMap, managedMap, nil
+}
+
 func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	search := q.Get("search")
@@ -134,7 +198,7 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 	query := `SELECT id, domain, COALESCE(kind,'web'), COALESCE(description,''), COALESCE(tags,'[]'),
 		COALESCE(priority,'medium'), COALESCE(notes,''), COALESCE(status,'idle'), COALESCE(scan_status,'idle'), COALESCE(enabled_modules,'[]'),
 		last_scan_at, created_at, updated_at, COALESCE(subdomain_count,0), COALESCE(alive_host_count,0), COALESCE(finding_count,0),
-		COALESCE(monitor_enabled,0), COALESCE(monitor_interval_hours,2), COALESCE(name,''), COALESCE(exclude_scope,''),
+		COALESCE(monitor_enabled,0), COALESCE(monitor_interval_hours,2), COALESCE(name,''),
 		COALESCE(watch_only,0), watch_last_run, watch_next_run, COALESCE(watch_fail_count,0),
 		COALESCE(watch_root_index,0), COALESCE(watch_paused,0)
 		FROM targets WHERE 1=1`
@@ -198,7 +262,7 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 			&t.Notes, &t.Status, &t.ScanStatus, &modulesJSON,
 			&lastScan, &t.CreatedAt, &t.UpdatedAt,
 			&t.SubdomainCount, &t.AliveHostCount, &t.FindingCount,
-			&monitorEnabled, &t.MonitorIntervalHours, &t.Name, &t.ExcludeScope,
+			&monitorEnabled, &t.MonitorIntervalHours, &t.Name,
 			&watchOnly, &watchLastRun, &watchNextRun, &t.WatchFailCount,
 			&t.WatchRootIndex, &watchPaused)
 		if err != nil {
@@ -225,6 +289,19 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 	if err := rows.Err(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to read targets")
 		return
+	}
+	targetIDs := make([]string, len(targets))
+	for i := range targets {
+		targetIDs[i] = targets[i].ID
+	}
+	manualMap, managedMap, err := loadAllTargetExclusions(r.Context(), h.db, targetIDs)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load target exclusions")
+		return
+	}
+	for i := range targets {
+		targets[i].ExcludeScope = manualMap[targets[i].ID]
+		targets[i].ManagedExclusions = managedMap[targets[i].ID]
 	}
 
 	h.writeSuccess(w, targets)
@@ -300,8 +377,8 @@ func (h *Handler) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	_, err = tx.ExecContext(r.Context(), `
 		INSERT INTO targets (id, domain, description, tags, priority, notes, kind, name, exclude_scope, owner_id, scan_user_agent, scan_headers)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, domain, req.Description, tagsJSON, req.Priority, req.Notes, kind, strings.TrimSpace(req.Name), strings.TrimSpace(req.ExcludeScope), h.currentUserID(r), scanUserAgent, scanHeadersJSON)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+	`, id, domain, req.Description, tagsJSON, req.Priority, req.Notes, kind, strings.TrimSpace(req.Name), h.currentUserID(r), scanUserAgent, scanHeadersJSON)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			h.writeError(w, http.StatusConflict, "target already exists")
@@ -312,6 +389,10 @@ func (h *Handler) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := reconcileManualAssetsTx(tx, id, scopeValues); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to create managed assets")
+		return
+	}
+	if err := scanner.ReplaceManualExclusionsTx(r.Context(), tx, id, req.ExcludeScope); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to save target exclusions")
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -328,6 +409,7 @@ func (h *Handler) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		Tags:          req.Tags,
 		Priority:      req.Priority,
 		Notes:         req.Notes,
+		ExcludeScope:  strings.Join(scanner.ParseManualExclusionPatterns(req.ExcludeScope), "\n"),
 		Status:        "idle",
 		ScanStatus:    "idle",
 		ScanUserAgent: scanUserAgent,
@@ -397,7 +479,7 @@ func (h *Handler) handleGetTarget(w http.ResponseWriter, r *http.Request) {
 		SELECT id, domain, COALESCE(kind,'web'), COALESCE(description,''), COALESCE(tags,'[]'),
 			COALESCE(priority,'medium'), COALESCE(notes,''), COALESCE(status,'idle'), COALESCE(scan_status,'idle'), COALESCE(enabled_modules,'[]'),
 			last_scan_at, created_at, updated_at, COALESCE(subdomain_count,0), COALESCE(alive_host_count,0), COALESCE(finding_count,0),
-			COALESCE(monitor_enabled,0), COALESCE(monitor_interval_hours,2), COALESCE(name,''), COALESCE(exclude_scope,''), monitor_last_run,
+			COALESCE(monitor_enabled,0), COALESCE(monitor_interval_hours,2), COALESCE(name,''), monitor_last_run,
 			COALESCE(scan_user_agent,''), COALESCE(scan_headers,'{}'), COALESCE(catchall_detection,-1),
 			COALESCE(watch_only,0), watch_last_run, watch_next_run, COALESCE(watch_fail_count,0),
 			COALESCE(watch_root_index,0), COALESCE(watch_paused,0)
@@ -406,13 +488,24 @@ func (h *Handler) handleGetTarget(w http.ResponseWriter, r *http.Request) {
 		&t.Notes, &t.Status, &t.ScanStatus, &modulesJSON,
 		&lastScan, &t.CreatedAt, &t.UpdatedAt,
 		&t.SubdomainCount, &t.AliveHostCount, &t.FindingCount,
-		&monitorEnabled, &t.MonitorIntervalHours, &t.Name, &t.ExcludeScope, &monitorLastRun, &t.ScanUserAgent, &scanHeadersJSON, &catchallOverride,
+		&monitorEnabled, &t.MonitorIntervalHours, &t.Name, &monitorLastRun, &t.ScanUserAgent, &scanHeadersJSON, &catchallOverride,
 		&watchOnly, &watchLastRun, &watchNextRun, &t.WatchFailCount,
 		&t.WatchRootIndex, &watchPaused)
 	if err != nil {
-		h.writeError(w, http.StatusNotFound, "target not found")
+		if errors.Is(err, sql.ErrNoRows) {
+			h.writeError(w, http.StatusNotFound, "target not found")
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, "failed to load target")
 		return
 	}
+	manualExcl, managedExcl, err := loadTargetExclusions(r.Context(), h.db, id)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load target exclusions")
+		return
+	}
+	t.ExcludeScope = manualExcl
+	t.ManagedExclusions = managedExcl
 
 	t.WatchOnly = watchOnly == 1
 	t.WatchPaused = watchPaused == 1
@@ -483,12 +576,12 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	// This endpoint is consumed as Partial<Target>. Load the current row first so
 	// omitted fields stay untouched; the old zero-value decoding silently erased
 	// enabled_modules (and, for API clients, metadata/identity) on unrelated edits.
-	var name, description, tagsJSON, priority, notes, excludeScope, modulesJSON, scanUserAgent, scanHeadersJSON string
+	var name, description, tagsJSON, priority, notes, modulesJSON, scanUserAgent, scanHeadersJSON string
 	var catchallOverride int
 	err := h.db.QueryRowContext(r.Context(), `SELECT COALESCE(name,''),COALESCE(description,''),COALESCE(tags,'[]'),
-		COALESCE(priority,'medium'),COALESCE(notes,''),COALESCE(exclude_scope,''),COALESCE(enabled_modules,'[]'),
+		COALESCE(priority,'medium'),COALESCE(notes,''),COALESCE(enabled_modules,'[]'),
 		COALESCE(scan_user_agent,''),COALESCE(scan_headers,'{}'),COALESCE(catchall_detection,-1) FROM targets WHERE id=?`, id).
-		Scan(&name, &description, &tagsJSON, &priority, &notes, &excludeScope, &modulesJSON, &scanUserAgent, &scanHeadersJSON, &catchallOverride)
+		Scan(&name, &description, &tagsJSON, &priority, &notes, &modulesJSON, &scanUserAgent, &scanHeadersJSON, &catchallOverride)
 	if err == sql.ErrNoRows {
 		h.writeError(w, http.StatusNotFound, "target not found")
 		return
@@ -511,9 +604,6 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Notes != nil {
 		notes = *req.Notes
-	}
-	if req.ExcludeScope != nil {
-		excludeScope = strings.TrimSpace(*req.ExcludeScope)
 	}
 	if req.EnabledModules != nil {
 		modulesJSON = models.StringSliceToJSON(*req.EnabledModules)
@@ -597,6 +687,10 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusInternalServerError, "failed to reconcile managed assets")
 			return
 		}
+		if err := syncTargetKind(r.Context(), tx, id); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to sync target kind")
+			return
+		}
 	}
 
 	// A breadth project may only hold web assets. This check also covers a
@@ -608,11 +702,7 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusInternalServerError, "failed to read coverage")
 			return
 		}
-		effectiveKind := kind
-		if effectiveKind == "" {
-			effectiveKind = currentKind
-		}
-		if currentWatchOnly == 1 && effectiveKind != "web" {
+		if currentWatchOnly == 1 && currentKind != "web" {
 			h.writeError(w, http.StatusBadRequest, "a breadth project must be web-only: switch to deep coverage first or remove network assets")
 			return
 		}
@@ -645,10 +735,10 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	res, err := tx.ExecContext(r.Context(), `
 		UPDATE targets SET
 			name = ?, description = ?, tags = ?, priority = ?, notes = ?,
-			exclude_scope = ?, enabled_modules = ?, scan_user_agent = ?, scan_headers = ?,
+			enabled_modules = ?, scan_user_agent = ?, scan_headers = ?,
 			catchall_detection = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
-	`, name, description, tagsJSON, priority, notes, excludeScope, modulesJSON, scanUserAgent, scanHeadersJSON, catchallDB, id)
+	`, name, description, tagsJSON, priority, notes, modulesJSON, scanUserAgent, scanHeadersJSON, catchallDB, id)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to update target")
 		return
@@ -656,6 +746,12 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		h.writeError(w, http.StatusNotFound, "target not found")
 		return
+	}
+	if req.ExcludeScope != nil {
+		if err := scanner.ReplaceManualExclusionsTx(r.Context(), tx, id, *req.ExcludeScope); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to update target exclusions")
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to update target")
@@ -702,6 +798,7 @@ func (h *Handler) deleteTargetByID(id string) error {
 		"DELETE FROM object_relationships WHERE target_id = ?",
 		"DELETE FROM workflow_variables WHERE target_id = ?",
 		"DELETE FROM http_observation_baselines WHERE target_id = ?",
+		"DELETE FROM target_exclusions WHERE target_id = ?",
 	} {
 		if _, err := tx.Exec(statement, id); err != nil {
 			return err

@@ -40,16 +40,7 @@ func NewExposureScanner(db *database.DB, exec *tools.Executor, cfg *config.Confi
 	return &ExposureScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var exposureHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   12 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 4 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var exposureHTTPClient = ScannerRedirectClient(12*time.Second, 4, RedirectInScope)
 
 func (s *ExposureScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	if err := s.runGraphQL(ctx, targetID, logFn); err != nil && ctx.Err() != nil {

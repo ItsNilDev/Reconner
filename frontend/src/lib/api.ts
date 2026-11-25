@@ -1,7 +1,7 @@
 import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding,
   Parameter, DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding,
-  NucleiFinding, VulnFinding, MonitoringChange, Task, TaskLog, TaskPhase, DashboardStats, AttackPath,
+  NucleiFinding, VulnFinding, Task, TaskLog, TaskPhase, DashboardStats, AttackPath,
   NetworkService, IngramCamera, Asset, FileBodyResponse, ChangeEntry, WatchRound,
   BountyProgram, BountySyncState, BountyScopeEvent,
 } from '../types'
@@ -361,21 +361,6 @@ export const findings = {
     req<{ triage: string }>(`/targets/${id}/findings/${fid}/triage`, {
       method: 'POST', body: JSON.stringify({ triage, note }),
     }),
-  // Changes use the same page/limit envelope as every other list endpoint, so
-  // fetchAllPaged() loads the complete history up front — no separate
-  // "load older changes" path and no 500-row stop.
-  monitoringChanges: async (id: string) => {
-    const rows = await fetchAllPaged<MonitoringChange>(`/targets/${id}/monitoring-changes`)
-    // Offset pagination can repeat a row when new changes land between page
-    // requests. Drop duplicates by id so React keys stay unique and the raw
-    // count in the footer matches the chips.
-    const seen = new Set<string>()
-    return rows.filter(r => {
-      if (seen.has(r.id)) return false
-      seen.add(r.id)
-      return true
-    })
-  },
   // Stored capture of a monitored file's body at detection time — NOT a live
   // fetch. Backs the Changes-tab diff drawer (css_change / js_change rows).
   fileBody: (id: string, kind: 'css' | 'js', url: string, side: 'current' | 'old' = 'current') =>

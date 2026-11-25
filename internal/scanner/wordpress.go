@@ -45,13 +45,7 @@ func NewWordPressScanner(db *database.DB, cfg *config.Config, log *logger.Logger
 // 301 is itself a detection/enumeration signal we must read from the Location
 // header, and following it would also risk leaving the base host. Per-request
 // contexts carry the real timeout.
-var wpHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var wpHTTPClient = ScannerClient(15 * time.Second)
 
 const wpUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 

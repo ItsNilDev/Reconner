@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Changes from './Changes'
 import type { ChangeEntry, WatchRound } from '../types'
+import { parseStatusTransition } from '../components/changes/changesModel'
 
 const changeRows: ChangeEntry[] = [
   {
@@ -75,6 +76,20 @@ function success(data: unknown) {
   })
 }
 
+function matchesDefaultView(r: ChangeEntry): boolean {
+  if (r.source === 'watch' && r.change_type === 'new_subdomain') return true
+  if ((r.source === 'watch' || r.source === 'monitor') &&
+    (r.change_type === 'status_change' || r.change_type === 'http_change' || r.change_type === 'page_change')) {
+    const parsed = parseStatusTransition(r.old_value || '', r.new_value || '')
+    const oldCode = r.old_status || parsed.oldCode || 0
+    const newCode = r.new_status || parsed.newCode || 0
+    return oldCode >= 100 && oldCode <= 599 && newCode >= 100 && newCode <= 599 && oldCode !== newCode
+  }
+  if (r.source === 'bounty' || r.source === 'watch_scope') return true
+  if (r.source === 'notification' && r.change_type === 'new_host') return true
+  return false
+}
+
 function mockApi(opts?: { changes?: ChangeEntry[]; rounds?: WatchRound[] }) {
   const rows = (opts?.changes ?? changeRows).map(r => ({ ...r }))
   const roundRows = opts?.rounds ?? rounds
@@ -94,7 +109,9 @@ function mockApi(opts?: { changes?: ChangeEntry[]; rounds?: WatchRound[] }) {
       const cat = u.searchParams.get('category')
       const cats = cat ? cat.split(',').filter(c => c && c !== 'all') : []
       const hideSeen = u.searchParams.get('hide_seen') === '1'
-      const filtered = cats.length ? rows.filter(r => cats.includes(r.category)) : rows
+      const defaultView = u.searchParams.get('default_view') === '1'
+      let filtered = cats.length ? rows.filter(r => cats.includes(r.category)) : rows
+      if (defaultView) filtered = filtered.filter(matchesDefaultView)
       return envelope(hideSeen ? filtered.filter(r => !r.seen) : filtered)
     }
     if (url.startsWith('/api/watch/rounds?')) return envelope(roundRows)
@@ -109,10 +126,11 @@ afterEach(() => { vi.unstubAllGlobals() })
 
 describe('global Changes page', () => {
   it('renders a flat feed with field diffs and source badges', async () => {
-    mockApi()
+    const fetchMock = mockApi()
     render(<MemoryRouter><Changes /></MemoryRouter>)
 
     await screen.findByRole('heading', { name: 'Changes' })
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('default_view=1'))).toBe(true)
     expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
     expect(screen.getByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
     expect(screen.getAllByText('STATUS CODE').length).toBeGreaterThan(0)

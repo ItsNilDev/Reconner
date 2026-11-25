@@ -314,7 +314,7 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 	logFn("info", "js_analysis", fmt.Sprintf("Secret verification done. %d live secrets confirmed.", verified))
 }
 
-var secretHTTPClient = &http.Client{Timeout: 10 * time.Second, Transport: sharedHTTPTransport}
+var secretHTTPClient = ExternalClient(10 * time.Second)
 
 // verifySecretValue makes a minimal, read-only auth call to the provider.
 func verifySecretValue(ctx context.Context, typ, value string) bool {
@@ -419,7 +419,7 @@ func isInScope(jsURL, targetDomain string) bool {
 var jsLinkRE = regexp.MustCompile(`(?i)(?:src|href)\s*=\s*["']([^"']+\.(?:js|mjs|cjs)(?:[?#][^"']*)?)["']`)
 
 func (s *JSScanner) discoverJSFromHTML(ctx context.Context, pageURL, targetDomain string, jsFiles *map[string]bool, mu *sync.Mutex) {
-	client := &http.Client{Timeout: 10 * time.Second, Transport: sharedHTTPTransport}
+	client := ScannerRedirectClient(10*time.Second, 5, RedirectInScope)
 	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
 	if err != nil {
 		return
@@ -662,7 +662,7 @@ func jsRedirectInScope(finalURL, requested, parent, targetDomain string) bool {
 }
 
 func fetchJSContent(ctx context.Context, jsURL string) ([]byte, string, *http.Client, error) {
-	client := &http.Client{Timeout: 20 * time.Second, Transport: sharedHTTPTransport}
+	client := ScannerRedirectClient(20*time.Second, 10, RedirectInScope)
 	content, finalURL, err := fetchJSContentWithClient(ctx, jsURL, client)
 	return content, finalURL, client, err
 }
@@ -708,20 +708,16 @@ func FetchJSArtifact(ctx context.Context, targetScope, jsURL string) ([]byte, st
 	if !requestURLInTargetScope(ctx, targetScope, jsURL) {
 		return nil, "", fmt.Errorf("JavaScript URL is outside target scope")
 	}
-	client := &http.Client{
-		Timeout:   20 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many JavaScript redirects")
-			}
-			if !requestURLInTargetScope(req.Context(), targetScope, req.URL.String()) {
-				return fmt.Errorf("JavaScript redirect left target scope")
-			}
-			return nil
-		},
+	reqCtx := ctx
+	if hostScopeSet(ctx) == nil && strictWatchScopeSet(ctx) == nil {
+		if id, ok := ctx.Value(requestIdentityKey{}).(requestIdentity); ok && len(id.hosts) > 0 {
+			reqCtx = WithHostScope(ctx, id.hosts)
+		} else if hosts := appendScopeHosts(nil, targetScope); len(hosts) > 0 {
+			reqCtx = WithHostScope(ctx, hosts)
+		}
 	}
-	content, finalURL, err := fetchJSContentWithClient(ctx, jsURL, client)
+	client := ScannerRedirectClient(20*time.Second, 10, RedirectInScope)
+	content, finalURL, err := fetchJSContentWithClient(reqCtx, jsURL, client)
 	if err != nil {
 		return nil, "", err
 	}

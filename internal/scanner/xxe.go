@@ -46,7 +46,7 @@ func NewXXEScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, lo
 	return &XXEScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var xxeClient = newPooledClient(15*time.Second, false)
+var xxeClient = ScannerClient(15 * time.Second)
 
 // In-band signatures that only appear when a file was actually read.
 var xxeFileSignatures = []string{"root:x:0:0:", "root:!:0:0:", "[extensions]", "; for 16-bit app support"}

@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -393,13 +392,7 @@ func protocolDifferential(ctx context.Context, url string, owner, attacker Ident
 		DiscoverySource: "protocol-differential"}, true
 }
 
-var identityHTTP1Client = func() *http.Client {
-	t := guardedCredentialTransport.Clone()
-	t.ForceAttemptHTTP2 = false
-	t.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
-	return &http.Client{Transport: identityRoundTripper{base: t}, Timeout: 15 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-}()
+var identityHTTP1Client = CredentialClient(15*time.Second, WithCredentialHTTP1Only())
 
 func fetchAsForceHTTP1(ctx context.Context, url string, id *Identity) IdentityResponse {
 	var who Identity

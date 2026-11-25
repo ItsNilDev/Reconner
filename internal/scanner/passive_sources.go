@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,9 +12,7 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
+var httpClient = ExternalClient(30 * time.Second)
 
 // errSourceUnavailable is returned when a passive source responds with something
 // other than the JSON we expect (an HTML rate-limit / Cloudflare / error page).
@@ -33,16 +32,23 @@ type crtEntry struct {
 
 // crtHTTPClient gives slow sources (crt.sh in particular) more headroom, since
 // crt.sh regularly takes 20-40s to answer for busy domains.
-var crtHTTPClient = &http.Client{Timeout: 60 * time.Second}
+var crtHTTPClient = ExternalClient(60 * time.Second)
 
-func queryCRTSH(domain string) ([]string, error) {
+func queryCRTSH(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", domain)
 	// crt.sh flakes often (timeouts, 502s). Retry a couple of times before giving
 	// up — it's one of the highest-signal sources so it's worth the patience.
 	var body []byte
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := crtHTTPClient.Get(url)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := crtHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
@@ -88,9 +94,13 @@ func queryCRTSH(domain string) ([]string, error) {
 	return result, nil
 }
 
-func queryHackerTarget(domain string) ([]string, error) {
+func queryHackerTarget(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://api.hackertarget.com/hostsearch/?q=%s", domain)
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -120,9 +130,9 @@ func queryHackerTarget(domain string) ([]string, error) {
 	return result, nil
 }
 
-func queryRapidDNS(domain string) ([]string, error) {
+func queryRapidDNS(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://rapiddns.io/subdomain/%s?full=1&down=1", domain)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -157,9 +167,13 @@ func queryRapidDNS(domain string) ([]string, error) {
 	return result, nil
 }
 
-func queryOTX(domain string) ([]string, error) {
+func queryOTX(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", domain)
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -199,9 +213,9 @@ func queryOTX(domain string) ([]string, error) {
 
 // queryAnubis uses the free jldc.me Anubis DB — a real, independent passive
 // source (replaces the old queryAlienVault which just duplicated queryOTX).
-func queryAnubis(domain string) ([]string, error) {
+func queryAnubis(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://jldc.me/anubis/subdomains/%s", domain)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -238,9 +252,9 @@ func queryAnubis(domain string) ([]string, error) {
 	return result, nil
 }
 
-func queryURLScan(domain string) ([]string, error) {
+func queryURLScan(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://urlscan.io/api/v1/search/?q=domain:%s&size=100", domain)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -286,9 +300,13 @@ func queryURLScan(domain string) ([]string, error) {
 
 // queryCertSpotter pulls subdomains from SSLMate's Cert Spotter CT-log API. It's
 // free (no key for basic use), reliable, and often surfaces names crt.sh misses.
-func queryCertSpotter(domain string) ([]string, error) {
+func queryCertSpotter(ctx context.Context, domain string) ([]string, error) {
 	url := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain)
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

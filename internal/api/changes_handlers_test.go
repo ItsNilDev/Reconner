@@ -1012,3 +1012,300 @@ func TestListChangesHideSeenExcludesRowsBeforeCountAndPagination(t *testing.T) {
 		t.Fatalf("bob hide_seen total=%d rows=%d, want 0 and 0", bobHidden.Total, len(bobHidden.Data))
 	}
 }
+
+func TestChangesDefaultViewSQLAndFiltering(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, []any{adminID}},
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t2','two.example',?)`, []any{adminID}},
+		{`INSERT INTO bounty_programs (id, provider, external_id, handle, name) VALUES ('p1','intigriti','ext-1','p1','Program')`, nil},
+		// Included in default_view on t1:
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-sub','t1','r1','','new_subdomain','','sub.one.example','medium',0,0,'2026-06-01 00:00:01')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-status','t1','r1','https://one.example','status_change','200','403','medium',200,403,'2026-06-01 00:00:02')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http','t1','https://a.one.example','http_change','status=200 title=OK','status=403 title=Forbidden','medium',200,403,'2026-06-01 00:00:03')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-page','t1','https://b.one.example','page_change','status=200 title=OK','status=403 title=Forbidden','medium',0,0,'2026-06-01 00:00:04')`, nil},
+		{`INSERT INTO bounty_scope_events (id,target_id,program_id,event_type,identifier,detected_at)
+			VALUES ('se-add','t1','p1','added','api.one.example','2026-06-01 00:00:05')`, nil},
+		{`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+			VALUES ('ws-oos','t1','p1','old.one.example','out_of_scope','a1','{}','2026-06-01 00:00:06')`, nil},
+		{`INSERT INTO notifications (id,target_id,type,title,body,metadata,created_at)
+			VALUES ('n-host-deep','t1','new_host','New host','deep.one.example','{"source":"monitor"}','2026-06-01 00:00:07')`, nil},
+		// Excluded from default_view on t1:
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-same','t1','https://c.one.example','http_change','status=200 title=Old','status=200 title=New','low',200,200,'2026-06-01 00:00:08')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-js','t1','https://d.one.example/app.js','js_change','a','b','low','2026-06-01 00:00:09')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-same','t1','r1','https://same.one.example','status_change','status=200 title=A','status=200 title=B','low',200,200,'2026-06-01 00:00:10')`, nil},
+		{`INSERT INTO notifications (id,target_id,type,title,body,metadata,created_at)
+			VALUES ('n-host-watch','t1','new_host','New host','watch.one.example','{"source":"watch"}','2026-06-01 00:00:11')`, nil},
+		{`INSERT INTO notifications (id,target_id,type,title,body,metadata,created_at)
+			VALUES ('n-alert','t1','watch_failed','Failed','err','{}','2026-06-01 00:00:12')`, nil},
+		// Included in default_view on t2 (for forced-target isolation check):
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('wc-t2','t2','r2','','new_subdomain','','sub.two.example','medium','2026-06-01 00:00:13')`, nil},
+	} {
+		if _, err := h.db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("seed %s: %v", q.sql, err)
+		}
+	}
+
+	// 1. Global default_view=1
+	rec := serveChanges(t, h, sid, "/api/changes?default_view=1", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("global default_view status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	got := idsOf(env.Data)
+	wantGlobal := []string{"wc-sub", "wc-status", "mc-http", "mc-page", "se-add", "ws-oos", "n-host-deep", "wc-t2"}
+	if len(got) != len(wantGlobal) || env.Total != len(wantGlobal) {
+		t.Fatalf("global default_view ids=%v total=%d, want %v", got, env.Total, wantGlobal)
+	}
+	for _, id := range wantGlobal {
+		if !got[id] {
+			t.Errorf("global default_view missing %q in %v", id, got)
+		}
+	}
+	for _, excluded := range []string{"mc-same", "mc-js", "wc-same", "n-host-watch", "n-alert"} {
+		if got[excluded] {
+			t.Errorf("global default_view unexpectedly included %q", excluded)
+		}
+	}
+
+	// Watch-sourced new_host notification is excluded even without default_view.
+	recAll := serveChanges(t, h, sid, "/api/changes?source=notification", nil, h.handleListChanges)
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("notifications list status=%d body=%s", recAll.Code, recAll.Body.String())
+	}
+	var envAll changesEnvelope
+	if err := json.Unmarshal(recAll.Body.Bytes(), &envAll); err != nil {
+		t.Fatal(err)
+	}
+	if idsOf(envAll.Data)["n-host-watch"] {
+		t.Errorf("watch-sourced notification n-host-watch leaked into changes feed")
+	}
+
+	// 2. Forced-target isolation: route id=t1 wins over ?target_id=t2.
+	recTarget := serveChanges(t, h, sid, "/api/targets/t1/changes?default_view=1&target_id=t2", map[string]string{"id": "t1"}, h.handleListTargetChanges)
+	if recTarget.Code != http.StatusOK {
+		t.Fatalf("target default_view status=%d body=%s", recTarget.Code, recTarget.Body.String())
+	}
+	var envTarget changesEnvelope
+	if err := json.Unmarshal(recTarget.Body.Bytes(), &envTarget); err != nil {
+		t.Fatal(err)
+	}
+	gotTarget := idsOf(envTarget.Data)
+	if gotTarget["wc-t2"] || len(gotTarget) != len(wantGlobal)-1 {
+		t.Fatalf("forced target default_view ids=%v, want only t1 rows", gotTarget)
+	}
+
+	// 3. Mark-all-read with default_view=1 only marks default_view rows.
+	recMark := postChanges(t, h, sid, "/api/changes/seen-all?default_view=1&target_id=t1", map[string]any{}, h.handleMarkAllChangesSeen)
+	if recMark.Code != http.StatusOK {
+		t.Fatalf("mark-all default_view status=%d body=%s", recMark.Code, recMark.Body.String())
+	}
+	recAfter := serveChanges(t, h, sid, "/api/changes", nil, h.handleListChanges)
+	if recAfter.Code != http.StatusOK {
+		t.Fatalf("after mark-all status=%d body=%s", recAfter.Code, recAfter.Body.String())
+	}
+	var envAfter changesEnvelope
+	if err := json.Unmarshal(recAfter.Body.Bytes(), &envAfter); err != nil {
+		t.Fatal(err)
+	}
+	seenByID := map[string]bool{}
+	for _, row := range envAfter.Data {
+		seenByID[row.ID] = row.Seen
+	}
+	if !seenByID["mc-http"] || !seenByID["wc-status"] || !seenByID["n-host-deep"] {
+		t.Errorf("expected t1 default_view rows marked seen: %v", seenByID)
+	}
+	if seenByID["mc-same"] || seenByID["mc-js"] || seenByID["wc-t2"] || seenByID["n-alert"] {
+		t.Errorf("non-matching rows unexpectedly marked seen: %v", seenByID)
+	}
+}
+
+func TestChangesAndBellReadStateSync(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("sync-bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSID, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSID, err := h.auth.Login("sync-bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t-sync','sync.example',?)`, []any{adminID}},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-1','t-sync','https://1.sync.example','http_change','status=200 title=A','status=403 title=B','medium',200,403,'2026-06-01 00:00:01')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-2','t-sync','https://2.sync.example','http_change','status=200 title=A','status=404 title=C','medium',200,404,'2026-06-01 00:00:02')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-3','t-sync','https://3.sync.example','http_change','status=200 title=A','status=500 title=D','high',200,500,'2026-06-01 00:00:03')`, nil},
+		// Notification linked via change_id to mc-1:
+		{`INSERT INTO notifications (id,target_id,type,title,body,is_read,change_id,created_at)
+			VALUES ('n-mc1','t-sync','http_change','Changed','status=403',0,'mc-1','2026-06-01 00:00:01')`, nil},
+		// Notification linked via change_id to mc-2:
+		{`INSERT INTO notifications (id,target_id,type,title,body,is_read,change_id,created_at)
+			VALUES ('n-mc2','t-sync','http_change','Changed','status=404',0,'mc-2','2026-06-01 00:00:02')`, nil},
+		// Notification linked via change_id to mc-3:
+		{`INSERT INTO notifications (id,target_id,type,title,body,is_read,change_id,created_at)
+			VALUES ('n-mc3','t-sync','http_change','Changed','status=500',0,'mc-3','2026-06-01 00:00:03')`, nil},
+		// Direct notification row that appears in Changes feed itself:
+		{`INSERT INTO notifications (id,target_id,type,title,body,is_read,created_at)
+			VALUES ('n-alert','t-sync','monitor_failed','Monitor failed','timeout',0,'2026-06-01 00:00:04')`, nil},
+		// Target-less shared notification for per-user isolation check:
+		{`INSERT INTO notifications (id,target_id,type,title,body,is_read,created_at)
+			VALUES ('n-shared',NULL,'watch_failed','Global notice','info',0,'2026-06-01 00:00:05')`, nil},
+	} {
+		if _, err := h.db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("seed %s: %v", q.sql, err)
+		}
+	}
+
+	notifRead := func(uid int64, notifID string) bool {
+		t.Helper()
+		var n int
+		if err := h.db.QueryRow(`SELECT COUNT(*) FROM notification_reads WHERE notification_id=? AND user_id=?`, notifID, uid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+	changeSeen := func(uid int64, changeID string) bool {
+		t.Helper()
+		var n int
+		if err := h.db.QueryRow(`SELECT COUNT(*) FROM change_seen WHERE change_id=? AND user_id=?`, changeID, uid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+
+	// 1. Changes -> Bell: marking mc-1 seen mirrors to notification n-mc1 via change_id.
+	rec := postChanges(t, h, adminSID, "/api/changes/seen", map[string]any{"ids": []string{"mc-1"}, "seen": true}, h.handleSetChangesSeen)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set seen status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !changeSeen(adminID, "mc-1") || !notifRead(adminID, "n-mc1") {
+		t.Fatalf("mc-1 seen sync failed: changeSeen=%v notifRead=%v", changeSeen(adminID, "mc-1"), notifRead(adminID, "n-mc1"))
+	}
+
+	// Unmarking mc-1 removes n-mc1 from notification_reads.
+	rec = postChanges(t, h, adminSID, "/api/changes/seen", map[string]any{"ids": []string{"mc-1"}, "seen": false}, h.handleSetChangesSeen)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set unseen status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if changeSeen(adminID, "mc-1") || notifRead(adminID, "n-mc1") {
+		t.Fatalf("mc-1 unseen sync failed: changeSeen=%v notifRead=%v", changeSeen(adminID, "mc-1"), notifRead(adminID, "n-mc1"))
+	}
+
+	// 2. Bell -> Changes (specific ID): marking n-mc2 read mirrors both n-mc2 and change_id mc-2 into change_seen.
+	rec = postChanges(t, h, adminSID, "/api/notifications/read", map[string]any{"ids": []string{"n-mc2"}}, h.handleMarkNotificationsRead)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bell mark single status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !notifRead(adminID, "n-mc2") || !changeSeen(adminID, "n-mc2") || !changeSeen(adminID, "mc-2") {
+		t.Fatalf("bell single sync failed: notifRead=%v changeSeen(n)=%v changeSeen(mc)=%v",
+			notifRead(adminID, "n-mc2"), changeSeen(adminID, "n-mc2"), changeSeen(adminID, "mc-2"))
+	}
+
+	// 3. Bell -> Changes (bulk bucket): marking deep bucket read syncs n-mc3 -> mc-3 and n-alert.
+	rec = postChanges(t, h, adminSID, "/api/notifications/read", map[string]any{"type": "deep"}, h.handleMarkNotificationsRead)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bell mark bulk status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !notifRead(adminID, "n-mc3") || !changeSeen(adminID, "mc-3") || !changeSeen(adminID, "n-alert") {
+		t.Fatalf("bell bulk sync failed: notifRead(n-mc3)=%v changeSeen(mc-3)=%v changeSeen(n-alert)=%v",
+			notifRead(adminID, "n-mc3"), changeSeen(adminID, "mc-3"), changeSeen(adminID, "n-alert"))
+	}
+	// watch_failed is not in deep bucket so n-shared stays unread.
+	if notifRead(adminID, "n-shared") || changeSeen(adminID, "n-shared") {
+		t.Fatalf("deep bucket bulk read leaked to n-shared")
+	}
+
+	// 4. Changes Mark-all-seen (with hide_seen=1) mirrors remaining unread rows (including change_id & direct notif) to bell.
+	// First clear mc-1 & n-mc1 to be sure they're unread, then mark all seen with hide_seen=1.
+	rec = postChanges(t, h, adminSID, "/api/changes/seen-all?hide_seen=1", map[string]any{}, h.handleMarkAllChangesSeen)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("changes seen-all status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !changeSeen(adminID, "n-shared") || !notifRead(adminID, "n-shared") {
+		t.Fatalf("seen-all failed to sync n-shared: changeSeen=%v notifRead=%v", changeSeen(adminID, "n-shared"), notifRead(adminID, "n-shared"))
+	}
+	if !changeSeen(adminID, "mc-1") || !notifRead(adminID, "n-mc1") {
+		t.Fatalf("seen-all failed to sync mc-1 -> n-mc1: changeSeen=%v notifRead=%v", changeSeen(adminID, "mc-1"), notifRead(adminID, "n-mc1"))
+	}
+
+	// 5. Per-user isolation: bob still sees n-shared unread in both surfaces.
+	if notifRead(bob.ID, "n-shared") || changeSeen(bob.ID, "n-shared") {
+		t.Fatalf("admin sync leaked read state to bob")
+	}
+	bobRec := serveChanges(t, h, bobSID, "/api/changes?hide_seen=1", nil, h.handleListChanges)
+	if bobRec.Code != http.StatusOK {
+		t.Fatalf("bob list status=%d body=%s", bobRec.Code, bobRec.Body.String())
+	}
+	var bobEnv changesEnvelope
+	if err := json.Unmarshal(bobRec.Body.Bytes(), &bobEnv); err != nil {
+		t.Fatal(err)
+	}
+	if !idsOf(bobEnv.Data)["n-shared"] {
+		t.Fatalf("bob should still see unread n-shared, got %v", idsOf(bobEnv.Data))
+	}
+}
+
+func TestListChangesContentChangeCategory(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	for _, stmt := range []struct {
+		q    string
+		args []any
+	}{
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, []any{adminID}},
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t2','two.example',?)`, []any{adminID}},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-content-1','t1','https://one.example/page','content_change','hash=aaa','hash=bbb','low',CURRENT_TIMESTAMP)`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-content-2','t2','https://two.example/page','content_change','hash=ccc','hash=ddd','low',CURRENT_TIMESTAMP)`, nil},
+	} {
+		if _, err := h.db.Exec(stmt.q, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serveChanges(t, h, sid, "/api/changes?category=http&target_id=t1", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Data) != 1 || env.Data[0].ID != "mc-content-1" || env.Data[0].Category != "http" {
+		t.Fatalf("got %+v, want single mc-content-1 with category http", env.Data)
+	}
+}

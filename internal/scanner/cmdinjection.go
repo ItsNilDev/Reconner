@@ -3,7 +3,6 @@ package scanner
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,13 +26,7 @@ func NewCmdiScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &CmdiScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var cmdiHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   20 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var cmdiHTTPClient = ScannerClient(20 * time.Second)
 
 // Echo-based detection that is REFLECTION-PROOF. A naive `echo MARKER` test
 // false-positives on any app that reflects input (search terms, breadcrumbs,

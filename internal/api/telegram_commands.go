@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/recon-platform/internal/models"
+	"github.com/recon-platform/internal/scanner"
 	"github.com/recon-platform/internal/scheduler"
 )
 
@@ -629,7 +630,7 @@ func (b *TelegramBot) editTelegramTarget(ctx context.Context, target telegramTar
 		}
 	}
 	if value, ok := updates["exclude"]; ok {
-		if _, err = tx.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, value, target.ID); err != nil {
+		if err = scanner.ReplaceManualExclusionsTx(ctx, tx, target.ID, value); err != nil {
 			return err
 		}
 	}

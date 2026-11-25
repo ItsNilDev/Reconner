@@ -38,13 +38,7 @@ func NewAPIDataExposureScanner(db *database.DB, cfg *config.Config, log *logger.
 	return &APIDataExposureScanner{db: db, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var apiDataExposureClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var apiDataExposureClient = ScannerClient(15 * time.Second)
 
 type apiDataEndpoint struct {
 	URL          string

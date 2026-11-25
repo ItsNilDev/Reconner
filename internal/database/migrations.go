@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 func isDuplicateColumnError(err error) bool {
@@ -209,6 +211,8 @@ func RunMigrations(db *DB) error {
 		alterTelegramChatsAddNotifyProgramScope,
 		alterTelegramChatsAddNotifyHTTPStatus,
 		createHTTPObservationBaselinesTable,
+		createTargetExclusionsTable,
+		createTargetExclusionsTargetIndex,
 	}
 
 	for i, m := range migrations {
@@ -239,6 +243,9 @@ func RunMigrations(db *DB) error {
 	}
 	if err := normalizeHTTPServiceURLs(db); err != nil {
 		return fmt.Errorf("HTTP service URL normalization failed: %w", err)
+	}
+	if err := migrateTargetExclusions(db); err != nil {
+		return fmt.Errorf("target exclusions migration failed: %w", err)
 	}
 
 	return nil
@@ -318,18 +325,45 @@ func migrateTaskPhases(db *DB) error {
 			(task.status == "finished" || task.status == "failed" || task.status == "cancelled") {
 			continue
 		}
-		var existingPhases int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_phases WHERE task_id=?`, task.id).Scan(&existingPhases); err != nil {
+		executable := make([]string, 0, len(task.modules))
+		for _, module := range task.modules {
+			if !taskPhaseOption(module) {
+				executable = append(executable, module)
+			}
+		}
+		phaseRows, err := tx.Query(`SELECT module FROM task_phases WHERE task_id=?`, task.id)
+		if err != nil {
 			return err
 		}
-		if existingPhases > 0 && len(task.completed) >= len(task.modules) {
-			continue
+		existingModules := make(map[string]int)
+		existingPhases := 0
+		for phaseRows.Next() {
+			var mod string
+			if err := phaseRows.Scan(&mod); err != nil {
+				phaseRows.Close()
+				return err
+			}
+			existingModules[mod]++
+			existingPhases++
 		}
-		phaseIndex := 0
-		for _, module := range task.modules {
-			if taskPhaseOption(module) {
+		if err := phaseRows.Err(); err != nil {
+			phaseRows.Close()
+			return err
+		}
+		phaseRows.Close()
+		if existingPhases > 0 {
+			matched := 0
+			for _, module := range executable {
+				if existingModules[module] > 0 {
+					existingModules[module]--
+					matched++
+				}
+			}
+			if matched == len(executable) {
 				continue
 			}
+		}
+		for phaseIndex, module := range executable {
 			status, reason := legacyTaskPhaseOutcome(task, module)
 			attemptCount := 0
 			if status != "pending" {
@@ -340,10 +374,10 @@ func migrateTaskPhases(db *DB) error {
 				task.id, phaseIndex, module, status, reason, attemptCount, status); err != nil {
 				return err
 			}
-			phaseIndex++
 		}
+		total := len(executable)
 		if _, err := tx.Exec(`UPDATE tasks SET total=?,progress=CASE WHEN status='finished' THEN ? ELSE MIN(progress,?) END WHERE id=?`,
-			phaseIndex, phaseIndex, phaseIndex, task.id); err != nil {
+			total, total, total, task.id); err != nil {
 			return err
 		}
 	}
@@ -384,41 +418,73 @@ func legacyUnsupportedPhase(module string) bool {
 	}
 }
 
+func normalizeBareServiceURL(raw string) (string, bool) {
+	schemeSep := strings.Index(raw, "://")
+	if schemeSep < 0 {
+		return "", false
+	}
+	rest := raw[schemeSep+3:]
+	if rest == "" {
+		return "", false
+	}
+	delimIdx := strings.IndexAny(rest, "/?#")
+	if delimIdx == -1 {
+		return raw + "/", true
+	}
+	if rest[delimIdx] == '/' || delimIdx == 0 {
+		return "", false
+	}
+	pos := schemeSep + 3 + delimIdx
+	return raw[:pos] + "/" + raw[pos:], true
+}
+
 // normalizeHTTPServiceURLs upgrades legacy bare scheme://host rows to the
 // canonical trailing-slash form. A duplicate is resolved once by keeping the
 // row with a valid status and the newest last_seen value.
 func normalizeHTTPServiceURLs(db *DB) error {
-	rows, err := db.Query(`SELECT id, url FROM http_services WHERE url NOT LIKE '%://%/%'`)
+	rows, err := db.Query(`SELECT id, target_id, url FROM http_services WHERE url NOT LIKE '%://%/%' OR url LIKE '%://%?%' OR url LIKE '%://%#%'`)
 	if err != nil {
 		return err
 	}
-	type legacyURL struct{ id, raw string }
+	type legacyURL struct {
+		id, targetID, normalized string
+	}
 	var list []legacyURL
 	for rows.Next() {
-		var u legacyURL
-		if err := rows.Scan(&u.id, &u.raw); err != nil {
+		var id, targetID, raw string
+		if err := rows.Scan(&id, &targetID, &raw); err != nil {
 			rows.Close()
 			return err
 		}
-		list = append(list, u)
+		normalized, ok := normalizeBareServiceURL(raw)
+		if !ok {
+			continue
+		}
+		list = append(list, legacyURL{id: id, targetID: targetID, normalized: normalized})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return err
 	}
 	rows.Close()
+	if len(list) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	for _, u := range list {
-		if !strings.Contains(u.raw, "://") || strings.HasSuffix(u.raw, "/") {
-			continue
-		}
-		normalized := u.raw + "/"
 		var existingID string
 		var existingCode int
 		var existingSeen string
-		err := db.QueryRow(`SELECT id, status_code, COALESCE(last_seen,'') FROM http_services
-			WHERE url=? LIMIT 1`, normalized).Scan(&existingID, &existingCode, &existingSeen)
+		err := tx.QueryRow(`SELECT id, status_code, COALESCE(last_seen,'') FROM http_services
+			WHERE target_id=? AND url=? LIMIT 1`, u.targetID, u.normalized).Scan(&existingID, &existingCode, &existingSeen)
 		if err == sql.ErrNoRows {
-			if _, err := db.Exec(`UPDATE http_services SET url=? WHERE id=?`, normalized, u.id); err != nil {
+			if _, err := tx.Exec(`UPDATE http_services SET url=? WHERE id=?`, u.normalized, u.id); err != nil {
 				return err
 			}
 			continue
@@ -428,12 +494,15 @@ func normalizeHTTPServiceURLs(db *DB) error {
 		}
 		var oldCode int
 		var oldSeen string
-		if err := db.QueryRow(`SELECT status_code, COALESCE(last_seen,'') FROM http_services WHERE id=?`, u.id).Scan(&oldCode, &oldSeen); err != nil {
+		if err := tx.QueryRow(`SELECT status_code, COALESCE(last_seen,'') FROM http_services WHERE id=?`, u.id).Scan(&oldCode, &oldSeen); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
 			return err
 		}
 		existingValid := existingCode >= 100 && existingCode <= 599
 		oldValid := oldCode >= 100 && oldCode <= 599
-		keepExisting := existingValid
+		keepExisting := true
 		if oldValid && !existingValid {
 			keepExisting = false
 		} else if oldSeen > existingSeen && (!existingValid || oldValid) {
@@ -441,19 +510,19 @@ func normalizeHTTPServiceURLs(db *DB) error {
 			keepExisting = false
 		}
 		if keepExisting {
-			if _, err := db.Exec(`DELETE FROM http_services WHERE id=?`, u.id); err != nil {
+			if _, err := tx.Exec(`DELETE FROM http_services WHERE id=?`, u.id); err != nil {
 				return err
 			}
 		} else {
-			if _, err := db.Exec(`DELETE FROM http_services WHERE id=?`, existingID); err != nil {
+			if _, err := tx.Exec(`DELETE FROM http_services WHERE id=?`, existingID); err != nil {
 				return err
 			}
-			if _, err := db.Exec(`UPDATE http_services SET url=? WHERE id=?`, normalized, u.id); err != nil {
+			if _, err := tx.Exec(`UPDATE http_services SET url=? WHERE id=?`, u.normalized, u.id); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func taskPhaseOption(module string) bool {
@@ -2223,3 +2292,103 @@ CREATE TABLE IF NOT EXISTS http_observation_baselines (
 	detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (target_id, service_url, observation_type)
 );`
+
+// target_exclusions stores typed per-target out-of-scope rules, separating
+// operator-entered ('manual') patterns from catalog-synced ('bounty') ones.
+const createTargetExclusionsTable = `
+CREATE TABLE IF NOT EXISTS target_exclusions (
+	id TEXT PRIMARY KEY,
+	target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+	source TEXT NOT NULL CHECK(source IN ('manual','bounty')),
+	program_id TEXT NOT NULL DEFAULT '',
+	pattern TEXT NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(target_id, source, program_id, pattern)
+);`
+
+const createTargetExclusionsTargetIndex = `
+CREATE INDEX IF NOT EXISTS idx_target_exclusions_target ON target_exclusions(target_id);`
+
+// migrateTargetExclusions performs a one-time backfill from legacy
+// targets.exclude_scope text into typed target_exclusions rows, then clears
+// targets.exclude_scope so deleted exclusions are never resurrected on restart.
+func migrateTargetExclusions(db *DB) error {
+	rows, err := db.Query(`SELECT id, COALESCE(exclude_scope,'') FROM targets WHERE COALESCE(TRIM(exclude_scope),'') <> ''`)
+	if err != nil {
+		return err
+	}
+	type legacyTargetExclusion struct {
+		targetID string
+		raw      string
+	}
+	var legacy []legacyTargetExclusion
+	for rows.Next() {
+		var item legacyTargetExclusion
+		if err := rows.Scan(&item.targetID, &item.raw); err != nil {
+			rows.Close()
+			return err
+		}
+		legacy = append(legacy, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(legacy) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, item := range legacy {
+		lines := strings.FieldsFunc(item.raw, func(r rune) bool {
+			return r == '\r' || r == '\n'
+		})
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "#bounty:") {
+				parts := strings.SplitN(line, "|", 2)
+				if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+					programID := strings.TrimSpace(strings.TrimPrefix(parts[0], "#bounty:"))
+					pattern := strings.TrimSpace(parts[1])
+					if _, err := tx.Exec(
+						`INSERT OR IGNORE INTO target_exclusions (id, target_id, source, program_id, pattern) VALUES (?, ?, 'bounty', ?, ?)`,
+						uuid.NewString(), item.targetID, programID, pattern,
+					); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			tokens := strings.FieldsFunc(line, func(r rune) bool {
+				return r == ',' || r == ' ' || r == '\t' || r == ';'
+			})
+			for _, tok := range tokens {
+				tok = strings.TrimSpace(tok)
+				if tok == "" {
+					continue
+				}
+				if _, err := tx.Exec(
+					`INSERT OR IGNORE INTO target_exclusions (id, target_id, source, program_id, pattern) VALUES (?, ?, 'manual', '', ?)`,
+					uuid.NewString(), item.targetID, tok,
+				); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.Exec(`UPDATE targets SET exclude_scope = '' WHERE id = ?`, item.targetID); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}

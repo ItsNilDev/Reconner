@@ -234,7 +234,7 @@ export const TopBar = () => {
 
             {open && (
               <div className="fixed sm:absolute left-3 right-3 sm:left-auto sm:right-0 top-16 sm:top-auto sm:mt-2 sm:w-80 max-h-[70dvh] overflow-hidden flex flex-col rounded-xl border border-border bg-surface-2 shadow-2xl z-[110]">
-                <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-border">
+                <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-border shrink-0">
                   <span className="text-sm font-semibold">Notifications</span>
                   <div className="flex items-center gap-2">
                     <select value={bucket} onChange={e => setBucket(e.target.value as typeof bucket)}
@@ -245,12 +245,12 @@ export const TopBar = () => {
                       <option value="watch">Watch</option>
                       <option value="findings">Findings</option>
                     </select>
-                    {items.some(n => !n.is_read) && (
+                    {(items.some(n => !n.is_read) || (bucket === 'all' && unread > 0)) && (
                       <button onClick={markAllRead} className="text-[11px] text-accent hover:underline">Mark all read</button>
                     )}
                   </div>
                 </div>
-                <div className="overflow-y-auto">
+                <div className="flex-1 min-h-0 overflow-y-auto">
                   {updateVisible && updateInfo && (
                     <button onClick={() => { setOpen(false); showUpdateDetails() }}
                       className="w-full text-left px-4 py-3 border-b border-accent/20 bg-accent/[.06] hover:bg-accent/[.10] transition-colors flex gap-2.5">
@@ -276,8 +276,10 @@ export const TopBar = () => {
                       </span>
                     </button>
                   ))}
+                </div>
+                <div className="shrink-0 border-t border-border bg-surface-2">
                   <Link to="/changes" onClick={() => setOpen(false)}
-                    className="block px-4 py-2.5 text-center text-[11px] text-accent hover:bg-white/[.04] border-t border-border">
+                    className="block px-4 py-2.5 text-center text-[11px] text-accent hover:bg-white/[.04]">
                     View all changes →
                   </Link>
                 </div>

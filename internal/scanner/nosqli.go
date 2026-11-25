@@ -45,7 +45,7 @@ func NewNoSQLiScanner(db *database.DB, exec *tools.Executor, cfg *config.Config,
 	return &NoSQLiScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var nosqliClient = newPooledClient(12*time.Second, false)
+var nosqliClient = ScannerClient(12 * time.Second)
 
 // MongoDB / NoSQL driver error signatures (specific enough to avoid FPs).
 var nosqlErrorSignatures = []string{

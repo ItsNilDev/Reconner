@@ -53,14 +53,14 @@ type WatchRound struct {
 // order in the frontend.
 func changeCategoryExpr(col string) string {
 	return `CASE
-		WHEN ` + col + ` IN ('status_change','http_change','redirect_change','page_change') THEN 'http'
+		WHEN ` + col + ` IN ('status_change','http_change','redirect_change','page_change','content_change') THEN 'http'
 		WHEN ` + col + ` IN ('js_change','css_change')
 		     OR ` + col + ` LIKE 'security:script_%'
 		     OR ` + col + ` LIKE 'security:stylesheet_%' THEN 'scripts'
 		WHEN ` + col + ` LIKE '%header%' THEN 'headers'
 		WHEN ` + col + ` LIKE 'security:%' THEN 'security'
 		WHEN ` + col + ` = 'tech_change' THEN 'tech'
-		WHEN ` + col + ` IN ('new_subdomain','new_host','scope_proposed','scope_landed','scope_modified','scope_removed','scope_rejected','scope_rule_added','scope_rule_removed','scope_re_eligible') THEN 'assets'
+		WHEN ` + col + ` IN ('new_subdomain','new_host','scope_proposed','scope_landed','scope_modified','scope_removed','scope_rejected','scope_rule_added','scope_rule_removed','scope_re_eligible','out_of_scope') THEN 'assets'
 		WHEN ` + col + ` IN ('watch_failed','watch_kind_conflict','monitor_failed','monitor_escalation_started','scan_auto_paused','bounty_scope_change') THEN 'alerts'
 		ELSE 'http' END`
 }
@@ -96,14 +96,18 @@ func parseChangesSince(raw string) string {
 	return raw
 }
 
-// changesFeedQuery builds the four-source UNION and the shared WHERE clause.
-// ownerArgs are the owner-scope placeholders inside the UNION; filterArgs are
-// the placeholders in the WHERE clause. Read state is joined by the caller so
-// count queries stay cheap.
+// changesFeedQuery builds the five-source UNION and the shared WHERE clause.
+// ownerArgs are the owner- and target-scope placeholders inside the UNION;
+// filterArgs are the placeholders in the WHERE clause. Read state is joined
+// by the caller so count queries stay cheap.
 func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inner, whereSQL string, ownerArgs, filterArgs []any) {
 	q := r.URL.Query()
 	uid, isAdmin := h.callerScope(r)
-	args := make([]any, 0, 8)
+	targetID := forcedTargetID
+	if targetID == "" {
+		targetID = q.Get("target_id")
+	}
+	args := make([]any, 0, 10)
 	sourceMonitor := `SELECT mc.id, 'monitor' AS source, mc.target_id, COALESCE(t.domain,'') AS target_name, '' AS task_id,
 		COALESCE(mc.url,'') AS url, mc.change_type, ` + changeCategoryExpr("mc.change_type") + ` AS category,
 		COALESCE(mc.severity,'info') AS severity, COALESCE(mc.old_value,'') AS old_value,
@@ -115,6 +119,10 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	if !isAdmin {
 		sourceMonitor += ` AND t.owner_id=?`
 		args = append(args, uid)
+	}
+	if targetID != "" {
+		sourceMonitor += ` AND mc.target_id=?`
+		args = append(args, targetID)
 	}
 
 	sourceWatch := `SELECT wc.id, 'watch' AS source, wc.target_id, COALESCE(t.domain,'') AS target_name,
@@ -130,6 +138,10 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	if !isAdmin {
 		sourceWatch += ` AND t.owner_id=?`
 		args = append(args, uid)
+	}
+	if targetID != "" {
+		sourceWatch += ` AND wc.target_id=?`
+		args = append(args, targetID)
 	}
 
 	// Event type and decision state are separate facts. A pending addition is
@@ -153,6 +165,10 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		sourceScope += ` AND t.owner_id=?`
 		args = append(args, uid)
 	}
+	if targetID != "" {
+		sourceScope += ` AND se.target_id=?`
+		args = append(args, targetID)
+	}
 
 	// Watch scope landings are a distinct origin. They keep their recorded
 	// event type (landed, re_eligible, or out_of_scope); current eligibility is
@@ -174,6 +190,10 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		sourceWatchScope += ` AND t.owner_id=?`
 		args = append(args, uid)
 	}
+	if targetID != "" {
+		sourceWatchScope += ` AND we.target_id=?`
+		args = append(args, targetID)
+	}
 
 	sourceNotification := `SELECT n.id, 'notification' AS source, COALESCE(n.target_id,'') AS target_id,
 		COALESCE(t.domain,'') AS target_name, '' AS task_id,
@@ -184,11 +204,16 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		'' AS program_id, '' AS program_asset_id, '' AS scope_status, '' AS resolved_at, 0 AS old_status, 0 AS new_status
 		FROM notifications n LEFT JOIN targets t ON t.id=n.target_id
 		WHERE COALESCE(n.type,'') IN ('watch_failed','watch_kind_conflict','monitor_failed',
-			'monitor_escalation_started','scan_auto_paused','bounty_scope_change','new_host')`
+			'monitor_escalation_started','scan_auto_paused','bounty_scope_change','new_host')
+		  AND COALESCE(json_extract(CASE WHEN n.metadata IS NULL OR n.metadata='' THEN '{}' ELSE n.metadata END,'$.source'),'') <> 'watch'`
 	if !isAdmin {
 		// Keep target-less notices visible, as the bell does.
 		sourceNotification += ` AND (COALESCE(n.target_id,'')='' OR t.owner_id=?)`
 		args = append(args, uid)
+	}
+	if targetID != "" {
+		sourceNotification += ` AND n.target_id=?`
+		args = append(args, targetID)
 	}
 
 	unionSQL := `( ` + sourceMonitor + ` UNION ALL ` + sourceWatch + ` UNION ALL ` +
@@ -204,8 +229,8 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	// a value like "status=2000x" from parsing as 200.
 	inner = `(
 		SELECT u.*,
-			` + changesStatusCodeExpr("u.change_type", "u.source", "u.old_value") + ` AS status_old,
-			` + changesStatusCodeExpr("u.change_type", "u.source", "u.new_value") + ` AS status_new
+			` + changesStatusCodeExpr("u.change_type", "u.source", "u.old_status", "u.old_value") + ` AS status_old,
+			` + changesStatusCodeExpr("u.change_type", "u.source", "u.new_status", "u.new_value") + ` AS status_new
 		FROM ` + unionSQL + ` u
 	) x`
 
@@ -216,19 +241,11 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	// Apply it before COUNT and LIMIT so pagination and Mark all read cannot
 	// hide behind a page of routine monitor diffs (A11).
 	if q.Get("default_view") == "1" {
-		filters = append(filters, `((x.source='watch' AND x.change_type IN ('new_subdomain','status_change')) OR x.source IN ('bounty','watch_scope') OR (x.source='notification' AND x.change_type='new_host')) OR (x.source='monitor' AND x.change_type IN ('http_change','status_change')))`)
+		filters = append(filters, `((x.source='watch' AND x.change_type='new_subdomain') OR (x.source IN ('watch','monitor') AND x.change_type IN ('status_change','http_change','page_change') AND x.status_old BETWEEN 100 AND 599 AND x.status_new BETWEEN 100 AND 599 AND x.status_old <> x.status_new) OR x.source IN ('bounty','watch_scope') OR (x.source='notification' AND x.change_type='new_host'))`)
 	}
 	if eventID := q.Get("event_id"); eventID != "" {
 		filters = append(filters, `x.id=?`)
 		filterArgs = append(filterArgs, eventID)
-	}
-	targetID := forcedTargetID
-	if targetID == "" {
-		targetID = q.Get("target_id")
-	}
-	if targetID != "" {
-		filters = append(filters, `x.target_id=?`)
-		filterArgs = append(filterArgs, targetID)
 	}
 
 	// category accepts a comma list. "all" is dropped; all,http means http.
@@ -375,12 +392,13 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 // token in its body, so parsing it would duplicate the real change. Other
 // free-text rows (alerts, scope events) are already outside the type list.
 // No metadata/JSON path is needed.
-func changesStatusCodeExpr(typeCol, sourceCol, col string) string {
-	return `CASE WHEN ` + typeCol + ` IN ('status_change','http_change','page_change')
-		AND ` + sourceCol + ` <> 'notification'
-		AND instr(` + col + `,'status=') > 0
-		AND substr(` + col + `, instr(` + col + `,'status=')+10, 1) = ' '
-		THEN CAST(substr(` + col + `, instr(` + col + `,'status=')+7, 3) AS INTEGER)
+func changesStatusCodeExpr(typeCol, sourceCol, numCol, textCol string) string {
+	return `CASE WHEN ` + sourceCol + ` = 'notification' THEN 0
+		WHEN ` + numCol + ` BETWEEN 100 AND 599 THEN ` + numCol + `
+		WHEN ` + typeCol + ` IN ('status_change','http_change','page_change')
+			AND instr(` + textCol + `,'status=') > 0
+			AND substr(` + textCol + `, instr(` + textCol + `,'status=')+10, 1) = ' '
+		THEN CAST(substr(` + textCol + `, instr(` + textCol + `,'status=')+7, 3) AS INTEGER)
 		ELSE 0 END`
 }
 
@@ -508,10 +526,16 @@ func (h *Handler) handleSetChangesSeen(w http.ResponseWriter, r *http.Request) {
 		// A feed row sourced from a notification is the same event the bell
 		// shows. Mirror the read state so the two surfaces agree (B5).
 		if body.Seen {
-			_, _ = tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
-				SELECT id,?,CURRENT_TIMESTAMP FROM notifications WHERE id=?`, uid, id)
+			if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
+				SELECT id,?,CURRENT_TIMESTAMP FROM notifications WHERE id=? OR change_id=?`, uid, id, id); err != nil {
+				h.writeError(w, http.StatusInternalServerError, "update failed")
+				return
+			}
 		} else {
-			_, _ = tx.ExecContext(r.Context(), `DELETE FROM notification_reads WHERE notification_id=? AND user_id=?`, id, uid)
+			if _, err := tx.ExecContext(r.Context(), `DELETE FROM notification_reads WHERE user_id=? AND notification_id IN (SELECT id FROM notifications WHERE id=? OR change_id=?)`, uid, id, id); err != nil {
+				h.writeError(w, http.StatusInternalServerError, "update failed")
+				return
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -527,25 +551,40 @@ func (h *Handler) handleSetChangesSeen(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleMarkAllChangesSeen(w http.ResponseWriter, r *http.Request) {
 	uid, _ := h.callerScope(r)
 	inner, whereSQL, ownerArgs, filterArgs := h.changesFeedQuery(r, "")
-	queryArgs := append([]any{uid}, ownerArgs...)
-	queryArgs = append(queryArgs, filterArgs...)
+	feedArgs := append(append([]any{}, ownerArgs...), filterArgs...)
+	queryArgs := append([]any{uid}, feedArgs...)
 
-	res, err := h.db.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "transaction failed")
+		return
+	}
+	defer tx.Rollback()
+
+	// Mirror matching changes into the bell's read table before inserting into
+	// change_seen so active hide_seen=1 filters still match the same rows (B5).
+	mirrorArgs := make([]any, 0, 1+2*len(feedArgs))
+	mirrorArgs = append(mirrorArgs, uid)
+	mirrorArgs = append(mirrorArgs, feedArgs...)
+	mirrorArgs = append(mirrorArgs, feedArgs...)
+	if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
+		SELECT n.id, ?, CURRENT_TIMESTAMP FROM notifications n
+		WHERE n.id IN (SELECT x.id FROM `+inner+whereSQL+`)
+		   OR (COALESCE(n.change_id,'') <> '' AND n.change_id IN (SELECT x.id FROM `+inner+whereSQL+`))`, mirrorArgs...); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+
+	res, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
 		SELECT x.id, ?, CURRENT_TIMESTAMP FROM `+inner+whereSQL, queryArgs...)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "update failed")
 		return
 	}
-	// Mirror notification-sourced rows into the bell's read table so marking a
-	// change read in one surface does not leave the other unread (B5).
-	mirrorWhere := whereSQL
-	if mirrorWhere == "" {
-		mirrorWhere = " WHERE x.source='notification'"
-	} else {
-		mirrorWhere += " AND x.source='notification'"
+	if err := tx.Commit(); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "commit failed")
+		return
 	}
-	_, _ = h.db.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
-		SELECT x.id, ?, CURRENT_TIMESTAMP FROM `+inner+mirrorWhere, queryArgs...)
 	updated, _ := res.RowsAffected()
 	h.writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
 }

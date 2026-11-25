@@ -145,3 +145,66 @@ func TestUnpauseRestartsWatchRound(t *testing.T) {
 		t.Fatalf("unpause state paused=%d fails=%d nextNull=%d", paused, fails, nextNull)
 	}
 }
+
+func TestAlreadyDeepNoOpPreservesMonitorEnabled(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,monitor_enabled,watch_paused,watch_next_run)
+		VALUES ('ad-t','example.test',0,1,1,'2026-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO assets(id,target_id,value,asset_type,monitor_enabled)
+		VALUES ('ad-a','ad-t','a.example.test','domain',1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := coverageRequest(h, "ad-t", adminID, map[string]any{"watch_only": false, "kind": "web"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var watchOnly, monitor, paused, nextNull, assetMonitor int
+	if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(monitor_enabled,-1), COALESCE(watch_paused,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='ad-t'`).
+		Scan(&watchOnly, &monitor, &paused, &nextNull); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.QueryRow(`SELECT COALESCE(monitor_enabled,-1) FROM assets WHERE id='ad-a'`).Scan(&assetMonitor); err != nil {
+		t.Fatal(err)
+	}
+	if watchOnly != 0 || monitor != 1 || paused != 0 || nextNull != 1 || assetMonitor != 1 {
+		t.Fatalf("already-deep state watch=%d monitor=%d paused=%d nextNull=%d assetMonitor=%d, want 0/1/0/1/1",
+			watchOnly, monitor, paused, nextNull, assetMonitor)
+	}
+}
+
+func TestPromoteWatchScopeEmptyMetadataOnDeepMonitoredTarget(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,monitor_enabled) VALUES ('pm-t','example.test',0,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO assets(id,target_id,name,value,approval_status,asset_type,source,monitor_enabled,metadata)
+		VALUES ('pm-a','pm-t','','app.example.test','approved','subdomain','watch:scope',0,'')`); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := promoteRequest(h, "pm-t", adminID, "app.example.test")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var typ, metadata string
+	var monitor int
+	if err := h.db.QueryRow(`SELECT asset_type, COALESCE(monitor_enabled,-1), COALESCE(metadata,'') FROM assets WHERE id='pm-a'`).
+		Scan(&typ, &monitor, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "url" || monitor != 1 {
+		t.Fatalf("promoted asset_type=%q monitor_enabled=%d, want url and 1", typ, monitor)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
+		t.Fatalf("metadata %q invalid JSON: %v", metadata, err)
+	}
+	if meta["promoted_to_deep"] != float64(1) || meta["out_of_scope"] != float64(0) {
+		t.Fatalf("metadata=%s, want promoted_to_deep=1 and out_of_scope=0", metadata)
+	}
+}

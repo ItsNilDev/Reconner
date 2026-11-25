@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -40,28 +39,6 @@ type watchHTTPSnapshot struct {
 	RedirectURL  string
 }
 
-func snapshotWatchHTTP(ctx context.Context, db *database.DB, targetID string) (map[string]watchHTTPSnapshot, error) {
-	rows, err := db.QueryContext(ctx, `SELECT COALESCE(url,''), COALESCE(status_code,0),
-		COALESCE(title,''), COALESCE(server,''), COALESCE(technologies,'[]'), COALESCE(redirect_url,'')
-		FROM http_services WHERE target_id=? ORDER BY url LIMIT 5000`, targetID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make(map[string]watchHTTPSnapshot)
-	for rows.Next() {
-		var h watchHTTPSnapshot
-		var technologies string
-		if err := rows.Scan(&h.URL, &h.StatusCode, &h.Title, &h.Server, &technologies, &h.RedirectURL); err != nil {
-			return nil, err
-		}
-		h.Technologies = joinWatchTechnologies(technologies)
-		out[h.URL] = h
-	}
-	return out, rows.Err()
-}
-
 func joinWatchTechnologies(raw string) string {
 	var list []string
 	if err := json.Unmarshal([]byte(raw), &list); err == nil {
@@ -69,77 +46,6 @@ func joinWatchTechnologies(raw string) string {
 		return strings.Join(list, ", ")
 	}
 	return strings.Trim(raw, "[]\"")
-}
-
-func watchStatusSeverity(oldCode, newCode int) string {
-	old2xx := oldCode >= 200 && oldCode < 300
-	new2xx := newCode >= 200 && newCode < 300
-	if old2xx != new2xx {
-		return "medium"
-	}
-	if (oldCode >= 300 && oldCode < 400) && newCode >= 500 {
-		return "medium"
-	}
-	return "low"
-}
-
-func watchURLHost(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err == nil && parsed.Hostname() != "" {
-		return strings.ToLower(parsed.Hostname())
-	}
-	trimmed := raw
-	if i := strings.Index(trimmed, "://"); i >= 0 {
-		trimmed = trimmed[i+3:]
-	}
-	if i := strings.IndexAny(trimmed, "/:@?"); i >= 0 {
-		trimmed = trimmed[:i]
-	}
-	return strings.ToLower(trimmed)
-}
-
-// diffWatchHTTP now produces only detail-tier changes. New and removed HTTP
-// services are state: the host emitter owns the one new_subdomain event for a
-// newly online host, and removal is inferred from liveness state.
-func diffWatchHTTP(before, after map[string]watchHTTPSnapshot, _ bool, _ bool) []watchChange {
-	changes := make([]watchChange, 0)
-	for raw, cur := range after {
-		old, existed := before[raw]
-		if !existed {
-			continue
-		}
-		if old.StatusCode != cur.StatusCode {
-			changes = append(changes, watchChange{
-				URL: raw, ChangeType: "status_change",
-				OldValue:  fmt.Sprintf("status=%d title=%s", old.StatusCode, old.Title),
-				NewValue:  fmt.Sprintf("status=%d title=%s", cur.StatusCode, cur.Title),
-				Severity:  watchStatusSeverity(old.StatusCode, cur.StatusCode),
-				Metadata:  fmt.Sprintf(`{"old_code":%d,"new_code":%d}`, old.StatusCode, cur.StatusCode),
-				OldStatus: old.StatusCode, NewStatus: cur.StatusCode,
-			})
-		}
-		if old.Title != cur.Title {
-			changes = append(changes, watchChange{
-				URL: raw, ChangeType: "page_change", OldValue: old.Title,
-				NewValue: cur.Title, Severity: "low", Metadata: "{}",
-			})
-		}
-		if old.Server != cur.Server || old.Technologies != cur.Technologies {
-			changes = append(changes, watchChange{
-				URL: raw, ChangeType: "tech_change",
-				OldValue: fmt.Sprintf("Server: %s | Tech: %s", old.Server, old.Technologies),
-				NewValue: fmt.Sprintf("Server: %s | Tech: %s", cur.Server, cur.Technologies),
-				Severity: "low", Metadata: "{}",
-			})
-		}
-		if old.RedirectURL != cur.RedirectURL {
-			changes = append(changes, watchChange{
-				URL: raw, ChangeType: "redirect_change", OldValue: old.RedirectURL,
-				NewValue: cur.RedirectURL, Severity: "low", Metadata: "{}",
-			})
-		}
-	}
-	return changes
 }
 
 type watchHostCandidate struct {
@@ -160,12 +66,23 @@ type watchHostCandidate struct {
 // The first finished watch round is a baseline and announces nothing.
 func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID string) []watchChange {
 	finished := 0
-	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks
 		WHERE target_id=? AND type=? AND status='finished' AND id<>?`,
-		targetID, watchScanType, taskID).Scan(&finished)
-	if finished == 0 {
-		s.baselineWatchHosts(ctx, targetID)
+		targetID, watchScanType, taskID).Scan(&finished); err != nil {
+		s.logger.Warn("watch new-host: baseline check failed", "error", err)
 		return nil
+	}
+	if finished == 0 {
+		announcedPrior := 0
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM watch_hosts
+			WHERE target_id=? AND announced_at IS NOT NULL`, targetID).Scan(&announcedPrior); err != nil {
+			s.logger.Warn("watch new-host: prior baseline check failed", "error", err)
+			return nil
+		}
+		if announcedPrior == 0 {
+			s.baselineWatchHosts(ctx, targetID)
+			return nil
+		}
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
@@ -187,12 +104,19 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	for rows.Next() {
 		var c rawCandidate
 		var alive int
-		if err := rows.Scan(&c.host, &c.firstSeen, &c.firstAlive, &c.programID, &c.assetID, &alive); err == nil {
-			c.alive = alive == 1
-			raw = append(raw, c)
+		if err := rows.Scan(&c.host, &c.firstSeen, &c.firstAlive, &c.programID, &c.assetID, &alive); err != nil {
+			_ = rows.Close()
+			s.logger.Warn("watch new-host: candidate scan failed", "error", err)
+			return nil
 		}
+		c.alive = alive == 1
+		raw = append(raw, c)
 	}
-	rows.Close()
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		s.logger.Warn("watch new-host: candidate rows error", "error", err)
+		return nil
+	}
 
 	// Manual breadth projects use the project's effective scope. Linked
 	// projects add program eligibility as a separate requirement. A scope read
@@ -200,6 +124,15 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	state, scopeErr := s.loadTaskScopeState(ctx, targetID)
 	if scopeErr != nil {
 		s.logger.Warn("watch new-host: scope could not be read", "error", scopeErr)
+		return nil
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	svcByHost, svcErr := batchWatchHTTPServices(ctx, s.db, targetID)
+	if svcErr != nil {
+		s.logger.Warn("watch new-host: http services query failed", "error", svcErr)
+		return nil
 	}
 
 	candidates := make([]watchHostCandidate, 0, len(raw))
@@ -211,23 +144,22 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 		// a new host and never label it in or out of scope.
 		if scanner.IsWildcardScopePattern(c.host) {
 			// Close the bad row so it cannot stay pending every round.
-			_, _ = s.db.ExecContext(ctx, `UPDATE watch_hosts SET announced_at=CURRENT_TIMESTAMP
-				WHERE target_id=? AND host=?`, targetID, c.host)
+			if _, err := s.db.ExecContext(ctx, `UPDATE watch_hosts SET announced_at=CURRENT_TIMESTAMP
+				WHERE target_id=? AND host=?`, targetID, c.host); err != nil {
+				s.logger.Warn("watch new-host: wildcard marker failed", "host", c.host, "error", err)
+			}
 			continue
 		}
 		inScope, programID, assetID := false, c.programID, c.assetID
-		switch {
-		case scopeErr != nil:
-			inScope = false
-		case state.linked:
-			inScope, programID, assetID = scanner.IsWatchScopeHostEligible(ctx, s.db, targetID, c.host)
+		if state.linked {
+			inScope, programID, assetID = scanner.MatchWatchEligibleHost(ctx, state.entries, state.exclusions, c.host)
 			if !inScope {
 				programID, assetID = c.programID, c.assetID
 			}
-		default:
+		} else {
 			inScope = state.allowsProjectHost(ctx, c.host)
 		}
-		svc := watchHTTPServiceForHost(ctx, s.db, targetID, c.host)
+		svc := svcByHost[normalizeWatchedHost(c.host)]
 		candidates = append(candidates, watchHostCandidate{
 			Host: c.host, FirstSeenAt: c.firstSeen, FirstAliveAt: c.firstAlive,
 			InScope: inScope, ProgramID: programID, AssetID: assetID,
@@ -240,6 +172,9 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].InScope != candidates[j].InScope {
+			return candidates[i].InScope
+		}
 		if candidates[i].Score != candidates[j].Score {
 			return candidates[i].Score > candidates[j].Score
 		}
@@ -258,6 +193,8 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 			members[c.Fingerprint] = append(members[c.Fingerprint], map[string]any{"host": c.Host, "in_scope": c.InScope})
 			if !groups[idx].InScope && c.InScope {
 				groups[idx].InScope = true
+				groups[idx].Host = c.Host
+				groups[idx].Service = c.Service
 				groups[idx].ProgramID = c.ProgramID
 				groups[idx].AssetID = c.AssetID
 			}
@@ -353,10 +290,24 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 		}
 	}
 	_ = stmt.Close()
-	if _, err := tx.ExecContext(ctx, `UPDATE watch_hosts SET announced_at=CURRENT_TIMESTAMP
-		WHERE target_id=? AND announced_at IS NULL AND first_alive_at IS NOT NULL`, targetID); err != nil {
-		s.logger.Warn("watch new-host: marker update failed", "error", err)
-		return nil
+	const hostChunkSize = 500
+	for start := 0; start < len(candidates); start += hostChunkSize {
+		end := start + hostChunkSize
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		chunk := candidates[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, targetID)
+		for _, c := range chunk {
+			args = append(args, c.Host)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE watch_hosts SET announced_at=CURRENT_TIMESTAMP
+			WHERE target_id=? AND announced_at IS NULL AND host IN (`+placeholders+`)`, args...); err != nil {
+			s.logger.Warn("watch new-host: marker update failed", "error", err)
+			return nil
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		s.logger.Warn("watch new-host: commit failed", "error", err)
@@ -367,8 +318,8 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	}
 	// One grouped alert per round. Out-of-scope hosts stay in the audit table
 	// but never reach the bell or Telegram.
-	notifyHosts := make([]string, 0, len(visible))
-	for _, g := range visible {
+	notifyHosts := make([]string, 0, len(candidates))
+	for _, g := range groups {
 		for _, m := range members[g.Fingerprint] {
 			if host, ok := m["host"].(string); ok && !scanner.IsWildcardScopePattern(host) {
 				// Per-member scope wins over the fleet-level flag.
@@ -381,9 +332,37 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	}
 	if len(notifyHosts) > 0 {
 		var domain string
-		_ = s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+		if err := s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil {
+			s.logger.Warn("watch new-host: target domain lookup failed", "target_id", targetID, "error", err)
+		}
 		summary := fmt.Sprintf("%d new host(s) up on %s", len(notifyHosts), domain)
-		s.insertNotification(targetID, "new_host", "New hosts up", summary, "info")
+		previewHosts := notifyHosts
+		if len(previewHosts) > 500 {
+			previewHosts = previewHosts[:500]
+		}
+		metaBytes, err := json.Marshal(map[string]any{
+			"source":  "watch",
+			"hosts":   previewHosts,
+			"total":   len(notifyHosts),
+			"task_id": taskID,
+		})
+		if err != nil {
+			s.logger.Warn("watch new-host: notification metadata marshal failed", "error", err)
+			metaBytes = []byte(`{"source":"watch"}`)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO notifications
+			(id,target_id,type,title,body,url,severity,is_read,metadata)
+			VALUES (?,?,?,?,?,?,?,0,?)`,
+			uuid.New().String(), targetID, "new_host", "New hosts up", summary,
+			"/targets/"+targetID, "info", string(metaBytes)); err != nil {
+			s.logger.Warn("watch new-host: notification insert failed", "target_id", targetID, "error", err)
+		} else if s.hub != nil {
+			s.hub.Broadcast("notification_created", map[string]any{
+				"target_id": targetID,
+				"type":      "new_host",
+				"severity":  "info",
+			})
+		}
 		if s.notifier != nil {
 			s.notifier.NotifyNewHosts("newhost:"+taskID, summary, notifyHosts, targetID)
 		}
@@ -418,6 +397,47 @@ func scanWatchService(scannerRow interface {
 	}
 	h.Technologies = joinWatchTechnologies(tech)
 	return h, nil
+}
+
+// batchWatchHTTPServices loads the best valid HTTP service (status 100–599,
+// preferring https://) for every host of targetID in a single query.
+func batchWatchHTTPServices(ctx context.Context, db *database.DB, targetID string) (map[string]watchHTTPSnapshot, error) {
+	rows, err := db.QueryContext(ctx, `SELECT COALESCE(d.subdomain,''), COALESCE(s.url,''),
+		COALESCE(s.status_code,0), COALESCE(s.title,''), COALESCE(s.server,''),
+		COALESCE(s.technologies,'[]'), COALESCE(s.redirect_url,'')
+		FROM http_services s LEFT JOIN subdomains d ON d.id=s.subdomain_id
+		WHERE s.target_id=? AND COALESCE(s.status_code,0) BETWEEN 100 AND 599
+		ORDER BY CASE WHEN d.id IS NOT NULL THEN 0 ELSE 1 END,
+		         CASE WHEN LOWER(s.url) LIKE 'https://%' THEN 0 ELSE 1 END, s.url`, targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]watchHTTPSnapshot)
+	for rows.Next() {
+		var subdomain, tech string
+		var h watchHTTPSnapshot
+		if err := rows.Scan(&subdomain, &h.URL, &h.StatusCode, &h.Title, &h.Server, &tech, &h.RedirectURL); err != nil {
+			return nil, err
+		}
+		host := normalizeWatchedHost(subdomain)
+		if host == "" {
+			host = normalizeWatchedHost(scanner.URLHost(h.URL))
+		}
+		if host == "" {
+			continue
+		}
+		if _, exists := out[host]; exists {
+			continue
+		}
+		h.Technologies = joinWatchTechnologies(tech)
+		out[host] = h
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // watchHTTPServiceForHost matches a host exactly. A prefix LIKE would let
@@ -506,80 +526,4 @@ func watchFingerprint(svc watchHTTPSnapshot) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d|%s", svc.StatusCode, svc.Title,
 		len(svc.Title), svc.Server)))
 	return hex.EncodeToString(sum[:])
-}
-
-func (s *Scheduler) insertWatchRoundChanges(ctx context.Context, taskID, targetID string, changes []watchChange) {
-	if len(changes) == 0 {
-		return
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		s.logger.Warn("watch changes: begin failed", "error", err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO watch_round_changes
-		(id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,old_status,new_status,detected_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)`)
-	if err != nil {
-		s.logger.Warn("watch changes: prepare failed", "error", err)
-		return
-	}
-	defer func() { _ = stmt.Close() }()
-
-	written := 0
-	// A real status transition is a daily signal. Keep its change id so the
-	// bell row and the Telegram alert share one stable identity.
-	type statusAlert struct {
-		id, rawURL, title string
-		oldCode, newCode  int
-		severity          string
-	}
-	var alerts []statusAlert
-	for _, c := range changes {
-		metadata := c.Metadata
-		if metadata == "" {
-			metadata = "{}"
-		}
-		id := uuid.New().String()
-		if _, err := stmt.ExecContext(ctx, id, targetID, taskID, c.URL,
-			c.ChangeType, c.OldValue, c.NewValue, c.Severity, metadata, c.OldStatus, c.NewStatus); err != nil {
-			s.logger.Warn("watch changes: insert failed", "error", err, "type", c.ChangeType)
-			continue
-		}
-		if c.ChangeType == "status_change" && c.OldStatus > 0 && c.NewStatus > 0 && c.OldStatus != c.NewStatus {
-			alerts = append(alerts, statusAlert{id: id, rawURL: c.URL, title: c.NewValue,
-				oldCode: c.OldStatus, newCode: c.NewStatus, severity: c.Severity})
-		}
-		written++
-	}
-	if err := tx.Commit(); err != nil {
-		s.logger.Warn("watch changes: commit failed", "error", err)
-		return
-	}
-	if written != len(changes) {
-		s.logger.Warn("watch changes: some rows were not written", "written", written, "total", len(changes))
-	}
-	if s.hub != nil {
-		s.hub.Broadcast("changes_written", map[string]any{"target_id": targetID, "count": written})
-	}
-	if len(alerts) == 0 {
-		return
-	}
-	var domain string
-	_ = s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
-	for _, a := range alerts {
-		host := a.rawURL
-		if u, err := url.Parse(a.rawURL); err == nil && u.Hostname() != "" {
-			host = u.Hostname()
-		}
-		s.insertNotification(targetID, "status_change",
-			fmt.Sprintf("HTTP status changed on %s", host),
-			fmt.Sprintf("%d → %d", a.oldCode, a.newCode), a.severity)
-		if s.notifier != nil {
-			s.notifier.NotifyHTTPStatus(targetID, domain, "status_change", a.title, a.rawURL,
-				fmt.Sprintf("HTTP %d", a.oldCode), fmt.Sprintf("HTTP %d", a.newCode), a.id)
-		}
-	}
 }

@@ -38,7 +38,7 @@ func NewOASTScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &OASTScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var oastClient = newPooledClient(12*time.Second, false)
+var oastClient = ScannerClient(12 * time.Second)
 
 func (s *OASTScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	oob, ok := newOOBCapability(s.cfg)

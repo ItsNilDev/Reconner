@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -24,19 +23,7 @@ import (
 // SKIPS the active injection modules on a detected WP/Joomla host (see
 // loadCMSSkipHosts) while keeping nuclei's CMS-aware checks.
 
-var cmsFingerprintClient = &http.Client{
-	Timeout:   10 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return http.ErrUseLastResponse
-		}
-		if !urlHostInScope(req.Context(), req.URL.String()) {
-			return fmt.Errorf("%w: redirect to %s is outside scope", ErrDestinationBlocked, req.URL.Host)
-		}
-		return nil
-	},
-}
+var cmsFingerprintClient = ScannerRedirectClient(10*time.Second, 3, RedirectInScope)
 
 // detectCMS returns "wordpress", "joomla", "drupal", … or "" if none is
 // confidently fingerprinted.

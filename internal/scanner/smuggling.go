@@ -142,20 +142,26 @@ func (s *SmugglingScanner) probeTimesOut(ctx context.Context, scheme, host, host
 // sendRaw opens a raw connection, writes the exact bytes, and measures time to
 // the first response byte. gotResp is false if the read deadline elapsed first.
 func (s *SmugglingScanner) sendRaw(ctx context.Context, scheme, host, hostport, raw string) (time.Duration, bool, error) {
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
-	var conn net.Conn
-	var err error
+	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	rawConn, err := ScopedDialContext(dialCtx, "tcp", hostport)
+	if err != nil {
+		cancel()
+		return 0, false, err
+	}
+	var conn net.Conn = rawConn
 	if scheme == "https" {
-		conn, err = tls.DialWithDialer(dialer, "tcp", hostport, &tls.Config{
+		tlsConn := tls.Client(rawConn, &tls.Config{
 			InsecureSkipVerify: true, // #nosec G402 -- raw smuggling proof must reach authorized targets even when their certificate is invalid
 			ServerName:         host,
 		})
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", hostport)
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+			cancel()
+			_ = rawConn.Close()
+			return 0, false, err
+		}
+		conn = tlsConn
 	}
-	if err != nil {
-		return 0, false, err
-	}
+	cancel()
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(smugReadDeadline))

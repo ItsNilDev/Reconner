@@ -37,16 +37,7 @@ func NewBLHScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, lo
 	return &BLHScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var blhClient = &http.Client{
-	Timeout:   12 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var blhClient = ScannerRedirectClient(12*time.Second, 5, RedirectInScope)
 
 func (s *BLHScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	logFn("info", "blh", "Checking pages for broken-link hijacking (dead external links)...")

@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,7 +132,7 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 	type passiveSrc struct {
 		id   string
 		name string
-		fn   func(string) ([]string, error)
+		fn   func(context.Context, string) ([]string, error)
 	}
 	sources := []passiveSrc{
 		{"crtsh", "crt.sh", queryCRTSH},
@@ -159,10 +158,10 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 			continue
 		}
 		srcWg.Add(1)
-		go func(name string, fn func(string) ([]string, error)) {
+		go func(name string, fn func(context.Context, string) ([]string, error)) {
 			defer srcWg.Done()
 			logFn("info", "subdomain_enum", fmt.Sprintf("Querying %s...", name))
-			subs, err := fn(domain)
+			subs, err := fn(ctx, domain)
 			if err != nil {
 				// A source being rate-limited/blocked is normal and not actionable
 				// — log it quietly (info) so it doesn't look like a real failure.
@@ -438,15 +437,7 @@ type vhostMatch struct {
 	probe vhostProbe
 }
 
-var vhostPlainClient = &http.Client{
-	Timeout: 7 * time.Second,
-	Transport: identityRoundTripper{base: &http.Transport{
-		MaxIdleConns:        128,
-		MaxIdleConnsPerHost: 32,
-		IdleConnTimeout:     30 * time.Second,
-	}},
-	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-}
+var vhostPlainClient = ScannerClient(7 * time.Second)
 
 // probeVhost fetches scheme://ip/ with an explicit Host header. It returns both
 // the raw body length and a NORMALISED length: the body with every occurrence of
@@ -455,6 +446,9 @@ var vhostPlainClient = &http.Client{
 // differ purely by the length of its own name — a reflected-Host false positive.
 // Comparing on normLen cancels that out, so only REAL template differences count.
 func probeVhost(ctx context.Context, scheme, ip, host string) (vhostProbe, bool) {
+	if hostExcluded(ctx, host) {
+		return vhostProbe{}, false
+	}
 	rctx, cancel := context.WithTimeout(ctx, 7*time.Second)
 	defer cancel()
 	if scheme == "http" {
@@ -485,16 +479,7 @@ func probeVhost(ctx context.Context, scheme, ip, host string) (vhostProbe, bool)
 		}
 		targetAddr = net.JoinHostPort(ip, port)
 	}
-	dialer := &net.Dialer{Timeout: 6 * time.Second}
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- vhost discovery must probe authorized hosts with invalid/mismatched certificates
-		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(dialCtx, network, targetAddr)
-		},
-	}
-	client := &http.Client{Timeout: 7 * time.Second, Transport: identityRoundTripper{base: transport},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	defer transport.CloseIdleConnections()
+	client := DirectIPClient(7*time.Second, targetAddr, host)
 	// Put the candidate in the URL as well as Request.Host. The custom dialer
 	// still connects to the known IP, while TLS now sends candidate-host SNI —
 	// essential for HTTPS virtual hosts that reject an IP-valued SNI handshake.
@@ -1588,7 +1573,7 @@ func (s *SubdomainScanner) resolvingSubdomainsUnder(ctx context.Context, targetI
 func (s *SubdomainScanner) gatherPassiveSubdomains(ctx context.Context, domain string, logFn LogFunc) map[string]bool {
 	out := make(map[string]bool)
 	var mu sync.Mutex
-	sources := []func(string) ([]string, error){
+	sources := []func(context.Context, string) ([]string, error){
 		queryCRTSH, queryCertSpotter, queryHackerTarget,
 		queryRapidDNS, queryOTX, queryAnubis, queryURLScan,
 	}
@@ -1598,9 +1583,9 @@ func (s *SubdomainScanner) gatherPassiveSubdomains(ctx context.Context, domain s
 			break
 		}
 		wg.Add(1)
-		go func(fn func(string) ([]string, error)) {
+		go func(fn func(context.Context, string) ([]string, error)) {
 			defer wg.Done()
-			subs, err := fn(domain)
+			subs, err := fn(ctx, domain)
 			if err != nil {
 				return
 			}

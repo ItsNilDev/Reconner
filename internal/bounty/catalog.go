@@ -274,15 +274,8 @@ func (s *Service) createProjectFromProgram(ctx context.Context, ownerID int64, p
 		selected[id] = true
 	}
 	assets := []Asset{}
-	outScope := []string{}
 	for _, a := range p.Assets {
-		if !a.Active {
-			continue
-		}
-		if !a.InScope || !a.EligibleSubmission {
-			if a.Identifier != "" {
-				outScope = append(outScope, a.Identifier)
-			}
+		if !a.Active || !a.InScope || !a.EligibleSubmission {
 			continue
 		}
 		if len(selected) > 0 && !selected[a.ID] {
@@ -354,13 +347,6 @@ func (s *Service) createProjectFromProgram(ctx context.Context, ownerID int64, p
 		hours = 12
 	}
 	scope := strings.Join(values, ",")
-	// Mark every copied deny rule with its program so a later sync can refresh
-	// it without deleting manual operator rules. Legacy unmarked rules are
-	// preserved by the reconciliation merge.
-	managedExclusions := make([]string, 0, len(outScope))
-	for _, identifier := range outScope {
-		managedExclusions = append(managedExclusions, programExclusionLine(p.ID, identifier))
-	}
 	targetID := uuid.New().String()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -383,9 +369,17 @@ func (s *Service) createProjectFromProgram(ctx context.Context, ownerID int64, p
 	// bulk creates spread their first rounds across the normal interval.
 	// Deep projects keep NULL ("not scheduled").
 	_, err = tx.ExecContext(ctx, `INSERT INTO targets(id,domain,name,description,priority,notes,kind,exclude_scope,owner_id,monitor_enabled,monitor_interval_hours,watch_only,watch_next_run,watch_paused,watch_fail_count,watch_root_index)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ? = 1 THEN datetime('now','+' || ? || ' minutes') ELSE NULL END,0,0,0)`, targetID, scope, name, req.Description, priority, req.Notes, kind, strings.Join(managedExclusions, "\n"), ownerID, boolInt(monitorEnabled), hours, watchOnly, watchOnly, watchStartOffsetMinutes)
+		VALUES(?,?,?,?,?,?,?,'',?,?,?,?,CASE WHEN ? = 1 THEN datetime('now','+' || ? || ' minutes') ELSE NULL END,0,0,0)`, targetID, scope, name, req.Description, priority, req.Notes, kind, ownerID, boolInt(monitorEnabled), hours, watchOnly, watchOnly, watchStartOffsetMinutes)
 	if err != nil {
 		return "", err
+	}
+	for _, pattern := range programDenyRules(p) {
+		if _, err = tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES(?,?,'bounty',?,?)`,
+			uuid.New().String(), targetID, p.ID, pattern,
+		); err != nil {
+			return "", err
+		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO project_programs(target_id,program_id,auto_sync,last_scope_hash,last_checked_at) VALUES(?,?,1,?,CURRENT_TIMESTAMP)`, targetID, p.ID, p.ScopeHash)
 	if err != nil {
@@ -763,24 +757,51 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 		}
 	}
 	_, _ = s.db.ExecContext(ctx, `UPDATE project_programs SET last_scope_hash=?,last_checked_at=CURRENT_TIMESTAMP WHERE target_id=? AND program_id=?`, p.ScopeHash, targetID, p.ID)
-	// Refresh the program's deny snapshot with provenance. Only rules this
-	// program owns are replaced. Manual edits, other programs' rules, and legacy
-	// unmarked rules survive, so a sync never widens or narrows them by accident.
-	var excludeRaw string
+	// Refresh this program's typed deny rules in target_exclusions. Only rows
+	// owned by (target_id, source='bounty', program_id) are reconciled; manual
+	// rules and other programs' rules stay untouched.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&excludeRaw); err != nil {
+	prevRows, err := tx.QueryContext(ctx, `SELECT pattern FROM target_exclusions WHERE target_id=? AND source='bounty' AND program_id=?`, targetID, programID)
+	if err != nil {
 		return err
 	}
-	other, mine, manual := splitManagedExclusions(excludeRaw, programID)
-	merged := append(manual, other...)
-	newDenyRules := programDenyRules(p)
-	merged = append(merged, newDenyRules...)
-	if _, err := tx.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID); err != nil {
+	previousRules := map[string]struct{}{}
+	for prevRows.Next() {
+		var pattern string
+		if err := prevRows.Scan(&pattern); err != nil {
+			prevRows.Close()
+			return err
+		}
+		previousRules[pattern] = struct{}{}
+	}
+	if err := prevRows.Err(); err != nil {
+		prevRows.Close()
 		return err
+	}
+	prevRows.Close()
+
+	newDenyRules := programDenyRules(p)
+	currentRules := make(map[string]struct{}, len(newDenyRules))
+	for _, pattern := range newDenyRules {
+		currentRules[pattern] = struct{}{}
+	}
+	for pattern := range previousRules {
+		if _, ok := currentRules[pattern]; !ok {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM target_exclusions WHERE target_id=? AND source='bounty' AND program_id=? AND pattern=?`, targetID, programID, pattern); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pattern := range newDenyRules {
+		if _, ok := previousRules[pattern]; !ok {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO target_exclusions (id,target_id,source,program_id,pattern) VALUES (?,?,'bounty',?,?)`, uuid.New().String(), targetID, programID, pattern); err != nil {
+				return err
+			}
+		}
 	}
 	// Commit the deny snapshot before recording rule events. createRuleEvent
 	// writes through s.db on another connection; an open write transaction here
@@ -791,25 +812,19 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 
 	// A deny rule can be added or withdrawn without any asset row. Record the
 	// rule itself as an approved upstream event so Changes shows the real edit.
-	previousRules := map[string]string{}
-	for _, rule := range mine {
-		previousRules[strings.TrimPrefix(rule, bountyExclusionMarker)] = rule
-	}
-	currentRules := map[string]string{}
-	for _, rule := range newDenyRules {
-		currentRules[strings.TrimPrefix(rule, bountyExclusionMarker)] = rule
-	}
 	ruleAdded, ruleRemoved := 0, 0
-	for identifier, rule := range previousRules {
+	for identifier := range previousRules {
 		if _, ok := currentRules[identifier]; !ok {
-			if s.createRuleEvent(ctx, targetID, p.ID, "rule_removed", identifier, rule, "{}") {
+			ruleJSON := mustJSON(map[string]any{"identifier": identifier, "rule": identifier, "in_scope": false})
+			if s.createRuleEvent(ctx, targetID, p.ID, "rule_removed", identifier, ruleJSON, "{}") {
 				ruleRemoved++
 			}
 		}
 	}
-	for identifier, rule := range currentRules {
+	for _, identifier := range newDenyRules {
 		if _, ok := previousRules[identifier]; !ok {
-			if s.createRuleEvent(ctx, targetID, p.ID, "rule_added", identifier, "{}", rule) {
+			ruleJSON := mustJSON(map[string]any{"identifier": identifier, "rule": identifier, "in_scope": false})
+			if s.createRuleEvent(ctx, targetID, p.ID, "rule_added", identifier, "{}", ruleJSON) {
 				ruleAdded++
 			}
 		}
@@ -825,56 +840,20 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
-// Program deny rules are stored in targets.exclude_scope with a provenance
-// marker. Reconciliation removes only the rules owned by the syncing program;
-// manual operator rules and legacy unmarked rules stay untouched.
-const bountyExclusionMarker = "#bounty:"
-
-func programExclusionLine(programID, identifier string) string {
-	return bountyExclusionMarker + programID + "|" + identifier
-}
-
-// splitManagedExclusions partitions exclude_scope into rules owned by other
-// programs, rules owned by programID, and manual/legacy rules.
-func splitManagedExclusions(raw, programID string) (other, mine, manual []string) {
-	prefix := bountyExclusionMarker + programID + "|"
-	// Managed rules are one per line and may contain spaces. Split on newlines
-	// first so a sync never breaks another program's rule into fragments.
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, bountyExclusionMarker) {
-			parts := strings.SplitN(line, "|", 2)
-			if len(parts) == 2 && parts[1] != "" {
-				if strings.HasPrefix(line, prefix) {
-					mine = append(mine, line)
-				} else {
-					other = append(other, line)
-				}
-				continue
-			}
-		}
-		for _, token := range strings.FieldsFunc(line, func(r rune) bool {
-			return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == ';'
-		}) {
-			if token = strings.TrimSpace(token); token != "" {
-				manual = append(manual, token)
-			}
-		}
-	}
-	return
-}
-
 // programDenyRules rebuilds the active out-of-scope rules a program contributes.
 func programDenyRules(p Program) []string {
-	out := []string{}
+	seen := make(map[string]struct{}, len(p.Assets))
+	out := make([]string, 0)
 	for _, a := range p.Assets {
-		if !a.Active || a.InScope && a.EligibleSubmission || a.Identifier == "" {
+		identifier := strings.TrimSpace(a.Identifier)
+		if !a.Active || (a.InScope && a.EligibleSubmission) || identifier == "" {
 			continue
 		}
-		out = append(out, programExclusionLine(p.ID, a.Identifier))
+		if _, dup := seen[identifier]; dup {
+			continue
+		}
+		seen[identifier] = struct{}{}
+		out = append(out, identifier)
 	}
 	return out
 }
@@ -1027,7 +1006,7 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			if affected, err := res.RowsAffected(); err != nil {
 				return err
 			} else if affected == 0 {
-				if _, err := tx.ExecContext(ctx, `UPDATE assets SET source_id=?, asset_type=CASE WHEN asset_type='subdomain' THEN ? ELSE asset_type END, approval_status='approved', updated_at=CURRENT_TIMESTAMP WHERE target_id=? AND value=? AND source='watch:scope'`, a.ID, managedAssetKind(a), targetID, a.Identifier); err != nil {
+				if _, err := tx.ExecContext(ctx, `UPDATE assets SET source_id=?, asset_type=CASE WHEN asset_type='subdomain' THEN ? ELSE asset_type END, approval_status='approved', updated_at=CURRENT_TIMESTAMP WHERE target_id=? AND value=? AND source='watch:scope'`, a.ID, a.AssetType, targetID, a.Identifier); err != nil {
 					return err
 				}
 			}

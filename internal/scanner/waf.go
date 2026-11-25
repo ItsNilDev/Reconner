@@ -103,16 +103,7 @@ func bodyLooksLikeWAFBlock(body string) bool { return looksLikeWAFBlock(0, body)
 // GET, no attack payloads) and matched only on vendor-specific signals, so a hit
 // is real, not a guess.
 
-var wafFingerprintClient = &http.Client{
-	Timeout:   10 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var wafFingerprintClient = ScannerRedirectClient(10*time.Second, 3, RedirectSameHost)
 
 type wafSig struct {
 	name    string

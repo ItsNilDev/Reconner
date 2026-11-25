@@ -14,7 +14,7 @@ import (
 )
 
 // storedXSSClient does NOT follow redirects and reuses the pooled transport.
-var storedXSSClient = newPooledClient(12*time.Second, false)
+var storedXSSClient = ScannerClient(12 * time.Second)
 
 // newXSSToken returns a short, unique, URL-safe marker token.
 func newXSSToken(prefix string) string {

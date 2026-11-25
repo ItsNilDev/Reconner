@@ -196,7 +196,7 @@ func writeTargetArtifactArchive(ctx context.Context, db *database.DB, dst, targe
 
 func targetArtifactDatasets(targetID string) []artifactDataset {
 	byTarget := []string{
-		"assets", "network_hosts", "network_services", "evidence", "http_interactions",
+		"assets", "target_exclusions", "network_hosts", "network_services", "evidence", "http_interactions",
 		"objects", "actions", "object_relationships", "workflow_variables", "authorization_observations",
 		"hypotheses", "state_snapshots", "capture_sessions", "request_templates",
 		"candidates", "candidate_transitions", "subdomains", "http_services", "js_files", "js_findings",

@@ -33,7 +33,7 @@ func NewShodanScanner(db *database.DB, exec *tools.Executor, cfg *config.Config,
 	return &ShodanScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var shodanClient = &http.Client{Timeout: 20 * time.Second}
+var shodanClient = ExternalClient(20 * time.Second)
 var shodanPace = time.Second
 
 type shodanHostResp struct {

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChangeLog from './ChangeLog'
 import { ws } from '../../lib/websocket'
 import type { ChangeEntry } from '../../types'
+import { parseStatusTransition } from './changesModel'
 
 // Real default-feed rows: a watch host discovery, an alert notification and a
 // program-scope row from the bounty feed.
@@ -82,6 +83,20 @@ function lastSeenAllUrl(fetchMock: ReturnType<typeof vi.fn>): string {
   return lastUrl(fetchMock, '/api/changes/seen-all?')
 }
 
+function matchesDefaultView(r: ChangeEntry): boolean {
+  if (r.source === 'watch' && r.change_type === 'new_subdomain') return true
+  if ((r.source === 'watch' || r.source === 'monitor') &&
+    (r.change_type === 'status_change' || r.change_type === 'http_change' || r.change_type === 'page_change')) {
+    const parsed = parseStatusTransition(r.old_value || '', r.new_value || '')
+    const oldCode = r.old_status || parsed.oldCode || 0
+    const newCode = r.new_status || parsed.newCode || 0
+    return oldCode >= 100 && oldCode <= 599 && newCode >= 100 && newCode <= 599 && oldCode !== newCode
+  }
+  if (r.source === 'bounty' || r.source === 'watch_scope') return true
+  if (r.source === 'notification' && r.change_type === 'new_host') return true
+  return false
+}
+
 function installFetch(options?: { rows?: ChangeEntry[]; firstChanges?: Promise<Response> }) {
   let changesCalls = 0
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -89,7 +104,12 @@ function installFetch(options?: { rows?: ChangeEntry[]; firstChanges?: Promise<R
     if (url.startsWith('/api/changes?')) {
       changesCalls++
       if (changesCalls === 1 && options?.firstChanges) return options.firstChanges
-      return envelope(options?.rows ?? [watchHost])
+      const u = new URL(url, 'http://localhost')
+      const allRows = options?.rows ?? [watchHost]
+      const rows = u.searchParams.get('default_view') === '1'
+        ? allRows.filter(matchesDefaultView)
+        : allRows
+      return envelope(rows)
     }
     if (url.startsWith('/api/watch/rounds?')) return envelope([])
     if (url.startsWith('/api/targets?')) return success([])
@@ -197,15 +217,29 @@ describe('ChangeLog loading and refresh', () => {
 })
 
 describe('ChangeLog default feed', () => {
-  it('hides findings, deep notices and routine monitor diffs', async () => {
-    installFetch({ rows: [...noiseRows, bountyScope] })
+  it('requests default_view=1 in Daily signals mode and omits it for All history or category filters', async () => {
+    const fetchMock = installFetch({ rows: [...noiseRows, bountyScope] })
     render(<ChangeLog />)
 
     expect(await screen.findByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
+    expect(lastChangesUrl(fetchMock)).toContain('default_view=1')
     expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
     expect(screen.queryByText('TECHNOLOGIES')).not.toBeInTheDocument()
     expect(screen.queryByText('FINDING')).not.toBeInTheDocument()
     expect(screen.queryByText('SCAN DEEP')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'All history' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1'))
+    expect(await screen.findByText('TECHNOLOGIES')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Daily signals' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('default_view=1'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('category=scripts')
+      expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
+    })
   })
 
   it('only renders http(s) links and promotes bare hosts', async () => {

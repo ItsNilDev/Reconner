@@ -31,13 +31,7 @@ func NewLFIScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, lo
 	return &LFIScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var lfiHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var lfiHTTPClient = ScannerClient(15 * time.Second)
 
 // Traversal + wrapper payloads (Linux + Windows + null-byte + encoded + wrapper).
 var lfiPayloads = []string{

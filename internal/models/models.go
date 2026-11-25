@@ -15,6 +15,7 @@ type Target struct {
 	Priority             string            `json:"priority" db:"priority"`
 	Notes                string            `json:"notes" db:"notes"`
 	ExcludeScope         string            `json:"exclude_scope" db:"exclude_scope"`
+	ManagedExclusions    []ManagedExclusion `json:"managed_exclusions,omitempty"`
 	Status               string            `json:"status" db:"status"`
 	ScanStatus           string            `json:"scan_status" db:"scan_status"`
 	EnabledModules       []string          `json:"enabled_modules"`
@@ -51,6 +52,11 @@ type Target struct {
 	WatchFailCount int        `json:"watch_fail_count" db:"watch_fail_count"`
 	WatchRootIndex int        `json:"watch_root_index" db:"watch_root_index"`
 	WatchPaused    bool       `json:"watch_paused" db:"watch_paused"`
+}
+
+type ManagedExclusion struct {
+	ProgramID string `json:"program_id"`
+	Pattern   string `json:"pattern"`
 }
 
 // Asset is one individually-scannable entry of a target (a domain, IP, CIDR, or

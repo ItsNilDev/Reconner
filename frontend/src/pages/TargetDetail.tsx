@@ -524,39 +524,84 @@ export default function TargetDetail() {
   // A stale tab request must never replace the rows of the tab the operator
   // switched to. Each load captures its sequence and target (B14).
   const requestSeqRef = useRef(0)
+  const targetLoadSeqRef = useRef(0)
   const activeTabRef = useRef(tab)
   const activeIdRef = useRef(id)
+  const searchParamsRef = useRef(searchParams)
   activeTabRef.current = tab
   activeIdRef.current = id
+  searchParamsRef.current = searchParams
   const [dataError, setDataError] = useState('')
+
+  useEffect(() => {
+    const t = searchParams.get('tab')
+    if (t && t.length < 60) setTab(t)
+  }, [searchParams])
 
   const loadScopeEvents = useCallback(() => {
     if (!id) return
-    bountyApi.events(id).then(e => setScopeEvents(e || [])).catch(() => {})
+    const reqId = id
+    bountyApi.events(reqId).then(e => {
+      if (reqId === activeIdRef.current) setScopeEvents(e || [])
+    }).catch(() => {})
   }, [id])
 
   useEffect(() => {
     if (!id) return
+    const seq = ++targetLoadSeqRef.current
+    const reqTab = searchParamsRef.current.get('tab')
+    setTab(reqTab && reqTab.length < 60 ? reqTab : 'subdomains')
+    setFpView(false)
+    setHostSearch('')
+    setStatusClass('all')
+    setAliveOnly(false)
+    setNewOnly(false)
+    setSort({ key: null, dir: 'desc' })
+    setLoading(true)
+    setTarget(null)
+    setAssets([])
+    setScopeEvents([])
+    setWatchScopeEvents([])
+    setPaths([])
+    setData([])
+    setDataError('')
     targetsApi.get(id).then(t => {
+      if (seq !== targetLoadSeqRef.current) return
       setTarget(t)
       setIsScanning(t.scan_status === 'running')
       // Network/WordPress targets never populate the default 'subdomains' tab —
       // land on the tab that actually carries their results.
-			if (t.kind === 'network') setTab('network-services')
-			else if ((t.tags || []).includes(WP_TAG)) setTab('wp-inventory')
-    }).catch(() => navigate('/targets')).finally(() => setLoading(false))
-    targetsApi.graph(id).then(g => setPaths(g.attack_paths || [])).catch(() => {})
+      if (!searchParamsRef.current.get('tab')) {
+        if (t.kind === 'network') setTab('network-services')
+        else if ((t.tags || []).includes(WP_TAG)) setTab('wp-inventory')
+        else setTab('subdomains')
+      }
+    }).catch(() => {
+      if (seq === targetLoadSeqRef.current) navigate('/targets')
+    }).finally(() => {
+      if (seq === targetLoadSeqRef.current) setLoading(false)
+    })
+    targetsApi.graph(id).then(g => {
+      if (seq === targetLoadSeqRef.current) setPaths(g.attack_paths || [])
+    }).catch(() => {})
     loadAssets()
     loadWatchScope()
     loadScopeEvents()
     bountyApi.list().then(r => {
+      if (seq !== targetLoadSeqRef.current) return
       const names: Record<string, string> = {}
       for (const prog of r.programs || []) names[prog.id] = prog.name
       setProgramNames(names)
     }).catch(() => {})
   }, [id, loadScopeEvents])
 
-  const loadAssets = () => { if (id) targetsApi.assets(id).then(a => setAssets(a || [])).catch(() => {}) }
+  const loadAssets = () => {
+    if (!id) return
+    const reqId = id
+    targetsApi.assets(reqId).then(a => {
+      if (reqId === activeIdRef.current) setAssets(a || [])
+    }).catch(() => {})
+  }
   const addAsset = async () => {
     const v = newAsset.trim()
     if (!v || !id) return
@@ -807,6 +852,7 @@ export default function TargetDetail() {
       // load the old full-history table in the background.
       setData([])
       setDataError('')
+      setTabLoading(false)
       return
     }
     setTabLoading(true)
@@ -954,7 +1000,10 @@ export default function TargetDetail() {
   // initialization" -> blank page for every target.
   function loadWatchScope() {
     if (!id) return
-    targetsApi.watchScopeEvents(id).then(r => setWatchScopeEvents(r.events || [])).catch(() => {})
+    const reqId = id
+    targetsApi.watchScopeEvents(reqId).then(r => {
+      if (reqId === activeIdRef.current) setWatchScopeEvents(r.events || [])
+    }).catch(() => {})
   }
 
   const promoteWatchHosts = async (values: string[]) => {
@@ -1391,6 +1440,13 @@ export default function TargetDetail() {
                 setData([])
                 setVisibleCount(PAGE)
                 setTab(t.id)
+                if (searchParamsRef.current.has('tab') || searchParamsRef.current.has('event') || searchParamsRef.current.has('q')) {
+                  const next = new URLSearchParams(searchParamsRef.current)
+                  next.delete('tab')
+                  next.delete('event')
+                  next.delete('q')
+                  setSearchParams(next, { replace: true })
+                }
               }} title={t.desc}
                 className={cn(
                   'rounded-md px-2.5 py-1.5 text-sm font-medium whitespace-nowrap transition-all',

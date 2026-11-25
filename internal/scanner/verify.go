@@ -338,9 +338,9 @@ func (s *VerifyScanner) verifyNucleiCandidates(ctx context.Context, targetID str
 		case "open_redirect":
 			r = verifyNucleiOpenRedirect(c.url, c.param)
 		case "lfi":
-			r = verifyNucleiSignatureReplay(c.url, "lfi-replay", reVerifiable["lfi"])
+			r = verifyNucleiSignatureReplay(ctx, c.url, "lfi-replay", reVerifiable["lfi"])
 		case "ssrf":
-			r = verifyNucleiSignatureReplay(c.url, "ssrf-replay", reVerifiable["ssrf"])
+			r = verifyNucleiSignatureReplay(ctx, c.url, "ssrf-replay", reVerifiable["ssrf"])
 		default:
 			continue
 		}
@@ -393,11 +393,11 @@ func verifyNucleiOpenRedirect(rawURL, param string) VerifyResult {
 // reVerifiable). Reproduces → VERIFIED; doesn't → REJECTED (nuclei's own
 // match was likely transient/WAF-mangled); a request error is never treated
 // as a rejection — that would punish a network hiccup, not the finding.
-func verifyNucleiSignatureReplay(rawURL, method string, check func(string) bool) VerifyResult {
+func verifyNucleiSignatureReplay(ctx context.Context, rawURL, method string, check func(string) bool) VerifyResult {
 	if check == nil || rawURL == "" {
 		return VerifyResult{Verdict: VerifyInconclusive, Reason: "no signature check available", Method: method}
 	}
-	req, err := http.NewRequest("GET", rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return VerifyResult{Verdict: VerifyInconclusive, Reason: "invalid matched URL", Method: method}
 	}
@@ -457,7 +457,7 @@ func contextPayloadFor(evidence string) string {
 	return `<svg onload=alert(document.domain)>`
 }
 
-var verifyClient = newPooledClient(15*time.Second, false)
+var verifyClient = ScannerClient(15 * time.Second)
 
 // baseConfidence reflects HOW a finding was detected. Signature-confirmed and
 // server-side-evaluated classes are near-certain; heuristic/passive ones lower.

@@ -662,8 +662,9 @@ func TestReconcileSuspendsStaleNonWebAsset(t *testing.T) {
 }
 
 // TestReconcileRefreshesProgramDenySnapshot proves that a sync replaces only
-// the deny rules it owns. Manual rules survive, stale rules disappear, and a
-// newly excluded descendant is added to exclude_scope.
+// the typed bounty deny rules it owns. Manual rules and sibling-program rules
+// survive, stale rules disappear, and newly excluded descendants are added to
+// target_exclusions.
 func TestReconcileRefreshesProgramDenySnapshot(t *testing.T) {
 	svc, db := testCatalog(t)
 	p := Program{
@@ -681,14 +682,43 @@ func TestReconcileRefreshesProgramDenySnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var raw string
-	if err := db.QueryRow(`SELECT exclude_scope FROM targets WHERE id=?`, projectID).Scan(&raw); err != nil {
+	var legacyRaw string
+	if err := db.QueryRow(`SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, projectID).Scan(&legacyRaw); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(raw, "old.acme.test") || !strings.Contains(raw, bountyExclusionMarker) {
-		t.Fatalf("import snapshot=%q, want marked old.acme.test", raw)
+	if legacyRaw != "" {
+		t.Fatalf("import targets.exclude_scope=%q, want empty", legacyRaw)
 	}
-	if _, err := db.Exec(`UPDATE targets SET exclude_scope = exclude_scope || char(10) || 'manual.example.test' WHERE id=?`, projectID); err != nil {
+
+	loadExclusions := func() map[string]bool {
+		t.Helper()
+		rows, err := db.Query(`SELECT source, program_id, pattern FROM target_exclusions WHERE target_id=?`, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		got := map[string]bool{}
+		for rows.Next() {
+			var source, programID, pattern string
+			if err := rows.Scan(&source, &programID, &pattern); err != nil {
+				t.Fatal(err)
+			}
+			got[source+"|"+programID+"|"+pattern] = true
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	initial := loadExclusions()
+	if !initial["bounty|"+p.ID+"|old.acme.test"] {
+		t.Fatalf("import target_exclusions=%v, want bounty rule for old.acme.test", initial)
+	}
+	if _, err := db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('manual-1',?,'manual','','manual.example.test')`, projectID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('sibling-1',?,'bounty','sibling-program','sibling.acme.test')`, projectID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -702,17 +732,18 @@ func TestReconcileRefreshesProgramDenySnapshot(t *testing.T) {
 	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT exclude_scope FROM targets WHERE id=?`, projectID).Scan(&raw); err != nil {
-		t.Fatal(err)
+	after := loadExclusions()
+	if after["bounty|"+p.ID+"|old.acme.test"] {
+		t.Fatalf("stale program rule survived sync: %v", after)
 	}
-	if strings.Contains(raw, "old.acme.test") {
-		t.Fatalf("stale program rule survived sync: %q", raw)
+	if !after["bounty|"+p.ID+"|new.acme.test"] {
+		t.Fatalf("new program deny rule missing: %v", after)
 	}
-	if !strings.Contains(raw, "new.acme.test") {
-		t.Fatalf("new program deny rule missing: %q", raw)
+	if !after["manual||manual.example.test"] {
+		t.Fatalf("manual rule was removed by sync: %v", after)
 	}
-	if !strings.Contains(raw, "manual.example.test") {
-		t.Fatalf("manual rule was removed by sync: %q", raw)
+	if !after["bounty|sibling-program|sibling.acme.test"] {
+		t.Fatalf("sibling program rule was removed by sync: %v", after)
 	}
 }
 
@@ -847,17 +878,21 @@ func TestReplaceAssetsRefusesEmptyScrape(t *testing.T) {
 	}
 }
 
-func TestSplitManagedExclusionsKeepsMultiWordRules(t *testing.T) {
-	raw := "#bounty:p1|*.api.example.com, staging.example.com\nmanual.example.com"
-	other, mine, manual := splitManagedExclusions(raw, "p1")
-	if len(mine) != 1 || mine[0] != "#bounty:p1|*.api.example.com, staging.example.com" {
-		t.Fatalf("managed line was split: %v", mine)
+func TestProgramDenyRulesDeduplicatesAndKeepsMultiWordRules(t *testing.T) {
+	p := Program{
+		ID: "p1",
+		Assets: []Asset{
+			{Identifier: "  *.api.example.com, staging.example.com  ", Active: true, InScope: false, EligibleSubmission: false},
+			{Identifier: "*.api.example.com, staging.example.com", Active: true, InScope: false, EligibleSubmission: false},
+			{Identifier: "in.example.com", Active: true, InScope: true, EligibleSubmission: true},
+			{Identifier: "inactive.example.com", Active: false, InScope: false, EligibleSubmission: false},
+			{Identifier: "   ", Active: true, InScope: false, EligibleSubmission: false},
+			{Identifier: "ineligible.example.com", Active: true, InScope: true, EligibleSubmission: false},
+		},
 	}
-	if len(other) != 0 {
-		t.Fatalf("unexpected other rules: %v", other)
-	}
-	if len(manual) != 1 || manual[0] != "manual.example.com" {
-		t.Fatalf("manual rules = %v", manual)
+	got := programDenyRules(p)
+	if len(got) != 2 || got[0] != "*.api.example.com, staging.example.com" || got[1] != "ineligible.example.com" {
+		t.Fatalf("programDenyRules = %v", got)
 	}
 }
 
@@ -872,7 +907,6 @@ func TestDenyRuleEventHasCleanIdentifierAndNotifies(t *testing.T) {
 		Status: "live", ProgramType: "bug_bounty",
 		Assets: []Asset{
 			{ExternalID: "in", Identifier: "app.example.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
-			{ExternalID: "out", Identifier: "admin.example.test", AssetType: "DOMAIN", InScope: false, EligibleSubmission: false, Active: true},
 		},
 	}
 	storeTestProgram(t, svc, &p)
@@ -881,28 +915,73 @@ func TestDenyRuleEventHasCleanIdentifierAndNotifies(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = nil
-	if !svc.createRuleEvent(context.Background(), projectID, p.ID, "rule_added", "admin.example.test",
-		"{}", mustJSON(map[string]any{"identifier": "admin.example.test", "rule": "admin.example.test", "in_scope": false})) {
-		t.Fatal("createRuleEvent reported no insert")
-	}
-	var identifier, newJSON string
-	if err := db.QueryRow(`SELECT identifier, new_json FROM bounty_scope_events WHERE target_id=? AND event_type='rule_added'`, projectID).Scan(&identifier, &newJSON); err != nil {
+
+	p.Assets = append(p.Assets, Asset{
+		ExternalID: "out", Identifier: "admin.example.test", AssetType: "DOMAIN",
+		InScope: false, EligibleSubmission: false, Active: true,
+	})
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(identifier, "#bounty:") || strings.Contains(identifier, "|") {
-		t.Fatalf("rule event identifier is not clean: %q", identifier)
+
+	assertRuleJSON := func(raw string, wantIdentifier string) {
+		t.Helper()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("rule event payload is not valid JSON (%q): %v", raw, err)
+		}
+		if payload["identifier"] != wantIdentifier || payload["rule"] != wantIdentifier || payload["in_scope"] != false {
+			t.Fatalf("unexpected rule event payload %v", payload)
+		}
 	}
-	if !strings.Contains(newJSON, `"in_scope":false`) {
-		t.Fatalf("rule event JSON is not valid: %q", newJSON)
+
+	var identifier, oldJSON, newJSON string
+	if err := db.QueryRow(`SELECT identifier, old_json, new_json FROM bounty_scope_events WHERE target_id=? AND event_type='rule_added'`, projectID).Scan(&identifier, &oldJSON, &newJSON); err != nil {
+		t.Fatal(err)
 	}
+	if identifier != "admin.example.test" || strings.Contains(identifier, "#bounty:") || strings.Contains(identifier, "|") {
+		t.Fatalf("rule_added identifier is not clean: %q", identifier)
+	}
+	if oldJSON != "{}" {
+		t.Fatalf("rule_added old_json = %q, want {}", oldJSON)
+	}
+	assertRuleJSON(newJSON, "admin.example.test")
+
 	found := false
 	for _, v := range got {
-		if v == "rule_added:"+identifier {
+		if v == "rule_added:admin.example.test" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("onScopeEvent callback missing rule_added:%q, got %v", identifier, got)
+		t.Fatalf("onScopeEvent callback missing rule_added:admin.example.test, got %v", got)
+	}
+
+	got = nil
+	p.Assets = p.Assets[:1]
+	storeTestProgram(t, svc, &p)
+	if err := svc.reconcileProject(context.Background(), projectID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT identifier, old_json, new_json FROM bounty_scope_events WHERE target_id=? AND event_type='rule_removed'`, projectID).Scan(&identifier, &oldJSON, &newJSON); err != nil {
+		t.Fatal(err)
+	}
+	if identifier != "admin.example.test" || strings.Contains(identifier, "#bounty:") || strings.Contains(identifier, "|") {
+		t.Fatalf("rule_removed identifier is not clean: %q", identifier)
+	}
+	assertRuleJSON(oldJSON, "admin.example.test")
+	if newJSON != "{}" {
+		t.Fatalf("rule_removed new_json = %q, want {}", newJSON)
+	}
+	found = false
+	for _, v := range got {
+		if v == "rule_removed:admin.example.test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("onScopeEvent callback missing rule_removed:admin.example.test, got %v", got)
 	}
 }
 

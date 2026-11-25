@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -128,7 +129,15 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	// from http_services, so this one filter keeps every downstream module
 	// (js, params, dast, nuclei…) off the excluded assets. This is the single
 	// enforcement choke point for exclude_scope on the web side.
-	if excl := LoadExclusions(ctx, s.db, targetID); !excl.Empty() {
+	excl := exclusionsFromContext(ctx)
+	if excl.Empty() {
+		var exclErr error
+		excl, exclErr = LoadExclusionsE(ctx, s.db, targetID)
+		if exclErr != nil {
+			return fmt.Errorf("load target exclusions: %w", exclErr)
+		}
+	}
+	if !excl.Empty() {
 		kept := hosts[:0]
 		var dropped int
 		for _, h := range hosts {
@@ -267,7 +276,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 			// Only a committed, valid observation advances liveness. A
 			// status-zero response is not proof that the host is alive.
 			if stored && ValidHTTPStatus(out.StatusCode) {
-				if err := s.updateSubdomainAlive(targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
+				if err := s.updateSubdomainAlive(ctx, targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
 					s.logger.Error("Failed to update subdomain", "error", err)
 				}
 				mu.Lock()
@@ -420,7 +429,16 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 	urls = filterURLsByHostScope(ctx, urls)
 	// A host excluded after it was first probed keeps its historical service
 	// row, but no later phase may open a connection to it.
-	if excl := LoadExclusions(ctx, s.db, targetID); !excl.Empty() {
+	excl := exclusionsFromContext(ctx)
+	if excl.Empty() {
+		var exclErr error
+		excl, exclErr = LoadExclusionsE(ctx, s.db, targetID)
+		if exclErr != nil {
+			logFn("warn", "http_probe", fmt.Sprintf("Fingerprinting skipped: load exclusions: %v", exclErr))
+			return
+		}
+	}
+	if !excl.Empty() {
 		urls = FilterExcludedURLs(urls, excl)
 	}
 	if len(urls) == 0 {
@@ -492,7 +510,7 @@ func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out
 	})
 }
 
-func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int, techs []string, server string) error {
+func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host string, statusCode int, techs []string, server string) error {
 	if IsWildcardScopePattern(host) {
 		return nil
 	}
@@ -501,7 +519,7 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 
 	// Match the exact host (scheme + host, optional port/path) instead of a
 	// loose substring, so `api` no longer matches `myapi.example.com`.
-	r := s.db.QueryRow(`
+	r := s.db.QueryRowContext(ctx, `
 		SELECT
 			SUM(CASE WHEN url LIKE 'https://%' THEN 1 ELSE 0 END),
 			SUM(CASE WHEN url LIKE 'http://%' THEN 1 ELSE 0 END)
@@ -526,12 +544,12 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 	sortedTechs := append([]string(nil), techs...)
 	sort.Strings(sortedTechs)
 	techsJSON := models.StringSliceToJSON(sortedTechs)
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(context.Background(), `
+	if _, err = tx.ExecContext(ctx, `
 		UPDATE subdomains SET
 			is_alive = 1,
 			status_code = ?,
@@ -546,7 +564,7 @@ func (s *HTTPScanner) updateSubdomainAlive(targetID, host string, statusCode int
 	`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, host); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(context.Background(), `
+	if _, err = tx.ExecContext(ctx, `
 		INSERT INTO watch_hosts(target_id,host,first_seen_at,first_alive_at,last_alive_at,alive_misses)
 		VALUES(?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)
 		ON CONFLICT(target_id,host) DO UPDATE SET
@@ -622,7 +640,7 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 					} else if ValidHTTPStatus(svc.StatusCode) {
 						// Native fallback shares the committed success path with
 						// the tool probe: inventory and host liveness advance together.
-						if err := s.updateSubdomainAlive(targetID, h, svc.StatusCode, nil, svc.Server); err != nil {
+						if err := s.updateSubdomainAlive(ctx, targetID, h, svc.StatusCode, nil, svc.Server); err != nil {
 							s.logger.Error("Update native probe liveness failed", "error", err)
 						}
 					}
@@ -636,9 +654,13 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 }
 
 func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPService) error {
+	lookupHost := URLHost(svc.URL)
+	if u, err := url.Parse(strings.TrimSpace(svc.URL)); err == nil && u.Hostname() != "" {
+		lookupHost = strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	}
 	var subID string
 	if err := s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
-		svc.TargetID, URLHost(svc.URL)).Scan(&subID); err != nil && err != sql.ErrNoRows {
+		svc.TargetID, lookupHost).Scan(&subID); err != nil && err != sql.ErrNoRows {
 		return err
 	}
 	obsType := ObservationDeep
@@ -684,37 +706,4 @@ func (s *HTTPScanner) ProbeURL(ctx context.Context, targetID, url string) error 
 	args = append(args, ToolRequestIdentityArgs(ctx, "httpx")...)
 	_, err := s.exec.Run(ctx, "httpx", args...)
 	return err
-}
-
-// RunWithInput probes an explicit newline-separated list of hosts via httpx.
-// It correctly feeds the list through stdin (previously it used a plain
-// RunWithCallback with `-l /dev/stdin`, which — like the old nuclei bug — read
-// EOF and scanned nothing).
-func (s *HTTPScanner) RunWithInput(ctx context.Context, taskID string, input string, logFn LogFunc) error {
-	if !s.exec.IsToolAvailable("httpx") {
-		return nil
-	}
-
-	args := []string{
-		"-l", "/dev/stdin",
-		"-silent",
-		"-json",
-		"-title",
-		"-web-server",
-		"-tech-detect",
-		"-status-code",
-		"-content-length",
-		"-follow-host-redirects", // never forward program headers to another host
-		"-timeout", "10",
-	}
-	args = append(args, ToolRequestIdentityArgs(ctx, "httpx")...)
-	return s.exec.RunWithInputCallback(ctx, strings.NewReader(input), taskID, func(line string) {
-		var out httpxOutput
-		if err := json.Unmarshal([]byte(line), &out); err != nil {
-			return
-		}
-		if err := s.storeHTTPService(ctx, taskID, out); err != nil {
-			s.logger.Error("Failed to store HTTP service from input run", "error", err)
-		}
-	}, "httpx", args...)
 }

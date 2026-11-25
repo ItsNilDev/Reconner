@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,22 +35,7 @@ func NewMonitorScanner(db *database.DB, exec *tools.Executor, cfg *config.Config
 	return &MonitorScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var monitorClient = &http.Client{
-	Timeout:   15 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return http.ErrUseLastResponse
-		}
-		// A monitored in-scope page can redirect to login, payments or another
-		// third party. Never turn that redirect into an out-of-scope GET. Same-host
-		// HTTP→HTTPS and path redirects remain useful and are still followed.
-		if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var monitorClient = ScannerRedirectClient(15*time.Second, 5, RedirectSameHost)
 
 // Run detects changes in HTTP services since last scan.
 func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
@@ -66,11 +52,16 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		return authHeaders
 	}
 
+	excl, err := LoadExclusionsE(ctx, s.db, targetID)
+	if err != nil {
+		return fmt.Errorf("load target exclusions: %w", err)
+	}
+
 	// Check HTTP services for changes
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, url, status_code, title, content_length, hash,
 		       COALESCE(norm_hash,''), COALESCE(security_snapshot,''), COALESCE(server,''),
-		       COALESCE(technologies,'[]'), COALESCE(redirect_url,'')
+		       COALESCE(technologies,'[]'), COALESCE(redirect_url,''), COALESCE(probe_tier,'')
 		FROM http_services WHERE target_id = ? AND COALESCE(source,'probe')='probe'
 	`, targetID)
 	if err != nil {
@@ -89,12 +80,12 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		Server        string
 		Technologies  string
 		RedirectURL   string
+		ProbeTier     string
 	}
-	excl := LoadExclusions(ctx, s.db, targetID)
 	var services []svcRecord
 	for rows.Next() {
 		var r svcRecord
-		if err := rows.Scan(&r.ID, &r.URL, &r.StatusCode, &r.Title, &r.ContentLength, &r.Hash, &r.NormHash, &r.SecSnapshot, &r.Server, &r.Technologies, &r.RedirectURL); err != nil {
+		if err := rows.Scan(&r.ID, &r.URL, &r.StatusCode, &r.Title, &r.ContentLength, &r.Hash, &r.NormHash, &r.SecSnapshot, &r.Server, &r.Technologies, &r.RedirectURL, &r.ProbeTier); err != nil {
 			rows.Close()
 			return err
 		}
@@ -139,6 +130,35 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		newNormHash := normalizedHash(body)
 		harvested += s.harvestStylesheets(ctx, targetID, svc.URL, body, knownCSS)
 
+		baselineURL := NormalizeServiceURL(svc.URL)
+		var baseStatus int
+		var baseTitle, baseServer, baseNormHash string
+		hasBaseline := false
+		err = s.db.QueryRowContext(ctx, `
+			SELECT status_code, COALESCE(title,''), COALESCE(server,''), COALESCE(body_hash,'')
+			FROM http_observation_baselines
+			WHERE target_id=? AND service_url=? AND observation_type=?`,
+			targetID, baselineURL, ObservationMonitor).Scan(&baseStatus, &baseTitle, &baseServer, &baseNormHash)
+		if err == nil {
+			hasBaseline = ValidHTTPStatus(baseStatus)
+			if baseNormHash == "" {
+				baseNormHash = svc.NormHash
+			}
+		} else if err == sql.ErrNoRows {
+			// Fall back to http_services only when the row is a deep/legacy probe
+			// row with a valid HTTP status — never a watch-tier row.
+			if (svc.ProbeTier == "deep" || svc.ProbeTier == "") && ValidHTTPStatus(svc.StatusCode) {
+				hasBaseline = true
+				baseStatus = svc.StatusCode
+				baseTitle = svc.Title
+				baseServer = svc.Server
+				baseNormHash = svc.NormHash
+			}
+		} else {
+			logFn("warn", "monitor", fmt.Sprintf("read monitor baseline for %s: %v", svc.URL, err))
+			continue
+		}
+
 		// ── Security-attribute change detection (supply-chain / form-hijack) ──
 		curSnap := extractSecuritySnapshot(body, hostOf(svc.URL))
 		curSnap.Headers = extractSecurityHeaders(hdr.Get)
@@ -149,8 +169,10 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			securityChanges = diffSecuritySnapshots(oldSnap, curSnap)
 			removedHeaders = diffSecurityHeaders(oldSnap.Headers, curSnap.Headers)
 		}
-		contentChanged := svc.NormHash != "" && newNormHash != svc.NormHash
-		potentialChange := newStatus != svc.StatusCode || newTitle != svc.Title || contentChanged || len(securityChanges) > 0 || len(removedHeaders) > 0
+		statusChanged := hasBaseline && newStatus != baseStatus
+		titleChanged := hasBaseline && newTitle != baseTitle
+		contentChanged := hasBaseline && baseNormHash != "" && newNormHash != baseNormHash
+		potentialChange := statusChanged || titleChanged || contentChanged || len(securityChanges) > 0 || len(removedHeaders) > 0
 		if potentialChange {
 			// Confirm only suspicious drift. A one-off 500/WAF challenge, rotating
 			// edge page, or half-written deploy must not mutate the baseline or ring
@@ -169,42 +191,73 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			body, hdr = confirmBody, confirmHeader
 		}
 
+		type pendingChange struct {
+			changeType string
+			oldVal     string
+			newVal     string
+			severity   string
+		}
+		type pendingFinding struct {
+			ch  securityChange
+			sev string
+		}
+		var pendingChanges []pendingChange
+		var pendingFindings []pendingFinding
+		var pendingHeaderRegressions []string
+
 		if svc.SecSnapshot != "" {
 			for _, ch := range securityChanges {
 				sev := securityChangeSeverity(ch)
 				desc := fmt.Sprintf("security:%s_%s", ch.attr.Kind, ch.action)
 				logFn("warn", "monitor", fmt.Sprintf("[SECURITY CHANGE] %s: %s external %s %q", svc.URL, ch.action, ch.attr.Kind, ch.attr.Value))
-				s.recordChange(targetID, svc.URL, desc, "", fmt.Sprintf("%s %s: %s", ch.action, ch.attr.Kind, ch.attr.Value), sev)
+				pendingChanges = append(pendingChanges, pendingChange{
+					changeType: desc,
+					newVal:     fmt.Sprintf("%s %s: %s", ch.action, ch.attr.Kind, ch.attr.Value),
+					severity:   sev,
+				})
 				// A NEW external script/iframe or a changed form action is a real
-				// finding (supply-chain injection / phishing) — raise it.
+				// finding (supply-chain injection / phishing) — raise it after commit.
 				if ch.action == "added" && (sev == "high" || sev == "medium") {
-					s.storeSecurityFinding(targetID, svc.URL, ch, sev)
+					pendingFindings = append(pendingFindings, pendingFinding{ch: ch, sev: sev})
 				}
-				changed++
 			}
 			// ── Security-header regression (HSTS/CSP/X-Frame removed) ──
 			for _, h := range removedHeaders {
-				desc := "security_header_removed"
 				logFn("warn", "monitor", fmt.Sprintf("[SECURITY HEADER REMOVED] %s: %s", svc.URL, h))
-				s.recordChange(targetID, svc.URL, desc, h+" present", h+" removed", "high")
-				s.storeHeaderRegression(targetID, svc.URL, h)
-				changed++
+				pendingChanges = append(pendingChanges, pendingChange{
+					changeType: "security_header_removed",
+					oldVal:     h + " present",
+					newVal:     h + " removed",
+					severity:   "high",
+				})
+				pendingHeaderRegressions = append(pendingHeaderRegressions, h)
 			}
 		}
 
 		// ── Content / status / title change (normalized) ──
-		if newStatus != svc.StatusCode || newTitle != svc.Title || contentChanged {
-			changeDesc := s.describeChange(svc.StatusCode, newStatus, svc.Title, newTitle, svc.NormHash, newNormHash)
+		if statusChanged || titleChanged || contentChanged {
+			changeDesc := s.describeChange(baseStatus, newStatus, baseTitle, newTitle, baseNormHash, newNormHash)
 			logFn("warn", "monitor", fmt.Sprintf("[CHANGE] %s: %s", svc.URL, changeDesc))
-			// A status-code transition is a stronger signal than a body tweak.
-			sev := "low"
-			if newStatus != svc.StatusCode {
-				sev = classifyChangeSeverity("status")
+			if !statusChanged && !titleChanged && contentChanged {
+				pendingChanges = append(pendingChanges, pendingChange{
+					changeType: "content_change",
+					oldVal:     baseNormHash,
+					newVal:     newNormHash,
+					severity:   "low",
+				})
+			} else {
+				// A status-code transition is a stronger signal than a body tweak.
+				sev := "low"
+				if statusChanged {
+					sev = classifyChangeSeverity("status")
+				}
+				pendingChanges = append(pendingChanges, pendingChange{
+					changeType: "http_change",
+					oldVal:     fmt.Sprintf("status=%d title=%s", baseStatus, baseTitle),
+					newVal:     fmt.Sprintf("status=%d title=%s", newStatus, newTitle),
+					severity:   sev,
+				})
 			}
-			s.recordChange(targetID, svc.URL, "http_change",
-				fmt.Sprintf("status=%d title=%s", svc.StatusCode, svc.Title),
-				fmt.Sprintf("status=%d title=%s", newStatus, newTitle), sev)
-			changed++
 		}
 
 		// ── Technology-stack change ──
@@ -215,39 +268,70 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		// the monitor only ever compared status/title/body/security, never the
 		// detected technology.
 		newServer := strings.TrimSpace(hdr.Get("Server"))
-		oldServer := strings.TrimSpace(svc.Server)
-		serverChanged := newServer != "" && oldServer != "" && !strings.EqualFold(newServer, oldServer)
+		oldServer := strings.TrimSpace(baseServer)
+		serverChanged := hasBaseline && newServer != "" && oldServer != "" && !strings.EqualFold(newServer, oldServer)
 		if serverChanged {
 			logFn("info", "monitor", fmt.Sprintf("[TECH CHANGE] %s: Server %q → %q", svc.URL, oldServer, newServer))
-			s.recordChange(targetID, svc.URL, "tech_change",
-				"Server: "+oldServer, "Server: "+newServer, classifyChangeSeverity("tech_change"))
-			changed++
+			pendingChanges = append(pendingChanges, pendingChange{
+				changeType: "tech_change",
+				oldVal:     "Server: " + oldServer,
+				newVal:     "Server: " + newServer,
+				severity:   classifyChangeSeverity("tech_change"),
+			})
 		}
 
-		// Always update the stored baseline (norm hash + security snapshot + server).
-		storeServer := oldServer
+		// Always update the stored baseline (norm hash + security snapshot + server)
+		// atomically alongside any detected monitoring_changes and notifications.
+		monitorServer := oldServer
 		if newServer != "" {
-			storeServer = newServer
+			monitorServer = newServer
 		}
-		if _, err := s.db.ExecContext(ctx, `
-			UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, last_seen=CURRENT_TIMESTAMP
-			WHERE id=?
-		`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID); err != nil {
-			logFn("warn", "monitor", fmt.Sprintf("update service baseline: %v", err))
+		storeServer := monitorServer
+		if storeServer == "" {
+			storeServer = strings.TrimSpace(svc.Server)
+		}
+
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("begin monitor transaction for %s: %v", svc.URL, err))
 			continue
 		}
-		// Keep the deep-probe and monitor baselines in step with the committed
-		// observation, so the next probe cannot emit a duplicate status event.
-		baselineURL := NormalizeServiceURL(svc.URL)
-		if err := upsertObservationBaseline(ctx, s.db, targetID, baselineURL,
-			ObservationDeep, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
-			logFn("warn", "monitor", fmt.Sprintf("sync deep baseline: %v", err))
+		var recorded []monitorRecordedChange
+		txErr := func() error {
+			for _, pc := range pendingChanges {
+				rec, err := insertChangeTx(ctx, tx, targetID, svc.URL, pc.changeType, pc.oldVal, pc.newVal, pc.severity)
+				if err != nil {
+					return fmt.Errorf("record %s: %w", pc.changeType, err)
+				}
+				recorded = append(recorded, rec)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, last_seen=CURRENT_TIMESTAMP
+				WHERE id=?
+			`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID); err != nil {
+				return fmt.Errorf("update service baseline: %w", err)
+			}
+			// Advance only the monitor baseline; deep and watch probes keep their
+			// own independent baselines in http_observation_baselines.
+			if err := upsertObservationBaseline(ctx, tx, targetID, baselineURL,
+				ObservationMonitor, newStatus, newTitle, monitorServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
+				return fmt.Errorf("sync monitor baseline: %w", err)
+			}
+			return tx.Commit()
+		}()
+		if txErr != nil {
+			_ = tx.Rollback()
+			logFn("warn", "monitor", fmt.Sprintf("persist monitor update for %s: %v", svc.URL, txErr))
 			continue
 		}
-		if err := upsertObservationBaseline(ctx, s.db, targetID, baselineURL,
-			ObservationMonitor, newStatus, newTitle, storeServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
-			logFn("warn", "monitor", fmt.Sprintf("sync monitor baseline: %v", err))
-			continue
+
+		changed += len(recorded)
+		s.broadcastRecordedChanges(targetID, recorded)
+		for _, pf := range pendingFindings {
+			s.storeSecurityFinding(targetID, svc.URL, pf.ch, pf.sev)
+		}
+		for _, h := range pendingHeaderRegressions {
+			s.storeHeaderRegression(targetID, svc.URL, h)
 		}
 	}
 
@@ -293,11 +377,17 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 					continue
 				}
 				logFn("warn", "monitor", fmt.Sprintf("[JS CHANGE] %s hash changed", jf.URL))
-				s.recordChange(targetID, jf.URL, "js_change", jf.Hash, newHash, classifyChangeSeverity("js_change"))
+				if err := s.recordChange(targetID, jf.URL, "js_change", jf.Hash, newHash, classifyChangeSeverity("js_change")); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("record js change for %s: %v", jf.URL, err))
+					continue
+				}
 				// Roll the previous content into old_* for the diff drawer, then
 				// publish the new baseline in one go.
-				_, _ = s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, body=?, old_hash=?, old_body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`,
-					newHash, newSize, newBody, jf.Hash, jf.Body, jf.ID)
+				if _, err := s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, body=?, old_hash=?, old_body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`,
+					newHash, newSize, newBody, jf.Hash, jf.Body, jf.ID); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("update js baseline for %s: %v", jf.URL, err))
+					continue
+				}
 				changed++
 				continue
 			}
@@ -305,10 +395,14 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			// was never written, so that JS file could change forever undetected.
 			// The content capture is written alongside it on the first pass only —
 			// rewriting unchanged 256KB bodies every pass is pure write churn.
+			var updateErr error
 			if jf.Body == "" {
-				_, _ = s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, newBody, jf.ID)
+				_, updateErr = s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, newBody, jf.ID)
 			} else {
-				_, _ = s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, jf.ID)
+				_, updateErr = s.db.ExecContext(ctx, `UPDATE js_files SET hash=?, size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, jf.ID)
+			}
+			if updateErr != nil {
+				logFn("warn", "monitor", fmt.Sprintf("update js baseline for %s: %v", jf.URL, updateErr))
 			}
 		}
 	}
@@ -355,21 +449,31 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 					continue
 				}
 				logFn("warn", "monitor", fmt.Sprintf("[CSS CHANGE] %s hash changed", cf.URL))
-				s.recordChange(targetID, cf.URL, "css_change", cf.Hash, newHash, classifyChangeSeverity("css_change"))
-				_, _ = s.db.ExecContext(ctx, `UPDATE css_files SET hash=?, size=?, body=?, old_hash=?, old_body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`,
-					newHash, newSize, newBody, cf.Hash, cf.Body, cf.ID)
+				if err := s.recordChange(targetID, cf.URL, "css_change", cf.Hash, newHash, classifyChangeSeverity("css_change")); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("record css change for %s: %v", cf.URL, err))
+					continue
+				}
+				if _, err := s.db.ExecContext(ctx, `UPDATE css_files SET hash=?, size=?, body=?, old_hash=?, old_body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`,
+					newHash, newSize, newBody, cf.Hash, cf.Body, cf.ID); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("update css baseline for %s: %v", cf.URL, err))
+					continue
+				}
 				changed++
 				continue
 			}
+			var updateErr error
 			if cf.Hash == "" {
 				// Establish the baseline without ringing the bell (same as JS).
-				_, _ = s.db.ExecContext(ctx, `UPDATE css_files SET hash=?, size=?, body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, newBody, cf.ID)
+				_, updateErr = s.db.ExecContext(ctx, `UPDATE css_files SET hash=?, size=?, body=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newHash, newSize, newBody, cf.ID)
 			} else if cf.Body == "" {
 				// Legacy row that predates capture: backfill the content snapshot
 				// so the next real change has a "before" side to diff against.
-				_, _ = s.db.ExecContext(ctx, `UPDATE css_files SET body=?, size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newBody, newSize, cf.ID)
+				_, updateErr = s.db.ExecContext(ctx, `UPDATE css_files SET body=?, size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newBody, newSize, cf.ID)
 			} else {
-				_, _ = s.db.ExecContext(ctx, `UPDATE css_files SET size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newSize, cf.ID)
+				_, updateErr = s.db.ExecContext(ctx, `UPDATE css_files SET size=?, last_seen=CURRENT_TIMESTAMP WHERE id=?`, newSize, cf.ID)
+			}
+			if updateErr != nil {
+				logFn("warn", "monitor", fmt.Sprintf("update css baseline for %s: %v", cf.URL, updateErr))
 			}
 		}
 	}
@@ -466,11 +570,11 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 	if err != nil {
 		return 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,value,COALESCE(asset_type,'domain'),COALESCE(metadata,'{}')
+	rows, err := s.db.QueryContext(ctx, `SELECT id,value,COALESCE(asset_type,'domain'),CASE WHEN metadata IS NULL OR metadata = '' THEN '{}' ELSE metadata END
 		FROM assets WHERE target_id=? AND COALESCE(approval_status,'approved')='approved' AND COALESCE(monitor_enabled,1)=1
 		  AND COALESCE(kind,'web')='web'
 		  AND NOT (COALESCE(source,'')='watch:scope' AND COALESCE(asset_type,'')='subdomain')
-		  AND COALESCE(json_extract(COALESCE(metadata,'{}'),'$.out_of_scope'),0) <> 1`, targetID)
+		  AND COALESCE(json_extract(CASE WHEN metadata IS NULL OR metadata = '' THEN '{}' ELSE metadata END,'$.out_of_scope'),0) <> 1`, targetID)
 	if err != nil {
 		return 0, err
 	}
@@ -479,9 +583,10 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 	var assets []record
 	for rows.Next() {
 		var a record
-		if rows.Scan(&a.id, &a.value, &a.typ, &a.metadata) == nil {
-			assets = append(assets, a)
+		if err := rows.Scan(&a.id, &a.value, &a.typ, &a.metadata); err != nil {
+			return 0, err
 		}
+		assets = append(assets, a)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
@@ -552,7 +657,10 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 					logFn("info", "monitor", fmt.Sprintf("Ignoring unstable one-off JavaScript response from %s", u))
 					continue
 				}
-				s.recordChange(targetID, u, "js_change", oldHash, newHash, classifyChangeSeverity("js_change"))
+				if err := s.recordChange(targetID, u, "js_change", oldHash, newHash, classifyChangeSeverity("js_change")); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("record project js change for %s: %v", u, err))
+					continue
+				}
 				logFn("warn", "monitor", fmt.Sprintf("[PROJECT JS CHANGE] %s", u))
 				changed++
 			}
@@ -602,17 +710,26 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 				}
 				body, hdr = confirmBody, confirmHeader
 			}
+			recordFailed := false
 			if oldRaw, _ := meta["monitor_security_snapshot"].(string); oldRaw != "" {
 				for _, ch := range securityChanges {
 					severity := securityChangeSeverity(ch)
-					s.recordChange(targetID, u, fmt.Sprintf("security:%s_%s", ch.attr.Kind, ch.action), "", fmt.Sprintf("%s %s: %s", ch.action, ch.attr.Kind, ch.attr.Value), severity)
+					if err := s.recordChange(targetID, u, fmt.Sprintf("security:%s_%s", ch.attr.Kind, ch.action), "", fmt.Sprintf("%s %s: %s", ch.action, ch.attr.Kind, ch.attr.Value), severity); err != nil {
+						logFn("warn", "monitor", fmt.Sprintf("record project security change for %s: %v", u, err))
+						recordFailed = true
+						continue
+					}
 					if ch.action == "added" && (severity == "high" || severity == "medium") {
 						s.storeSecurityFinding(targetID, u, ch, severity)
 					}
 					changed++
 				}
 				for _, header := range removedHeaders {
-					s.recordChange(targetID, u, "security_header_removed", header+" present", header+" removed", "high")
+					if err := s.recordChange(targetID, u, "security_header_removed", header+" present", header+" removed", "high"); err != nil {
+						logFn("warn", "monitor", fmt.Sprintf("record project security header change for %s: %v", u, err))
+						recordFailed = true
+						continue
+					}
 					s.storeHeaderRegression(targetID, u, header)
 					changed++
 				}
@@ -622,9 +739,16 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 				if int(oldStatus) != status {
 					severity = classifyChangeSeverity("status")
 				}
-				s.recordChange(targetID, u, "page_change", fmt.Sprintf("status=%d title=%s", int(oldStatus), oldTitle), fmt.Sprintf("status=%d title=%s", status, title), severity)
-				logFn("warn", "monitor", fmt.Sprintf("[PROJECT PAGE CHANGE] %s", u))
-				changed++
+				if err := s.recordChange(targetID, u, "page_change", fmt.Sprintf("status=%d title=%s", int(oldStatus), oldTitle), fmt.Sprintf("status=%d title=%s", status, title), severity); err != nil {
+					logFn("warn", "monitor", fmt.Sprintf("record project page change for %s: %v", u, err))
+					recordFailed = true
+				} else {
+					logFn("warn", "monitor", fmt.Sprintf("[PROJECT PAGE CHANGE] %s", u))
+					changed++
+				}
+			}
+			if recordFailed {
+				continue
 			}
 			meta["monitor_hash"] = newHash
 			meta["monitor_status"] = status
@@ -634,8 +758,14 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 			meta["monitor_checked_at"] = time.Now().UTC().Format(time.RFC3339)
 		}
 		meta["monitor_url"] = u
-		encoded, _ := json.Marshal(meta)
-		_, _ = s.db.ExecContext(ctx, `UPDATE assets SET metadata=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, string(encoded), a.id)
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("encode asset metadata for %s: %v", a.id, err))
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE assets SET metadata=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, string(encoded), a.id); err != nil {
+			logFn("warn", "monitor", fmt.Sprintf("update asset metadata for %s: %v", a.id, err))
+		}
 	}
 	return changed, nil
 }
@@ -670,40 +800,96 @@ func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, h
 	return resp.StatusCode, extractTitle(string(body)), string(body), resp.Header, nil
 }
 
-// recordChange inserts a monitoring_changes row with a severity classification,
-// and raises a matching notification so the operator sees it in the bell menu.
-func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal, severity string) error {
+type monitorRecordedChange struct {
+	changeID   string
+	url        string
+	changeType string
+	oldVal     string
+	newVal     string
+	severity   string
+	oldStatus  int
+	newStatus  int
+	alertable  bool
+}
+
+func insertChangeTx(ctx context.Context, exec execContexter, targetID, rawURL, changeType, oldVal, newVal, severity string) (monitorRecordedChange, error) {
 	changeID := uuid.New().String()
 	oldStatus := statusCodeFromValue(oldVal)
 	newStatus := statusCodeFromValue(newVal)
-	_, err := s.db.ExecContext(context.Background(), `
+	if _, err := exec.ExecContext(ctx, `
 		INSERT INTO monitoring_changes (id, target_id, url, change_type, old_value, new_value, severity, old_status, new_status, detected_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		changeID, targetID, url, changeType, oldVal, newVal, severity, oldStatus, newStatus)
+		changeID, targetID, rawURL, changeType, oldVal, newVal, severity, oldStatus, newStatus); err != nil {
+		return monitorRecordedChange{}, err
+	}
+
+	alertable := monitorAlertableChange(changeType, oldStatus, newStatus)
+	if alertable {
+		title := notificationTitle(changeType)
+		body := rawURL
+		if newVal != "" {
+			body = rawURL + " — " + newVal
+		}
+		notifSeverity := severity
+		if notifSeverity == "" {
+			notifSeverity = "info"
+		}
+		if _, err := exec.ExecContext(ctx, `
+			INSERT INTO notifications (id, target_id, type, title, body, url, severity, is_read, metadata, change_id, old_value, new_value, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0, '{}', ?, ?, ?, CURRENT_TIMESTAMP)`,
+			uuid.New().String(), targetID, changeType, title, body, rawURL, notifSeverity, changeID, oldVal, newVal); err != nil {
+			return monitorRecordedChange{}, err
+		}
+	}
+	return monitorRecordedChange{
+		changeID:   changeID,
+		url:        rawURL,
+		changeType: changeType,
+		oldVal:     oldVal,
+		newVal:     newVal,
+		severity:   severity,
+		oldStatus:  oldStatus,
+		newStatus:  newStatus,
+		alertable:  alertable,
+	}, nil
+}
+
+func (s *MonitorScanner) broadcastRecordedChanges(targetID string, events []monitorRecordedChange) {
+	if s.broadcast == nil || len(events) == 0 {
+		return
+	}
+	// Only real status transitions and security/script/header changes ring the
+	// bell. Routine title and body drift stays in monitoring_changes and Changes.
+	s.broadcast("changes_written", map[string]any{"target_id": targetID, "count": len(events)})
+	for _, ev := range events {
+		if !ev.alertable {
+			continue
+		}
+		s.broadcast("notification_created", map[string]any{
+			"target_id": targetID, "type": ev.changeType, "severity": ev.severity,
+			"change_id": ev.changeID, "old_value": ev.oldVal, "new_value": ev.newVal,
+			"old_status": ev.oldStatus, "new_status": ev.newStatus, "url": ev.url,
+		})
+	}
+}
+
+// recordChange inserts a monitoring_changes row with a severity classification,
+// and raises a matching notification so the operator sees it in the bell menu.
+func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal, severity string) error {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-
-	// Only real status transitions and security/script/header changes ring the
-	// bell. Routine title and body drift stays in monitoring_changes and Changes.
-	if s.broadcast != nil {
-		s.broadcast("changes_written", map[string]any{"target_id": targetID, "count": 1})
+	defer func() { _ = tx.Rollback() }()
+	rec, err := insertChangeTx(ctx, tx, targetID, url, changeType, oldVal, newVal, severity)
+	if err != nil {
+		return err
 	}
-	if monitorAlertableChange(changeType, oldStatus, newStatus) {
-		title := notificationTitle(changeType)
-		body := url
-		if newVal != "" {
-			body = url + " — " + newVal
-		}
-		notifyWithIdentity(s.db, targetID, changeType, title, body, url, severity, "{}", changeID, oldVal, newVal)
-		if s.broadcast != nil {
-			s.broadcast("notification_created", map[string]any{
-				"target_id": targetID, "type": changeType, "severity": severity,
-				"change_id": changeID, "old_value": oldVal, "new_value": newVal,
-				"old_status": oldStatus, "new_status": newStatus, "url": url,
-			})
-		}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
+	s.broadcastRecordedChanges(targetID, []monitorRecordedChange{rec})
 	return nil
 }
 

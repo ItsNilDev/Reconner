@@ -42,7 +42,7 @@ func NewCachePoisonScanner(db *database.DB, exec *tools.Executor, cfg *config.Co
 	return &CachePoisonScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var cachePoisonClient = newPooledClient(12*time.Second, false)
+var cachePoisonClient = ScannerClient(12 * time.Second)
 
 // Unkeyed headers that frameworks/CDNs commonly reflect into responses (links,
 // redirects, canonical tags) while omitting them from the cache key.

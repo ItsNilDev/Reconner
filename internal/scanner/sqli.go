@@ -33,13 +33,7 @@ func NewSQLiScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &SQLiScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var sqliHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   20 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var sqliHTTPClient = ScannerClient(20 * time.Second)
 
 // SQL error signatures — presence after a quote injection = error-based SQLi.
 var sqlErrorSignatures = []*regexp.Regexp{

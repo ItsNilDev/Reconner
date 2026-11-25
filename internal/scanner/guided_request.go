@@ -327,4 +327,4 @@ func (g *guidedContext) guidedPathAllowed(base, candidate *url.URL) bool {
 	return false
 }
 
-var guidedClient = &http.Client{Transport: identityRoundTripper{}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+var guidedClient = ScannerClient(12 * time.Second)

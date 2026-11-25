@@ -39,13 +39,7 @@ func NewParamFuzzScanner(db *database.DB, exec *tools.Executor, cfg *config.Conf
 	return &ParamFuzzScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var paramFuzzClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   12 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var paramFuzzClient = ScannerClient(12 * time.Second)
 
 const (
 	pfCanary          = "rcnfz9137"

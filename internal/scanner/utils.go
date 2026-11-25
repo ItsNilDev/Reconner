@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -13,17 +12,6 @@ import (
 )
 
 type LogFunc func(level, module, message string)
-
-var probeHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   10 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
 
 func probeURL(url string) *models.HTTPService {
 	return probeURLWithContext(context.Background(), url)
@@ -40,19 +28,7 @@ func probeURLWithContext(ctx context.Context, rawURL string) *models.HTTPService
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	client := &http.Client{
-		Transport: sharedHTTPTransport,
-		Timeout:   10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return http.ErrUseLastResponse
-			}
-			if !urlHostInScope(ctx, req.URL.String()) {
-				return fmt.Errorf("%w: redirect to %s is outside scope", ErrDestinationBlocked, req.URL.Host)
-			}
-			return nil
-		},
-	}
+	client := ScannerRedirectClient(10*time.Second, 5, RedirectInScope)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {

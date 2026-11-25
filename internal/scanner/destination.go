@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -138,7 +139,7 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	}
 	// Literal-IP destination: validate directly (no DNS), then dial it.
 	if ip := net.ParseIP(host); ip != nil {
-		if isDisallowedDestIP(ip) || (!excl.Empty() && excl.ExcludesWithIPs(host, []net.IP{ip})) {
+		if isDisallowedDestIP(ip) || (!excl.Empty() && excl.ExcludesWithIPs(net.JoinHostPort(host, port), []net.IP{ip})) {
 			return nil, fmt.Errorf("%w: %s", ErrDestinationBlocked, host)
 		}
 		return credentialBaseDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -153,6 +154,15 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	ips, err := validateResolvedIPs(host, resolved)
 	if err != nil {
 		return nil, err
+	}
+	if !excl.Empty() {
+		rawIPs := make([]net.IP, len(ips))
+		for i, ia := range ips {
+			rawIPs[i] = ia.IP
+		}
+		if excl.ExcludesWithIPs(net.JoinHostPort(host, port), rawIPs) {
+			return nil, fmt.Errorf("%w: %s resolves into an excluded CIDR", ErrDestinationBlocked, host)
+		}
 	}
 	var lastErr error
 	for _, ia := range ips {
@@ -181,4 +191,62 @@ var guardedCredentialTransport = &http.Transport{
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
 	TLSClientConfig:       baseHTTPTransport.TLSClientConfig,
+}
+
+type credentialClientConfig struct {
+	http1Only     bool
+	jar           http.CookieJar
+	checkRedirect func(*http.Request, []*http.Request) error
+}
+
+// CredentialClientOption customizes a client built by CredentialClient.
+type CredentialClientOption func(*credentialClientConfig)
+
+// WithCredentialHTTP1Only forces HTTP/1.1 on a cloned guarded transport.
+func WithCredentialHTTP1Only() CredentialClientOption {
+	return func(cfg *credentialClientConfig) {
+		cfg.http1Only = true
+	}
+}
+
+// WithCredentialCookieJar attaches a cookie jar to the credential client.
+func WithCredentialCookieJar(jar http.CookieJar) CredentialClientOption {
+	return func(cfg *credentialClientConfig) {
+		cfg.jar = jar
+	}
+}
+
+// WithCredentialRedirectCheck overrides the default no-redirect policy.
+// A nil fn leaves the fail-closed default (http.ErrUseLastResponse) intact.
+func WithCredentialRedirectCheck(fn func(*http.Request, []*http.Request) error) CredentialClientOption {
+	return func(cfg *credentialClientConfig) {
+		if fn != nil {
+			cfg.checkRedirect = fn
+		}
+	}
+}
+
+// CredentialClient returns an http.Client backed by guardedCredentialTransport
+// wrapped in identityRoundTripper. By default it refuses to follow redirects.
+func CredentialClient(timeout time.Duration, opts ...CredentialClientOption) *http.Client {
+	cfg := credentialClientConfig{
+		checkRedirect: noRedirectPolicy,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	tr := guardedCredentialTransport
+	if cfg.http1Only {
+		tr = guardedCredentialTransport.Clone()
+		tr.ForceAttemptHTTP2 = false
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return &http.Client{
+		Transport:     identityRoundTripper{base: tr},
+		Timeout:       timeout,
+		Jar:           cfg.jar,
+		CheckRedirect: cfg.checkRedirect,
+	}
 }

@@ -31,22 +31,7 @@ func NewDirScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, lo
 	return &DirScanner{db: db, exec: exec, cfg: cfg, logger: log}
 }
 
-var dirHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   8 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return http.ErrUseLastResponse
-		}
-		// Content discovery must never follow a target-controlled redirect onto a
-		// different host. The original 3xx is still returned and recorded, but no
-		// out-of-scope request is sent.
-		if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var dirHTTPClient = ScannerRedirectClient(8*time.Second, 3, RedirectSameHost)
 
 // soft404 captures how a host responds to a guaranteed-nonexistent path so we
 // can recognise (and discard) catch-all 200 pages during content discovery.

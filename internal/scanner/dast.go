@@ -72,13 +72,7 @@ func NewDASTScanner(db *database.DB, cfg *config.Config, log *logger.Logger, bro
 	return &DASTScanner{db: db, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var dastClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var dastClient = ScannerClient(15 * time.Second)
 
 // unique, collision-resistant markers.
 const (

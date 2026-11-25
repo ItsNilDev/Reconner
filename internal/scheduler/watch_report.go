@@ -208,8 +208,10 @@ func (s *Scheduler) flushScopeLandings() {
 	for _, l := range claimed {
 		byTarget[l.TargetID]++
 	}
-	for tid, count := range byTarget {
-		s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+	if s.hub != nil {
+		for tid, count := range byTarget {
+			s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+		}
 	}
 	s.logger.Info("Closed watch landing audit rows", "count", len(claimed))
 }
@@ -252,8 +254,10 @@ func (s *Scheduler) consumeOutOfScopeWatchEvents(ctx context.Context) {
 	for _, l := range claimedLost {
 		byTarget[l.TargetID]++
 	}
-	for tid, count := range byTarget {
-		s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+	if s.hub != nil {
+		for tid, count := range byTarget {
+			s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+		}
 	}
 }
 

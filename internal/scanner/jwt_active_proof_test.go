@@ -30,9 +30,15 @@ import (
 // which is correct for a real scan but would block this local fixture too.
 func withPlainIdentityClient(t *testing.T) {
 	t.Helper()
-	original := identityHTTPClient
-	identityHTTPClient = &http.Client{Timeout: 5 * time.Second}
-	t.Cleanup(func() { identityHTTPClient = original })
+	origIdentity := identityHTTPClient
+	origJWKS := jwksHTTPClient
+	plain := &http.Client{Timeout: 5 * time.Second}
+	identityHTTPClient = plain
+	jwksHTTPClient = plain
+	t.Cleanup(func() {
+		identityHTTPClient = origIdentity
+		jwksHTTPClient = origJWKS
+	})
 }
 
 func b64u(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

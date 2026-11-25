@@ -1095,12 +1095,12 @@ func (s *Scheduler) ResumeTask(taskID string) (*models.Task, error) {
 	// "select at least one executable module".
 	var remaining, optionTokens, skipped []string
 	for _, m := range all {
-		if done[m] {
-			skipped = append(skipped, m)
-			continue
-		}
 		if scanOptionToken(m) {
 			optionTokens = append(optionTokens, m)
+			continue
+		}
+		if done[m] {
+			skipped = append(skipped, m)
 			continue
 		}
 		remaining = append(remaining, m)
@@ -1187,18 +1187,22 @@ func (s *Scheduler) CancelTask(taskID string) error {
 // Called before a target is deleted so a scan can't keep running in the
 // background — the cause of "I deleted it but an hour later Telegram pinged me".
 func (s *Scheduler) CancelTasksForTarget(targetID string) error {
-	rows, err := s.db.Query(`SELECT id FROM tasks WHERE target_id = ? AND status IN ('running','pending','paused','interrupted')`, targetID)
+	rows, err := s.db.Query(`SELECT id, COALESCE(type,'') FROM tasks WHERE target_id = ? AND status IN ('running','pending','paused','interrupted')`, targetID)
 	if err != nil {
 		return err
 	}
-	var ids []string
+	type cancelledTask struct {
+		id       string
+		taskType string
+	}
+	var tasks []cancelledTask
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var t cancelledTask
+		if err := rows.Scan(&t.id, &t.taskType); err != nil {
 			rows.Close()
 			return err
 		}
-		ids = append(ids, id)
+		tasks = append(tasks, t)
 	}
 	if err := rows.Close(); err != nil {
 		return err
@@ -1211,29 +1215,47 @@ func (s *Scheduler) CancelTasksForTarget(targetID string) error {
 	// module that's slow to notice cancellation can't keep the target's scan (or
 	// the queue behind it) running in the background after deletion.
 	s.mu.Lock()
-	for _, id := range ids {
-		if cancel, ok := s.cancelMap[id]; ok {
+	for _, t := range tasks {
+		if cancel, ok := s.cancelMap[t.id]; ok {
 			cancel()
 		}
-		delete(s.cancelMap, id)
-		delete(s.running, id)
-		delete(s.taskTargets, id)
-		delete(s.taskTypes, id)
+		delete(s.cancelMap, t.id)
+		delete(s.running, t.id)
+		delete(s.taskTargets, t.id)
+		delete(s.taskTypes, t.id)
 	}
 	s.mu.Unlock()
-	for _, id := range ids {
-		s.clearTaskControls(id)
+	for _, t := range tasks {
+		s.clearTaskControls(t.id)
 	}
 
-	for _, id := range ids {
+	var hadWatch, hadMonitor bool
+	for _, t := range tasks {
 		if _, err := s.db.Exec(`UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-			WHERE id=? AND status IN ('running','pending','paused','interrupted')`, id); err != nil {
+			WHERE id=? AND status IN ('running','pending','paused','interrupted')`, t.id); err != nil {
 			return err
 		}
-		s.hub.Broadcast("task_cancelled", map[string]string{"task_id": id, "target_id": targetID})
+		s.finishUnresolvedTaskPhases(t.id, "cancelled", "Task cancelled")
+		if s.hub != nil {
+			s.hub.Broadcast("task_cancelled", map[string]string{"task_id": t.id, "target_id": targetID})
+		}
+		if t.taskType == watchScanType {
+			hadWatch = true
+		}
+		if t.taskType == monitorWatchType {
+			hadMonitor = true
+		}
 	}
-	if len(ids) > 0 {
-		s.logger.Info("Cancelled running tasks for deleted target", "target", targetID, "count", len(ids))
+	if hadWatch {
+		s.applyWatchTerminalRules(targetID, "cancelled")
+	}
+	if hadMonitor {
+		if _, err := s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID); err != nil {
+			return err
+		}
+	}
+	if len(tasks) > 0 {
+		s.logger.Info("Cancelled running tasks for deleted target", "target", targetID, "count", len(tasks))
 	}
 	s.refreshTargetScanStatus(targetID, "idle", false)
 	return nil
@@ -1701,11 +1723,17 @@ func (s *Scheduler) tryStartTask(taskID string) {
 // asset). Without this the stale round would start later and run the wrong
 // pipeline on the wrong project.
 func (s *Scheduler) cancelStaleWatchTask(taskID, targetID string) {
-	_, _ = s.db.Exec(`UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP,
-		updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'`, taskID)
+	if _, err := s.db.Exec(`UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP,
+		updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'`, taskID); err != nil {
+		s.logger.Warn("Could not cancel stale watch round", "task_id", taskID, "target_id", targetID, "error", err)
+		return
+	}
+	s.finishUnresolvedTaskPhases(taskID, "cancelled", "Stale watch task cancelled")
 	s.logger.Info("Dropped stale watch round — project is no longer a watch project",
 		"task_id", taskID, "target_id", targetID)
-	s.hub.Broadcast("task_cancelled", map[string]string{"task_id": taskID, "target_id": targetID})
+	if s.hub != nil {
+		s.hub.Broadcast("task_cancelled", map[string]string{"task_id": taskID, "target_id": targetID})
+	}
 }
 
 // baseScanWatchdog is the FLOOR of the per-phase watchdog — not the whole
@@ -4029,9 +4057,6 @@ func (s *Scheduler) notifyScanDone(taskID, targetID, domain, taskType, status st
 		return
 	}
 	s.notifier.NotifyScanFinished(taskID, targetID, domain, status, duration, stats)
-	s.insertNotification(targetID, "scan_deep", "Scan "+status,
-		fmt.Sprintf("%d host(s) known · %d alive · %d verified finding(s)", subdomains, alive, stats["verified"]),
-		"low")
 }
 
 func (s *Scheduler) monitoringScheduler() {

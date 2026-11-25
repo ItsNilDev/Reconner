@@ -41,7 +41,7 @@ func NewRaceScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &RaceScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var raceClient = newPooledClient(12*time.Second, false)
+var raceClient = ScannerClient(12 * time.Second)
 
 // tokens that suggest a state-changing / limited action worth racing.
 var raceProneTokens = []string{

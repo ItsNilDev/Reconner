@@ -35,16 +35,7 @@ func NewIntelScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, 
 	return &IntelScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var intelClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   12 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 2 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var intelClient = ScannerRedirectClient(12*time.Second, 2, RedirectInScope)
 
 func (s *IntelScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	logFn("info", "intel", "Fingerprinting technologies and running stack-specific checks...")

@@ -40,12 +40,7 @@ import (
 // sqliTimingClient reuses the pooled transport; the per-request deadline (sleep+
 // margin) is set via context, so a real SLEEP can complete while a hung host can't
 // stall the scan forever.
-var sqliTimingClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var sqliTimingClient = ScannerClient(0)
 
 // timingPayload is one DBMS-specific sleep vector; Build injects a given number of
 // seconds into the parameter value for a numeric or quoted context.

@@ -7,7 +7,7 @@ import { cn, safeHref, timeAgo } from '../../lib/utils'
 import { ws } from '../../lib/websocket'
 import { notifyNotificationsChanged } from '../../lib/notifications'
 import {
-  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isDefaultFeedRow, isScopeEvent,
+  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isScopeEvent,
   scopeEventSummary, type ChangeFilter,
 } from './changesModel'
 import InlineChangeDiff from './InlineChangeDiff'
@@ -301,8 +301,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     parseStatusCodes(codesText).length === 0,
     [viewMode, categories, source, severity, selectedTaskId, statusOnly, statusClasses, activeEventId])
 
-  const defaultView = isDefaultView(debouncedQ, debouncedCodes)
-
   // Build query params from explicit text values. Reads pass the debounced
   // values, while writes (mark-all-read) pass the raw values so a click before
   // the debounce settles still targets exactly the rows currently on screen.
@@ -399,8 +397,10 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     } finally {
       inFlight.current = false
       hasLoaded.current = true
-      setLoading(false)
-      setRefreshing(false)
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setRefreshing(false)
+      }
       const next = pendingMode.current
       pendingMode.current = null
       if (next) void loadRef.current?.(next)
@@ -430,7 +430,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       offs.forEach(off => off())
       if (reloadTimer.current) clearTimeout(reloadTimer.current)
     }
-  }, [load])
+  }, [load, targetId])
 
   useEffect(() => {
     if (!activeEventId || handledEventRef.current === activeEventId) return
@@ -517,13 +517,19 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     }
   }
 
-  // Keep the client guard as a safety net; the server now applies the same
-  // filter before pagination.
-  const visibleRows = useMemo(() => {
-    const base = rows
-    return defaultView ? base.filter(isDefaultFeedRow) : base
-  }, [rows, hideSeen, defaultView])
-  const cards = useMemo(() => groupIntoCards(visibleRows), [visibleRows])
+  const cards = useMemo(() => groupIntoCards(rows), [rows])
+  const detailDiffItem = detail?.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
+  const applyQuickFilter = (opts: { categories: ChangeFilter[]; source: string; statusOnly: boolean }) => {
+    setViewMode('all')
+    setCategories(new Set<ChangeFilter>(opts.categories))
+    setSource(opts.source)
+    setStatusOnly(opts.statusOnly)
+    setQ('')
+    setSeverity('')
+    setStatusClasses(new Set<string>())
+    setStatusCodes('')
+    setSelectedTaskId('')
+  }
 
   return (
     <div className={cn('space-y-3', compact && 'space-y-2')}>
@@ -531,6 +537,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-xs text-text-primary">
           Showing focused event
           <button type="button" className="text-accent hover:underline" onClick={() => {
+            handledEventRef.current = ''
             setActiveEventId('')
             setDetail(null)
             onClearEventId?.()
@@ -541,9 +548,10 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         <button type="button" onClick={() => setViewMode('signals')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'signals' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>Daily signals</button>
         <button type="button" onClick={() => setViewMode('all')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'all' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>All history</button>
         <span className="mx-1 text-[10px] text-text-muted">Quick filters</span>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['assets'])); setQ(''); setStatusOnly(false) }}>New hosts</button>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['http'])); setStatusOnly(true) }}>Status flips</button>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['assets'])); setStatusOnly(false) }}>Scope changes</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['assets'], source: 'watch', statusOnly: false })}>New hosts</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['all'], source: '', statusOnly: true })}>Status flips</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['assets'], source: 'bounty', statusOnly: false })}>Scope changes</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['all'], source: 'watch_scope', statusOnly: false })}>Watch scope</button>
       </div>
 
       {/* Time filter */}
@@ -725,9 +733,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
           <Empty message={hideSeen ? 'All changes are marked as seen.' : 'No changes recorded yet.'} />
         ) : (
           cards.map(card => {
-            const first = card.items[0]
             const diffItem = card.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
-            const canDiff = !!diffItem
             const href = safeHref(card.url)
             return (
               <div
@@ -783,7 +789,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                             {hosts.slice(0, 5).map(host => (
                               <span key={host} className="rounded border border-border px-1 font-mono text-[10px] text-text-primary">{host}</span>
                             ))}
-                            {hosts.length > 5 && <span className="text-[10px] text-text-muted">+{hosts.length - 5} more</span>}
+                            {hosts.length > 5 && <button type="button" onClick={() => setDetail(card)} className="text-[10px] text-accent hover:underline">+{hosts.length - 5} more</button>}
                             <CopyButton text={hosts.join('\n')} />
                             {typeof item.metadata?.status === 'number' && <Badge variant="info">HTTP {item.metadata.status}</Badge>}
                             {item.metadata?.in_scope === true && <Badge variant="low">in scope</Badge>}
@@ -801,13 +807,13 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                   <button type="button" onClick={() => setDetail(card)} className="text-accent hover:underline">
                     Details
                   </button>
-                  {canDiff && (
+                  {diffItem && (
                     <button
                       type="button"
                       onClick={() => setDiffView({
                         targetId: card.target_id,
-                        url: card.url,
-                        kind: first.change_type === 'css_change' ? 'css' : 'js',
+                        url: diffItem.url,
+                        kind: diffItem.change_type === 'css_change' ? 'css' : 'js',
                       })}
                       className="text-accent hover:underline"
                     >
@@ -917,6 +923,19 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                 >
                   Open target →
                 </Link>
+              )}
+              {detailDiffItem && (
+                <button
+                  type="button"
+                  onClick={() => setDiffView({
+                    targetId: detail.target_id,
+                    url: detailDiffItem.url,
+                    kind: detailDiffItem.change_type === 'css_change' ? 'css' : 'js',
+                  })}
+                  className="rounded-lg border border-border px-3 py-1.5 text-xs text-accent hover:border-accent/40 hover:bg-accent/10"
+                >
+                  Diff
+                </button>
               )}
               <button
                 type="button"

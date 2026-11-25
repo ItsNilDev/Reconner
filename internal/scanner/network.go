@@ -112,7 +112,7 @@ func (s *NetworkScanner) RunBasicAuth(ctx context.Context, targetID, rawScope st
 	}
 	users := LoadCorpus(dir, "basic_auth_users", defaultBasicAuthUsers())
 	passwords := LoadCorpus(dir, "basic_auth_passwords", defaultBasicAuthPasswords())
-	client := &http.Client{Transport: sharedHTTPTransport, Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := ScannerClient(8 * time.Second)
 	attempts := 0
 	started := time.Now()
 targetLoop:
@@ -247,8 +247,12 @@ func (s *NetworkScanner) Run(ctx context.Context, targetID, rawScope string, log
 		logFn("warn", "network", fmt.Sprintf("Skipped %s: recognised %s edge (%s), not an origin", match.IP, match.Kind, match.Provider))
 		RecordCoverage(ctx, CoverageBlocked, 1)
 	}
+	excl, err := LoadExclusionsE(ctx, s.db, targetID)
+	if err != nil {
+		return fmt.Errorf("load target exclusions: %w", err)
+	}
 	var excluded int
-	kept, excluded = FilterExcludedIPs(kept, LoadExclusions(ctx, s.db, targetID))
+	kept, excluded = FilterExcludedIPs(kept, excl)
 	if excluded > 0 {
 		logFn("info", "network", fmt.Sprintf("Excluded %d out-of-scope address(es) before any network request", excluded))
 		RecordCoverage(ctx, CoverageBlocked, int64(excluded))
@@ -579,7 +583,7 @@ func (s *NetworkScanner) persistNmap(ctx context.Context, targetID string, run n
 				WHERE target_id=? AND ip=? AND port=? AND protocol=?`, port.Service.Name, port.Service.Product, port.Service.Version,
 				banner, boolInt(isWeb), boolInt(tls), targetID, ip, port.Port, port.Protocol)
 			if isWeb {
-				s.probeNetworkHTTP(targetID, ip, port.Port, tls)
+				s.probeNetworkHTTP(ctx, targetID, ip, port.Port, tls)
 			}
 			s.probeKnownExposures(ctx, targetID, ip, port.Port, port.Service.Name)
 		}
@@ -597,7 +601,7 @@ func (s *NetworkScanner) nativeFingerprint(ctx context.Context, targetID string,
 		_, _ = s.db.Exec(`UPDATE network_services SET service=?,banner=?,is_web=?,tls=? WHERE target_id=? AND ip=? AND port=? AND protocol='tcp'`,
 			service, banner, boolInt(isWeb), boolInt(tls), targetID, item.IP, item.Port)
 		if isWeb {
-			s.probeNetworkHTTP(targetID, item.IP, item.Port, tls)
+			s.probeNetworkHTTP(ctx, targetID, item.IP, item.Port, tls)
 		}
 		s.probeKnownExposures(ctx, targetID, item.IP, item.Port, service)
 	}
@@ -667,19 +671,17 @@ func (s *NetworkScanner) storeNetworkFinding(ctx context.Context, targetID, vuln
 	})
 }
 
-func (s *NetworkScanner) probeNetworkHTTP(targetID, ip string, port int, tls bool) {
+func (s *NetworkScanner) probeNetworkHTTP(ctx context.Context, targetID, ip string, port int, tls bool) {
 	scheme := "http"
 	if tls {
 		scheme = "https"
 	}
 	rawURL := scheme + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
-	client := &http.Client{Transport: sharedHTTPTransport, Timeout: 7 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 || (len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname())) {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}}
-	req, _ := http.NewRequest("GET", rawURL, nil)
+	client := ScannerRedirectClient(7*time.Second, 3, RedirectSameHost)
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return

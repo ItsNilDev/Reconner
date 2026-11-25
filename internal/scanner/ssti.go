@@ -3,7 +3,6 @@ package scanner
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,13 +26,7 @@ func NewSSTIScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &SSTIScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var sstiHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var sstiHTTPClient = ScannerClient(15 * time.Second)
 
 type sstiProbe struct {
 	payload string

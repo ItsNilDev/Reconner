@@ -31,16 +31,7 @@ func NewTakeoverScanner(db *database.DB, exec *tools.Executor, cfg *config.Confi
 	return &TakeoverScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var takeoverHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   10 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var takeoverHTTPClient = ScannerRedirectClient(10*time.Second, 5, RedirectSameHost)
 
 // takeoverFingerprint maps a dangling-CNAME provider to the body signature it
 // returns when the resource is unclaimed. Curated from EdOverflow/can-i-take-over-xyz.

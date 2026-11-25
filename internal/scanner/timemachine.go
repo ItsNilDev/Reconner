@@ -36,7 +36,7 @@ func NewTimeMachineScanner(db *database.DB, exec *tools.Executor, cfg *config.Co
 	return &TimeMachineScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var tmHTTPClient = &http.Client{Timeout: 90 * time.Second}
+var tmHTTPClient = ExternalClient(90 * time.Second)
 
 // vuln-prone parameter-name heuristics (lowercased substrings). Mirrors the
 // "juicy param" lists TheTimeMachine ships, condensed and de-duplicated.

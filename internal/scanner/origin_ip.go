@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -332,27 +331,16 @@ func (s *OriginIPScanner) fetchHistoricalIPs(ctx context.Context, domain, key st
 // whether it serves a page (title + length + scheme).
 func (s *OriginIPScanner) probeOrigin(ctx context.Context, ip, domain string) (bool, string, int, string, string) {
 	for _, scheme := range []string{"https", "http"} {
-		var client *http.Client
-		var urlStr string
+		var targetAddr, serverName, urlStr string
 		if scheme == "https" {
-			client = &http.Client{
-				Timeout: 8 * time.Second,
-				Transport: identityRoundTripper{base: &http.Transport{
-					TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: domain}, // #nosec G402 -- direct-IP origin verification intentionally bypasses certificate-chain validation
-					DisableKeepAlives: true,
-					DialContext:       (&net.Dialer{Timeout: 6 * time.Second}).DialContext,
-				}},
-				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-			}
-			urlStr = "https://" + net.JoinHostPort(ip, "443") + "/"
+			targetAddr = net.JoinHostPort(ip, "443")
+			serverName = domain
+			urlStr = "https://" + targetAddr + "/"
 		} else {
-			client = &http.Client{
-				Timeout:       8 * time.Second,
-				Transport:     identityRoundTripper{base: &http.Transport{DisableKeepAlives: true, DialContext: (&net.Dialer{Timeout: 6 * time.Second}).DialContext}},
-				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-			}
-			urlStr = "http://" + net.JoinHostPort(ip, "80") + "/"
+			targetAddr = net.JoinHostPort(ip, "80")
+			urlStr = "http://" + targetAddr + "/"
 		}
+		client := DirectIPClient(6*time.Second, targetAddr, serverName)
 
 		reqCtx, cancel := context.WithTimeout(ctx, 9*time.Second)
 		req, err := http.NewRequestWithContext(reqCtx, "GET", urlStr, nil)

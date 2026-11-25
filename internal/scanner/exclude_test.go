@@ -1,8 +1,13 @@
 package scanner
 
 import (
+	"context"
 	"net"
+	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/recon-platform/internal/database"
 )
 
 func TestExclusions(t *testing.T) {
@@ -132,5 +137,139 @@ func TestExclusionBracketedIPv6(t *testing.T) {
 	set := ParseExclusions("[2001:db8::1]")
 	if !set.Excludes("2001:db8::1") {
 		t.Error("bracketed IPv6 rule must exclude the literal host")
+	}
+}
+
+func TestParseManualExclusionPatterns(t *testing.T) {
+	raw := "  admin.example.com, *.staging.example.com;\n10.0.0.0/8\tadmin.example.com\r\n  #bounty:p1|ignored.test  "
+	got := ParseManualExclusionPatterns(raw)
+	want := []string{
+		"admin.example.com",
+		"*.staging.example.com",
+		"10.0.0.0/8",
+		"#bounty:p1|ignored.test",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseManualExclusionPatterns = %v, want %v", got, want)
+	}
+	if got := ParseManualExclusionPatterns(" , \n\t\r; "); len(got) != 0 {
+		t.Fatalf("expected empty slice for delimiter-only input, got %v", got)
+	}
+}
+
+func TestCompileExclusions(t *testing.T) {
+	set := CompileExclusions([]string{
+		"https://admin.example.com:8443/panel",
+		"10.20.0.0/16",
+		"portal.example.com/secret",
+		"*.dev.example.com",
+		".qa.example.com",
+		"api.example.com:9000",
+		"[2001:db8::1]:8443",
+		"exact.example.com",
+		"#bounty:p1|should-not-parse.example.com",
+		"   ",
+	})
+	for _, host := range []string{
+		"admin.example.com",
+		"admin.example.com:443",
+		"10.20.1.5",
+		"portal.example.com",
+		"dev.example.com",
+		"sub.dev.example.com",
+		"qa.example.com",
+		"sub.qa.example.com",
+		"api.example.com:9000",
+		"[2001:db8::1]:8443",
+		"exact.example.com",
+	} {
+		if !set.Excludes(host) {
+			t.Errorf("expected %q to be excluded", host)
+		}
+	}
+	for _, host := range []string{
+		"api.example.com:443",
+		"should-not-parse.example.com",
+		"app.example.com",
+	} {
+		if set.Excludes(host) {
+			t.Errorf("expected %q not to be excluded", host)
+		}
+	}
+}
+
+func TestLoadExclusionsEFromTable(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "exclusions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO targets (id, domain) VALUES ('t1', 'example.test'), ('t2', 'other.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO target_exclusions (id, target_id, source, program_id, pattern) VALUES
+		('e1', 't1', 'manual', '', 'admin.example.test'),
+		('e2', 't1', 'bounty', 'prog-1', '*.staging.example.test'),
+		('e3', 't2', 'manual', '', 'other-only.example.test')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	set, err := LoadExclusionsE(ctx, db, "t1")
+	if err != nil {
+		t.Fatalf("LoadExclusionsE failed: %v", err)
+	}
+	if !set.Excludes("admin.example.test") {
+		t.Error("expected manual pattern from target_exclusions to be excluded")
+	}
+	if !set.Excludes("api.staging.example.test") {
+		t.Error("expected bounty pattern from target_exclusions to be excluded")
+	}
+	if set.Excludes("other-only.example.test") {
+		t.Error("exclusion from another target must not bleed into t1")
+	}
+
+	if err := ReplaceManualExclusionsTx(ctx, db, "t1", "new-manual.example.test, 192.0.2.0/24"); err != nil {
+		t.Fatalf("ReplaceManualExclusionsTx failed: %v", err)
+	}
+	set, err = LoadExclusionsE(ctx, db, "t1")
+	if err != nil {
+		t.Fatalf("LoadExclusionsE after replace failed: %v", err)
+	}
+	if set.Excludes("admin.example.test") {
+		t.Error("replaced manual pattern should no longer be excluded")
+	}
+	if !set.Excludes("new-manual.example.test") || !set.Excludes("192.0.2.9") {
+		t.Error("new manual patterns should be excluded")
+	}
+	if !set.Excludes("api.staging.example.test") {
+		t.Error("bounty pattern must survive ReplaceManualExclusionsTx")
+	}
+
+	if _, err := LoadExclusionsE(ctx, nil, "t1"); err == nil {
+		t.Error("expected error when db is nil")
+	}
+}
+
+func TestCompileExclusionsAnnotatedBountyRulesAndTrailingDotPort(t *testing.T) {
+	set := CompileExclusions([]string{
+		"*.staging.example.test (do not test)",
+		"10.0.0.0/8 (internal)",
+		"excluded.example.com",
+	})
+	if !set.Excludes("api.staging.example.test") {
+		t.Error("annotated wildcard deny rule must match descendant")
+	}
+	if !set.Excludes("10.20.30.40") {
+		t.Error("annotated CIDR deny rule must match IP in range")
+	}
+	if !set.Excludes("excluded.example.com.:443") {
+		t.Error("trailing-dot FQDN with port must not bypass exclusion")
+	}
+	if !set.Excludes("api.staging.example.test.:8443") {
+		t.Error("trailing-dot descendant FQDN with port must not bypass wildcard exclusion")
 	}
 }

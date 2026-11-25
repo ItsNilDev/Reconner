@@ -60,13 +60,7 @@ type apiPathParameter struct {
 // parses it, and stores its documented query + body parameters so the active
 // modules test the real API surface. Returns the number of endpoints ingested.
 func (s *ParamScanner) harvestAPISpecs(ctx context.Context, targetID string, targetURLs []string, logFn LogFunc) int {
-	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ScannerClient(10 * time.Second)
 	origins := map[string]bool{}
 	for _, u := range targetURLs {
 		if p, err := url.Parse(u); err == nil && p.Host != "" {

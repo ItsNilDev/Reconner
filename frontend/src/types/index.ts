@@ -108,6 +108,11 @@ export interface BountyScopeEvent {
   resolved_at: string | null
 }
 
+export interface ManagedExclusion {
+  program_id: string
+  pattern: string
+}
+
 export interface Target {
   id: string
   domain: string
@@ -118,6 +123,7 @@ export interface Target {
   priority: string
   notes: string
   exclude_scope?: string
+  managed_exclusions?: ManagedExclusion[]
   status: string
   scan_status: string
   enabled_modules: string[]
@@ -314,24 +320,13 @@ export interface VulnFinding {
   screenshot_id?: string
 }
 
-export interface MonitoringChange {
-  id: string
-  target_id: string
-  url: string
-  change_type: string
-  old_value: string
-  new_value: string
-  severity: string
-  detected_at: string
-}
-
 export type ChangeCategory =
   | 'http' | 'scripts' | 'security' | 'tech' | 'headers' | 'assets' | 'alerts'
 
 export interface ChangeEntry {
   id: string
   // bounty holds program-scope rows written by the bounty feed (read-only).
-  source: 'monitor' | 'watch' | 'scope' | 'notification' | 'bounty'
+  source: 'monitor' | 'watch' | 'watch_scope' | 'notification' | 'bounty'
   target_id: string
   target_name: string
   task_id?: string

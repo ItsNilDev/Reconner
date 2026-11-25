@@ -3,16 +3,11 @@ import {
   categoryForChangeType,
   changeBadgeVariant,
   changeHosts,
-  groupMonitorChanges,
   inlineDiffPieces,
-  isDefaultFeedRow,
   isScopeEvent,
-  monitorRowKind,
-  NOTIFICATION_ALLOWED_TYPES,
   parseStatusTransition,
   scopeEventSummary,
 } from './changesModel'
-import type { MonitoringChange } from '../../types'
 
 describe('categoryForChangeType', () => {
   it('maps the new watch change types', () => {
@@ -25,8 +20,10 @@ describe('categoryForChangeType', () => {
   })
 
   it('maps alert change types to the alerts category', () => {
-    for (const type of NOTIFICATION_ALLOWED_TYPES) {
-      if (type === 'new_host') continue
+    for (const type of [
+      'watch_failed', 'watch_kind_conflict', 'monitor_failed',
+      'monitor_escalation_started', 'scan_auto_paused', 'bounty_scope_change',
+    ]) {
       expect(categoryForChangeType(type)).toBe('alerts')
     }
     expect(categoryForChangeType('new_host')).toBe('assets')
@@ -34,8 +31,9 @@ describe('categoryForChangeType', () => {
     expect(categoryForChangeType('scope_rejected')).toBe('assets')
   })
 
-  it('maps redirect_change to http', () => {
+  it('maps redirect_change and content_change to http', () => {
     expect(categoryForChangeType('redirect_change')).toBe('http')
+    expect(categoryForChangeType('content_change')).toBe('http')
   })
 
   it('routes stylesheets and scripts to scripts, not css', () => {
@@ -43,7 +41,6 @@ describe('categoryForChangeType', () => {
     expect(categoryForChangeType('js_change')).toBe('scripts')
     expect(categoryForChangeType('security:script_added')).toBe('scripts')
     expect(categoryForChangeType('security:stylesheet_added')).toBe('scripts')
-    expect(monitorRowKind({ change_type: 'css_change' })).toBe('scripts')
   })
 
   it('routes header changes to headers before the security prefix', () => {
@@ -54,33 +51,6 @@ describe('categoryForChangeType', () => {
   it('falls back to http for unknown or missing types', () => {
     expect(categoryForChangeType('')).toBe('http')
     expect(categoryForChangeType('something_new')).toBe('http')
-  })
-})
-
-describe('isDefaultFeedRow', () => {
-  it('keeps watch host discoveries and bounty scope rows', () => {
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain' })).toBe(true)
-    for (const type of ['scope_landed', 'scope_modified', 'scope_removed']) {
-      expect(isDefaultFeedRow({ source: 'bounty', change_type: type })).toBe(true)
-    }
-  })
-
-  it('keeps only allow-listed alert notifications', () => {
-    for (const type of NOTIFICATION_ALLOWED_TYPES) {
-      expect(isDefaultFeedRow({ source: 'notification', change_type: type })).toBe(type === 'new_host')
-    }
-    expect(isDefaultFeedRow({ source: 'notification', change_type: 'finding' })).toBe(false)
-    expect(isDefaultFeedRow({ source: 'notification', change_type: 'scan_deep' })).toBe(false)
-  })
-
-  it('drops routine monitor and watch noise', () => {
-    // An actual status transition is a daily signal and stays visible.
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change', old_status: 403, new_status: 200 })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'http_change', old_status: 403, new_status: 200 })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'tech_change' })).toBe(false)
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change', old_status: 403, new_status: 200 })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain_extra' })).toBe(false)
-    expect(isDefaultFeedRow({ change_type: 'new_subdomain' })).toBe(false)
   })
 })
 
@@ -96,6 +66,11 @@ describe('changeBadgeVariant', () => {
     expect(changeBadgeVariant({ change_type: 'security:script_added' })).toBe('high')
     expect(changeBadgeVariant({ change_type: 'tech_change' })).toBe('low')
     expect(changeBadgeVariant({ change_type: 'status_change' })).toBe('info')
+  })
+
+  it('tolerates foreign rows without change_type or severity', () => {
+    const stale = { id: 's1', target_id: 't1', subdomain: 'a.example.test' } as Record<string, unknown>
+    expect(changeBadgeVariant(stale)).toBe('info')
   })
 })
 
@@ -122,39 +97,6 @@ describe('changeHosts', () => {
     expect(changeHosts({ change_type: 'new_subdomain' })).toBeNull()
     expect(changeHosts({ change_type: 'new_subdomain', metadata: { hosts: 'a.example' } })).toBeNull()
     expect(changeHosts({ change_type: 'new_subdomain', metadata: { hosts: [] } })).toBeNull()
-  })
-})
-
-describe('groupMonitorChanges', () => {
-  const row = (over: Partial<MonitoringChange>): MonitoringChange => ({
-    id: over.id || 'x',
-    target_id: over.target_id || '',
-    url: over.url || '',
-    change_type: over.change_type || '',
-    old_value: over.old_value || '',
-    new_value: over.new_value || '',
-    severity: over.severity || 'info',
-    detected_at: over.detected_at || '2026-01-01 00:00:00',
-  })
-
-  it('keeps the legacy three-part key for an empty identity', () => {
-    const rows = [
-      row({ id: '1', change_type: 'status_change', old_value: '403', new_value: '200' }),
-      row({ id: '2', change_type: 'status_change', old_value: '403', new_value: '200', url: 'https://b.test' }),
-    ]
-    const groups = groupMonitorChanges(rows)
-    expect(groups).toHaveLength(1)
-    expect(groups[0].items).toHaveLength(2)
-    expect(groups[0].urls).toEqual(['', 'https://b.test'])
-  })
-
-  it('separates identical changes from different targets when identity is supplied', () => {
-    const rows = [
-      row({ id: '1', target_id: 'a', change_type: 'status_change', old_value: '403', new_value: '200' }),
-      row({ id: '2', target_id: 'b', change_type: 'status_change', old_value: '403', new_value: '200' }),
-    ]
-    const groups = groupMonitorChanges(rows, (r: MonitoringChange) => r.target_id)
-    expect(groups).toHaveLength(2)
   })
 })
 
@@ -194,20 +136,10 @@ describe('scope event recognition', () => {
   it('recognizes re-eligible and out-of-scope watch events', () => {
     expect(isScopeEvent({ change_type: 'scope_re_eligible' })).toBe(true)
     expect(isScopeEvent({ change_type: 'out_of_scope' })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'watch_scope', change_type: 'scope_re_eligible' })).toBe(true)
   })
 })
 
-describe('Phase 5 default feed contract', () => {
-  it('admits watch new hosts and real status changes only', () => {
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain' })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change', old_status: 200, new_status: 403 })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'tech_change' })).toBe(false)
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change', old_status: 200, new_status: 200 })).toBe(false)
-    expect(isDefaultFeedRow({ source: 'notification', change_type: 'new_host' })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'notification', change_type: 'watch_failed' })).toBe(false)
-  })
-
+describe('scopeEventSummary', () => {
   it('uses review-state aware scope verbs', () => {
     const base = { change_type: 'scope_landed', url: 'api.example.test' }
     expect(scopeEventSummary({ ...base, source: 'bounty', scope_status: 'pending', program_id: 'p1' })).toContain('Scope proposed.')

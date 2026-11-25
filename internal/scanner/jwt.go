@@ -504,7 +504,7 @@ type jwkSet struct {
 // jwksHTTPClient is a short-timeout, credential-free client used only to fetch
 // PUBLIC JWKS documents for the algorithm-confusion proof below — it never
 // attaches a captured Authorization/Cookie header.
-var jwksHTTPClient = &http.Client{Timeout: 8 * time.Second}
+var jwksHTTPClient = CredentialClient(8 * time.Second)
 
 func fetchJSON(ctx context.Context, rawURL string, out any) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)

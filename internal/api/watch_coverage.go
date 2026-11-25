@@ -103,11 +103,7 @@ func applyWatchCoverage(ctx context.Context, tx *sql.Tx, targetID string, toWatc
 			_, err = tx.ExecContext(ctx, `UPDATE assets SET monitor_enabled = 0 WHERE target_id = ?`, targetID)
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_next_run=NULL, monitor_enabled=0 WHERE id=?`, targetID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE assets SET monitor_enabled = 0 WHERE target_id = ?`, targetID)
+		_, err = tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_next_run=NULL WHERE id=?`, targetID)
 		return err
 	}
 
@@ -334,7 +330,7 @@ func (h *Handler) handlePromoteWatchScope(w http.ResponseWriter, r *http.Request
 	// keeps its own type. Revalidate every row against current policy before
 	// the UPDATE, so a revoked asset cannot become a deep seed.
 	placeholders := make([]string, 0, len(req.Values))
-	args := []any{id}
+	args := []any{id, id}
 	seen := map[string]bool{}
 	blocked := []string{}
 	for _, v := range req.Values {
@@ -368,8 +364,8 @@ func (h *Handler) handlePromoteWatchScope(w http.ResponseWriter, r *http.Request
 	res, err := h.db.ExecContext(r.Context(), `
 		UPDATE assets
 		SET asset_type = 'url',
-		    monitor_enabled = 0,
-		    metadata = json_set(COALESCE(metadata,'{}'), '$.promoted_to_deep', 1, '$.out_of_scope', 0),
+		    monitor_enabled = (SELECT CASE WHEN COALESCE(watch_only,0)=0 AND COALESCE(monitor_enabled,0)=1 THEN 1 ELSE 0 END FROM targets WHERE id = ?),
+		    metadata = json_set(COALESCE(NULLIF(metadata,''),'{}'), '$.promoted_to_deep', 1, '$.out_of_scope', 0),
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE target_id = ? AND source = 'watch:scope' AND value IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {

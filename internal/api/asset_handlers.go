@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -112,6 +113,72 @@ func classifyProjectScope(values []string) string {
 	}
 }
 
+// syncTargetKind recomputes targets.kind from non-suspended assets so adding,
+// editing, or deleting assets never leaves targets.kind stale. If a target has
+// no non-suspended assets, its kind is left unchanged.
+func syncTargetKind(ctx context.Context, exec queryRower, targetID string) error {
+	rows, err := exec.QueryContext(ctx, `
+		SELECT COALESCE(kind,''), COALESCE(asset_type,''), COALESCE(value,'')
+		FROM assets
+		WHERE target_id = ? AND COALESCE(approval_status,'approved') != 'suspended'`, targetID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	hasWeb, hasNetwork := false, false
+	for rows.Next() {
+		var kind, assetType, value string
+		if err := rows.Scan(&kind, &assetType, &value); err != nil {
+			return err
+		}
+		count++
+		switch strings.ToLower(strings.TrimSpace(assetType)) {
+		case "cidr", "ip", "network", "ip_address", "range":
+			hasNetwork = true
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "network":
+			hasNetwork = true
+		case "mixed":
+			hasWeb, hasNetwork = true, true
+		case "web":
+			hasWeb = true
+		default:
+			detected, _, _ := detectAssetKind(value)
+			switch detected {
+			case "network":
+				hasNetwork = true
+			case "mixed":
+				hasWeb, hasNetwork = true, true
+			default:
+				hasWeb = true
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	targetKind := "web"
+	switch {
+	case hasWeb && hasNetwork:
+		targetKind = "mixed"
+	case hasNetwork:
+		targetKind = "network"
+	}
+	_, err = exec.ExecContext(ctx, `UPDATE targets SET kind = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, targetKind, targetID)
+	return err
+}
+
 // parseAssetTime parses a timestamp returned by SQLite. A COALESCE expression
 // has no declared column type, so the driver returns a plain string instead of
 // time.Time. Scan directly into time.Time fails and silently drops the row.
@@ -178,9 +245,15 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 	// A watch-only project cannot run a watch round once it has a network
 	// asset (the project turns mixed). Refuse it with a clear 400 instead of
 	// letting the project stop silently.
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to add asset")
+		return
+	}
+	defer tx.Rollback()
 	if kind == "network" {
 		var watchOnly int
-		if err := h.db.QueryRow(`SELECT COALESCE(watch_only,0) FROM targets WHERE id=?`, id).Scan(&watchOnly); err != nil {
+		if err := tx.QueryRowContext(r.Context(), `SELECT COALESCE(watch_only,0) FROM targets WHERE id=?`, id).Scan(&watchOnly); err != nil {
 			h.writeError(w, http.StatusNotFound, "target not found")
 			return
 		}
@@ -191,7 +264,7 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	assetType := normalizeManualAssetType(req.AssetType, value, kind)
 	aid := uuid.New().String()
-	if _, err := h.db.Exec(
+	if _, err := tx.ExecContext(r.Context(),
 		`INSERT INTO assets (id, target_id, name, value, kind, asset_type, source, approval_status, monitor_enabled, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'manual', 'approved', 1, CURRENT_TIMESTAMP)`,
 		aid, id, strings.TrimSpace(req.Name), value, kind, assetType); err != nil {
@@ -199,6 +272,14 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusConflict, "that asset already exists on this target")
 			return
 		}
+		h.writeError(w, http.StatusInternalServerError, "failed to add asset")
+		return
+	}
+	if err := syncTargetKind(r.Context(), tx, id); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to update target kind")
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to add asset")
 		return
 	}
@@ -313,6 +394,10 @@ func (h *Handler) handleUpdateAsset(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to update asset")
 		return
 	}
+	if err := syncTargetKind(r.Context(), tx, id); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to update target kind")
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to update asset")
 		return
@@ -323,8 +408,14 @@ func (h *Handler) handleUpdateAsset(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 	id, aid := mux.Vars(r)["id"], mux.Vars(r)["aid"]
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to delete asset")
+		return
+	}
+	defer tx.Rollback()
 	var approval, assetType string
-	if err := h.db.QueryRowContext(r.Context(), `SELECT COALESCE(approval_status,'approved'),COALESCE(asset_type,'domain') FROM assets WHERE id=? AND target_id=?`, aid, id).Scan(&approval, &assetType); err != nil {
+	if err := tx.QueryRowContext(r.Context(), `SELECT COALESCE(approval_status,'approved'),COALESCE(asset_type,'domain') FROM assets WHERE id=? AND target_id=?`, aid, id).Scan(&approval, &assetType); err != nil {
 		if err == sql.ErrNoRows {
 			h.writeError(w, http.StatusNotFound, "asset not found")
 		} else {
@@ -335,7 +426,7 @@ func (h *Handler) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 	scannableType := map[string]bool{"domain": true, "wildcard": true, "url": true, "page": true, "js": true, "api": true, "ip": true, "cidr": true}
 	if approval == "approved" && scannableType[assetType] {
 		var remaining int
-		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM assets WHERE target_id=? AND id<>? AND COALESCE(approval_status,'approved')='approved'
+		if err := tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM assets WHERE target_id=? AND id<>? AND COALESCE(approval_status,'approved')='approved'
 			AND COALESCE(asset_type,'domain') IN ('domain','wildcard','url','page','js','api','ip','cidr')`, id, aid).Scan(&remaining); err != nil {
 			h.writeError(w, http.StatusInternalServerError, "failed to validate project scope")
 			return
@@ -345,13 +436,21 @@ func (h *Handler) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	res, err := h.db.ExecContext(r.Context(), `DELETE FROM assets WHERE id=? AND target_id=?`, aid, id)
+	res, err := tx.ExecContext(r.Context(), `DELETE FROM assets WHERE id=? AND target_id=?`, aid, id)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to delete asset")
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		h.writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err := syncTargetKind(r.Context(), tx, id); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to update target kind")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to delete asset")
 		return
 	}
 	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})

@@ -49,15 +49,15 @@ func TestHTTPObservationBaselineMigrationIsAdditive(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("baselines after repeat migration = %d, want 1", count)
 	}
-	var exclude, status string
-	if err := db.QueryRow(`SELECT exclude_scope FROM targets WHERE id='t1'`).Scan(&exclude); err != nil {
+	var exclSource, exclProgramID, exclPattern, status string
+	if err := db.QueryRow(`SELECT source, program_id, pattern FROM target_exclusions WHERE target_id='t1' AND pattern='manual.example.test'`).Scan(&exclSource, &exclProgramID, &exclPattern); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT status_code FROM http_services WHERE id='s1'`).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if exclude != "manual.example.test" || status != "200" {
-		t.Fatalf("prior data lost: exclude=%q status=%q", exclude, status)
+	if exclSource != "manual" || exclProgramID != "" || exclPattern != "manual.example.test" || status != "200" {
+		t.Fatalf("prior data lost: exclusion=(%q,%q,%q) status=%q", exclSource, exclProgramID, exclPattern, status)
 	}
 }
 
@@ -140,5 +140,150 @@ func TestHTTPServiceURLNormalizationKeepsValidStatusOverNewerBareDuplicate(t *te
 	}
 	if id != "good" || url != "https://example.test/" || status != 200 {
 		t.Fatalf("kept service = %s/%s/%d, want good/https://example.test//200", id, url, status)
+	}
+}
+
+func TestNormalizeHTTPServiceURLsPreservesCrossTargetRows(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "normalize-cross-target.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO targets (id,domain) VALUES ('target-a','a.example.test'),('target-b','b.example.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO http_services (id,target_id,url,status_code,title,last_seen) VALUES
+		('svc-a','target-a','https://shared.example.test',200,'Target A','2026-01-01 00:00:00'),
+		('svc-b','target-b','https://shared.example.test/',200,'Target B','2026-01-02 00:00:00'),
+		('svc-q','target-a','https://query.example.test?x=1',200,'Query','2026-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	// Repeat to verify idempotency.
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+
+	var countA, countB int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM http_services WHERE target_id='target-a'`).Scan(&countA); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM http_services WHERE target_id='target-b'`).Scan(&countB); err != nil {
+		t.Fatal(err)
+	}
+	if countA != 2 || countB != 1 {
+		t.Fatalf("row counts after normalization: target-a=%d (want 2), target-b=%d (want 1)", countA, countB)
+	}
+
+	var urlA, urlB, urlQ string
+	if err := db.QueryRow(`SELECT url FROM http_services WHERE id='svc-a' AND target_id='target-a'`).Scan(&urlA); err != nil {
+		t.Fatalf("target-a shared service missing: %v", err)
+	}
+	if err := db.QueryRow(`SELECT url FROM http_services WHERE id='svc-b' AND target_id='target-b'`).Scan(&urlB); err != nil {
+		t.Fatalf("target-b shared service missing: %v", err)
+	}
+	if err := db.QueryRow(`SELECT url FROM http_services WHERE id='svc-q' AND target_id='target-a'`).Scan(&urlQ); err != nil {
+		t.Fatalf("target-a query service missing: %v", err)
+	}
+	if urlA != "https://shared.example.test/" {
+		t.Fatalf("target-a url = %q, want https://shared.example.test/", urlA)
+	}
+	if urlB != "https://shared.example.test/" {
+		t.Fatalf("target-b url = %q, want https://shared.example.test/", urlB)
+	}
+	if urlQ != "https://query.example.test/?x=1" {
+		t.Fatalf("query url = %q, want https://query.example.test/?x=1", urlQ)
+	}
+}
+
+func TestMigrateTargetExclusionsSplitsManualAndBounty(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "exclusions-migration.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := "admin.example.test, 10.0.0.0/8\r\n#bounty:prog-1|*.staging.example.test (do not test)\n"
+	if _, err := db.Exec(`INSERT INTO targets (id, domain, exclude_scope) VALUES ('t1', 'example.test', ?)`, legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+
+	var remainingLegacy string
+	if err := db.QueryRow(`SELECT COALESCE(exclude_scope, '') FROM targets WHERE id='t1'`).Scan(&remainingLegacy); err != nil {
+		t.Fatal(err)
+	}
+	if remainingLegacy != "" {
+		t.Fatalf("targets.exclude_scope after migration = %q, want empty", remainingLegacy)
+	}
+
+	type exclusionRow struct {
+		source    string
+		programID string
+		pattern   string
+	}
+	readRows := func() []exclusionRow {
+		t.Helper()
+		rows, err := db.Query(`SELECT source, program_id, pattern FROM target_exclusions WHERE target_id='t1' ORDER BY source, program_id, pattern`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []exclusionRow
+		for rows.Next() {
+			var r exclusionRow
+			if err := rows.Scan(&r.source, &r.programID, &r.pattern); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	want := []exclusionRow{
+		{source: "bounty", programID: "prog-1", pattern: "*.staging.example.test (do not test)"},
+		{source: "manual", programID: "", pattern: "10.0.0.0/8"},
+		{source: "manual", programID: "", pattern: "admin.example.test"},
+	}
+	got := readRows()
+	if len(got) != len(want) {
+		t.Fatalf("migrated rows = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// Repeat migration must be idempotent and never resurrect deleted rows.
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := readRows(); len(got) != len(want) {
+		t.Fatalf("rows after repeat migration = %+v, want %+v", got, want)
+	}
+	if _, err := db.Exec(`DELETE FROM target_exclusions WHERE target_id='t1' AND pattern='admin.example.test'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := readRows(); len(got) != len(want)-1 {
+		t.Fatalf("deleted exclusion resurrected after repeat migration: got %+v", got)
 	}
 }

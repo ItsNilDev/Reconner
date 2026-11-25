@@ -52,16 +52,7 @@ func NewPassiveScanner(db *database.DB, exec *tools.Executor, cfg *config.Config
 	return &PassiveScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var passiveHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-}
+var passiveHTTPClient = ScannerRedirectClient(15*time.Second, 3, RedirectInScope)
 
 // Server-side error / stack-trace signatures (verbose error disclosure).
 var stackTraceSignatures = []*regexp.Regexp{

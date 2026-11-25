@@ -30,13 +30,7 @@ func NewSSRFScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &SSRFScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var ssrfHTTPClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   15 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var ssrfHTTPClient = ScannerClient(15 * time.Second)
 
 // Cloud-metadata signatures — these must be tokens that appear ONLY in the
 // actual metadata RESPONSE body, never in the request URL we send. Path tokens

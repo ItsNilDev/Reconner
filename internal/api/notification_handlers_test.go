@@ -100,3 +100,51 @@ func TestNotificationReadStateIsPerUser(t *testing.T) {
 		t.Fatalf("one user's read state leaked to admin: unread=%d", got)
 	}
 }
+
+func TestNotificationBucketsCoverAllTypes(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	if _, err := h.db.Exec(`INSERT INTO targets(id,domain,owner_id) VALUES ('b-t','bucket.example',?)`, adminID); err != nil {
+		t.Fatal(err)
+	}
+	watchTypes := []string{"scan_watch", "scope_landed", "watch_failed", "watch_kind_conflict", "new_host", "new_subdomain", "status_change"}
+	deepOnlyTypes := []string{"redirect_change", "content_change", "monitor_escalation_started"}
+	for _, typ := range append(append([]string{}, watchTypes...), deepOnlyTypes...) {
+		if _, err := h.db.Exec(`INSERT INTO notifications(id,target_id,type,title,is_read) VALUES (?,'b-t',?,'t',0)`, "n-"+typ, typ); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listBucket := func(bucket string) map[string]bool {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/notifications?type="+bucket, nil)
+		req = req.WithContext(context.WithValue(req.Context(), ctxUserIDKey, adminID))
+		rec := httptest.NewRecorder()
+		h.handleListNotifications(rec, req)
+		var resp struct {
+			Data struct {
+				Notifications []notification `json:"notifications"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, n := range resp.Data.Notifications {
+			out[n.Type] = true
+		}
+		return out
+	}
+
+	gotWatch := listBucket("watch")
+	for _, typ := range watchTypes {
+		if !gotWatch[typ] {
+			t.Errorf("watch bucket missing type %q (got %v)", typ, gotWatch)
+		}
+	}
+	gotDeep := listBucket("deep")
+	for _, typ := range deepOnlyTypes {
+		if !gotDeep[typ] {
+			t.Errorf("deep bucket missing type %q (got %v)", typ, gotDeep)
+		}
+	}
+}

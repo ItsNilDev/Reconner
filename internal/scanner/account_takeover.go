@@ -39,13 +39,7 @@ func NewAccountTakeoverEngine(db *database.DB, exec *tools.Executor, cfg *config
 	return &AccountTakeoverEngine{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var atoClient = &http.Client{
-	Transport: sharedHTTPTransport,
-	Timeout:   10 * time.Second,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse // capture the FIRST response's Set-Cookie
-	},
-}
+var atoClient = ScannerClient(10 * time.Second)
 
 // atoSensitivePathRe matches URL paths where a redirect/leak hands over an auth
 // secret (OAuth code, SSO assertion, session, reset token).

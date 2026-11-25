@@ -405,7 +405,7 @@ func (s *ParamScanner) discoverForms(ctx context.Context, targetID, domain strin
 	rows.Close()
 	pages = filterURLsByHostScope(ctx, pages)
 
-	client := &http.Client{Timeout: 12 * time.Second, Transport: sharedHTTPTransport}
+	client := ScannerRedirectClient(12*time.Second, 5, RedirectInScope)
 	stored := 0
 	for _, page := range pages {
 		if ctx.Err() != nil {
@@ -627,13 +627,7 @@ func parseSitemapLocs(body string) []string {
 // pathological site cannot stall the scan. Returns the number of candidate URLs
 // emitted to addURL (addURL itself applies the domain + query-param filter).
 func (s *ParamScanner) harvestWellKnown(ctx context.Context, targetURLs []string, addURL func(string)) int {
-	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: sharedHTTPTransport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ScannerClient(10 * time.Second)
 	get := func(u string) string {
 		reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()

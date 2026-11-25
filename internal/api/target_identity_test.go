@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
+	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/websocket"
 )
 
@@ -88,8 +89,14 @@ func TestPartialTargetUpdatePreservesOmittedFields(t *testing.T) {
 	h, _ := newIsoHandler(t)
 	h.hub = websocket.NewHub()
 	_, err := h.db.Exec(`INSERT INTO targets(id,domain,name,description,tags,priority,notes,exclude_scope,enabled_modules,scan_user_agent,scan_headers)
-		VALUES('partial-target','example.com','old name','keep description','["keep-tag"]','high','keep notes','out.example','["http_probe","monitor"]','keep-agent','{"X-Program":"keep-token"}')`)
+		VALUES('partial-target','example.com','old name','keep description','["keep-tag"]','high','keep notes','','["http_probe","monitor"]','keep-agent','{"X-Program":"keep-token"}')`)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('ex-manual','partial-target','manual','','out.example')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('ex-bounty','partial-target','bounty','prog-1','bounty-out.example')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -101,16 +108,58 @@ func TestPartialTargetUpdatePreservesOmittedFields(t *testing.T) {
 		t.Fatalf("update status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var name, description, tags, priority, notes, exclude, modules, userAgent, headers string
-	if err := h.db.QueryRow(`SELECT name,description,tags,priority,notes,exclude_scope,enabled_modules,scan_user_agent,scan_headers
-		FROM targets WHERE id='partial-target'`).Scan(&name, &description, &tags, &priority, &notes, &exclude, &modules, &userAgent, &headers); err != nil {
+	var name, description, tags, priority, notes, modules, userAgent, headers string
+	if err := h.db.QueryRow(`SELECT name,description,tags,priority,notes,enabled_modules,scan_user_agent,scan_headers
+		FROM targets WHERE id='partial-target'`).Scan(&name, &description, &tags, &priority, &notes, &modules, &userAgent, &headers); err != nil {
 		t.Fatal(err)
 	}
 	if name != "new name" || description != "keep description" || tags != `["keep-tag"]` || priority != "high" ||
-		notes != "keep notes" || exclude != "out.example" || modules != `["http_probe","monitor"]` ||
+		notes != "keep notes" || modules != `["http_probe","monitor"]` ||
 		userAgent != "keep-agent" || !strings.Contains(headers, "keep-token") {
-		t.Fatalf("partial update erased data: name=%q description=%q tags=%q priority=%q notes=%q exclude=%q modules=%q ua=%q headers=%q",
-			name, description, tags, priority, notes, exclude, modules, userAgent, headers)
+		t.Fatalf("partial update erased data: name=%q description=%q tags=%q priority=%q notes=%q modules=%q ua=%q headers=%q",
+			name, description, tags, priority, notes, modules, userAgent, headers)
+	}
+
+	getTarget := func() models.Target {
+		t.Helper()
+		getReq := httptest.NewRequest(http.MethodGet, "/api/targets/partial-target", nil)
+		getReq = mux.SetURLVars(getReq, map[string]string{"id": "partial-target"})
+		getRec := httptest.NewRecorder()
+		h.handleGetTarget(getRec, getReq)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status=%d body=%s", getRec.Code, getRec.Body.String())
+		}
+		var resp struct {
+			Data models.Target `json:"data"`
+		}
+		if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Data
+	}
+
+	got := getTarget()
+	if got.ExcludeScope != "out.example" {
+		t.Fatalf("partial update erased manual exclusions: got=%q want=%q", got.ExcludeScope, "out.example")
+	}
+	if len(got.ManagedExclusions) != 1 || got.ManagedExclusions[0].ProgramID != "prog-1" || got.ManagedExclusions[0].Pattern != "bounty-out.example" {
+		t.Fatalf("partial update altered managed exclusions: %#v", got.ManagedExclusions)
+	}
+
+	// Updating manual exclude_scope replaces only manual rows and preserves bounty rules.
+	req2 := httptest.NewRequest(http.MethodPut, "/api/targets/partial-target", strings.NewReader(`{"exclude_scope":"new-manual.example"}`))
+	req2 = mux.SetURLVars(req2, map[string]string{"id": "partial-target"})
+	rec2 := httptest.NewRecorder()
+	h.handleUpdateTarget(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("exclude update status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	got2 := getTarget()
+	if got2.ExcludeScope != "new-manual.example" {
+		t.Fatalf("exclude update got=%q want=%q", got2.ExcludeScope, "new-manual.example")
+	}
+	if len(got2.ManagedExclusions) != 1 || got2.ManagedExclusions[0].ProgramID != "prog-1" || got2.ManagedExclusions[0].Pattern != "bounty-out.example" {
+		t.Fatalf("manual exclude update clobbered managed exclusions: %#v", got2.ManagedExclusions)
 	}
 }
 

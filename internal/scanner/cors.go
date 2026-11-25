@@ -49,13 +49,7 @@ func NewCORSScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 
 // corsClient does NOT follow redirects — CORS headers must be read from the
 // endpoint's own response, not wherever it redirects to.
-var corsClient = &http.Client{
-	Timeout:   12 * time.Second,
-	Transport: sharedHTTPTransport,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var corsClient = ScannerClient(12 * time.Second)
 
 const corsMaxHosts = 300
 

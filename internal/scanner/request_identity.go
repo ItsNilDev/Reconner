@@ -249,7 +249,7 @@ func (t identityRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	base := t.base
 	if base == nil {
-		base = http.DefaultTransport
+		base = baseHTTPTransport
 	}
 	return base.RoundTrip(ApplyRequestIdentity(req))
 }

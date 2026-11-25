@@ -36,7 +36,7 @@ func NewJSEndpointScanner(db *database.DB, exec *tools.Executor, cfg *config.Con
 	return &JSEndpointScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var jsEndpointClient = newPooledClient(12*time.Second, false)
+var jsEndpointClient = ScannerClient(12 * time.Second)
 
 func (s *JSEndpointScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	logFn("info", "js_endpoints", "Resolving & probing endpoints extracted from JavaScript...")

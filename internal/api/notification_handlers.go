@@ -30,13 +30,13 @@ type notification struct {
 var notificationBuckets = map[string][]string{
 	// The breadth tier: specific changes only. New rounds no longer write
 	// scan_watch rows; the value stays here so older bell history stays visible.
-	"watch": {"scan_watch", "scope_landed", "watch_failed"},
+	"watch": {"scan_watch", "scope_landed", "watch_failed", "watch_kind_conflict", "new_host", "new_subdomain", "status_change"},
 	// The deep tier: full scans, discovery, monitoring changes and program
 	// scope updates.
 	"deep": {
-		"scan_deep", "scan_auto_paused", "new_subdomain", "monitor_failed", "bounty_scope_change",
-		"js_change", "css_change", "http_change", "status_change", "page_change",
-		"tech_change", "header_regression", "security_header_removed",
+		"scan_deep", "scan_auto_paused", "new_subdomain", "monitor_failed", "monitor_escalation_started",
+		"bounty_scope_change", "js_change", "css_change", "http_change", "status_change", "page_change",
+		"redirect_change", "content_change", "tech_change", "header_regression", "security_header_removed",
 		"new_host", "new_service", "content_security_change",
 	},
 	// Verified findings.
@@ -193,8 +193,30 @@ func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Req
 		args := []any{uid}
 		args = append(args, ownerArgs...)
 		args = append(args, bulkTypeArgs...)
-		if _, err := h.db.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
+
+		tx, err := h.db.BeginTx(r.Context(), nil)
+		if err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
+			return
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
 			SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n`+bulkScope, args...); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
+			SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n`+bulkScope, args...); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to sync changes read state")
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
+			SELECT n.change_id,?,CURRENT_TIMESTAMP FROM notifications n`+bulkScope+` AND COALESCE(n.change_id,'') <> ''`, args...); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to sync changes read state")
+			return
+		}
+		if err := tx.Commit(); err != nil {
 			h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
 			return
 		}
@@ -227,8 +249,31 @@ func (h *Handler) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Req
 		args = append(args, id)
 	}
 	args = append(args, ownerArgs...)
-	if _, err := h.db.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
-		SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n WHERE n.id IN (`+marks+`)`+ownerClause, args...); err != nil {
+
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
+		return
+	}
+	defer tx.Rollback()
+
+	idScope := ` WHERE n.id IN (` + marks + `)` + ownerClause
+	if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at)
+		SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n`+idScope, args...); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
+		SELECT n.id,?,CURRENT_TIMESTAMP FROM notifications n`+idScope, args...); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to sync changes read state")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `INSERT OR IGNORE INTO change_seen(change_id,user_id,seen_at)
+		SELECT n.change_id,?,CURRENT_TIMESTAMP FROM notifications n`+idScope+` AND COALESCE(n.change_id,'') <> ''`, args...); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to sync changes read state")
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to mark notifications read")
 		return
 	}

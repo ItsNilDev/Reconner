@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { tasks as tasksApi } from '../lib/api'
 import { ws } from '../lib/websocket'
 import { Badge, Button, Spinner, Empty } from '../components/ui'
@@ -36,6 +36,7 @@ export default function Tasks() {
   const [coverageFilter, setCoverageFilter] = useState<CoverageFilter>('all')
   const [taskSort, setTaskSort] = useState('recent')
   const [page, setPage] = useState(0)
+  const reloadTimerRef = useRef<number | undefined>(undefined)
   const { addToast } = useUIStore()
 
   const load = async () => {
@@ -43,16 +44,25 @@ export default function Tasks() {
       const p: Record<string,string> = { limit: String(PAGE_SIZE), page: String(page) }
       if (statusFilter) p.status = statusFilter
       if (coverageFilter !== 'all') p.coverage = coverageFilter
-      setTaskList(await tasksApi.list(p) || [])
+      const list = await tasksApi.list(p) || []
+      setTaskList(list)
+      setSelected(prev => prev ? (list.find(t => t.id === prev.id) || prev) : prev)
     } catch { /**/ } finally { setLoading(false) }
   }
 
   useEffect(() => { load() }, [statusFilter, coverageFilter, page])
 
   useEffect(() => {
+    const scheduleReload = () => {
+      window.clearTimeout(reloadTimerRef.current)
+      reloadTimerRef.current = window.setTimeout(() => {
+        reloadTimerRef.current = undefined
+        void load()
+      }, 800)
+    }
     // The backend broadcasts a dedicated event per lifecycle step instead of a
     // single task_update. Each event carries the current task row.
-    const apply = (payload: unknown) => {
+    const apply = (eventName: string) => (payload: unknown) => {
       const event = payload as Partial<Task> & { task_id?: string }
       const id = event?.id || event?.task_id
       if (!id) return
@@ -60,21 +70,45 @@ export default function Tasks() {
       // only task_id/target_id/status, so refresh the filtered list instead
       // of dropping the event.
       if (!event.id || !event.status) {
-        void load()
+        const inferredStatus = event.status || (
+          eventName === 'task_finished' ? 'finished'
+          : eventName === 'task_cancelled' ? 'cancelled'
+          : eventName === 'task_paused' ? 'paused'
+          : eventName === 'task_resumed' || eventName === 'task_started' ? 'running'
+          : undefined
+        )
+        if (inferredStatus) {
+          setSelected(prev => prev?.id === id ? { ...prev, status: inferredStatus } : prev)
+        }
+        scheduleReload()
         return
       }
       if (statusFilter && event.status !== statusFilter) return
       if (coverageFilter === 'breadth' && !isBreadth(event as Task)) return
       if (coverageFilter === 'deep' && isBreadth(event as Task)) return
-      setTaskList(p => p.some(t => t.id === id) ? p.map(t => t.id === id ? event as Task : t) : [event as Task, ...p])
+      if (eventName === 'task_created') {
+        if (page === 0) {
+          setTaskList(p => p.some(t => t.id === id) ? p.map(t => t.id === id ? event as Task : t) : [event as Task, ...p])
+        } else {
+          scheduleReload()
+        }
+        setSelected(p => p?.id === id ? event as Task : p)
+        return
+      }
+      setTaskList(p => p.some(t => t.id === id) ? p.map(t => t.id === id ? event as Task : t) : (page === 0 ? [event as Task, ...p] : p))
       setSelected(p => p?.id === id ? event as Task : p)
     }
     const offs = [
       'task_created', 'task_started', 'task_progress', 'task_finished',
       'task_cancelled', 'task_paused', 'task_resumed',
-    ].map(event => ws.on(event, apply))
+    ].map(event => ws.on(event, apply(event)))
     const i = setInterval(() => load(), 15000)
-    return () => { offs.forEach(off => off()); clearInterval(i) }
+    return () => {
+      offs.forEach(off => off())
+      clearInterval(i)
+      window.clearTimeout(reloadTimerRef.current)
+      reloadTimerRef.current = undefined
+    }
   }, [statusFilter, coverageFilter, page])
 
   useEffect(() => {

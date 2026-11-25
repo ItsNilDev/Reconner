@@ -50,7 +50,7 @@ func NewIDORScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &IDORScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var idorClient = newPooledClient(12*time.Second, false)
+var idorClient = ScannerClient(12 * time.Second)
 
 // lastNumericSegment matches a numeric path segment (>=2 digits) so /api/user/1052 is enumerable.
 var lastNumericSegment = regexp.MustCompile(`^(.*/)(\d{2,})(/?[^/]*)$`)

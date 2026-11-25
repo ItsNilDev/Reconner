@@ -504,14 +504,19 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
                     </div>
                   )}
 
-                  <div className="flex justify-between text-xs text-text-muted">
-                    <span className="capitalize">{t.scan_status}</span>
-                    <span>Deep: {t.last_scan_at ? timeAgo(t.last_scan_at) : 'never'}</span>
+                  <div className="flex justify-between gap-2 text-xs text-text-muted">
+                    <span className="capitalize shrink-0">{t.scan_status}</span>
+                    {t.watch_only ? (
+                      <span className="truncate text-right">
+                        Watch: {t.watch_last_run ? timeAgo(t.watch_last_run) : 'never'} · Next: {t.watch_paused ? 'paused' : t.watch_next_run ? timeUntil(t.watch_next_run) : 'not scheduled'}
+                      </span>
+                    ) : (
+                      <span>Deep: {t.last_scan_at ? timeAgo(t.last_scan_at) : 'never'}</span>
+                    )}
                   </div>
-                  {t.watch_only && (
-                    <div className="flex justify-between text-xs text-text-muted">
-                      <span>Watch: {t.watch_last_run ? timeAgo(t.watch_last_run) : 'never'}</span>
-                      <span>Next: {t.watch_paused ? 'paused' : t.watch_next_run ? timeUntil(t.watch_next_run) : 'not scheduled'}</span>
+                  {t.watch_only && t.last_scan_at && (
+                    <div className="flex justify-end text-xs text-text-muted">
+                      <span>Deep: {timeAgo(t.last_scan_at)}</span>
                     </div>
                   )}
                   {t.monitor_last_run && (
@@ -571,6 +576,21 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
               <span className="font-mono"> *.wildcards</span> and CIDRs.
             </p>
           </div>
+          {editTarget?.managed_exclusions && editTarget.managed_exclusions.length > 0 && (
+            <div className="rounded-lg border border-border bg-surface-alt/40 p-2.5">
+              <p className="text-[11px] font-medium text-text-secondary">Program deny rules (managed by sync)</p>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {editTarget.managed_exclusions.map((rule, idx) => (
+                  <span
+                    key={`${rule.program_id}:${rule.pattern}:${idx}`}
+                    className="rounded border border-border bg-surface-3/60 px-2 py-0.5 font-mono text-[11px] text-text-muted"
+                  >
+                    {rule.pattern}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="rounded-lg border border-border bg-surface-alt/40 p-3 space-y-3">
             <div>
               <p className="text-xs font-semibold">Bug-bounty request identity</p>

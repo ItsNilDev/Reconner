@@ -17,8 +17,10 @@ func TestGuidedURLInScopeHonorsURLSeedsAndExclusions(t *testing.T) {
 	if err := database.RunMigrations(db); err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`INSERT INTO targets(id,domain,exclude_scope) VALUES('t','https://app.example.test:8443/api/v1/orders/42','admin.example.test')`)
-	if err != nil {
+	if _, err = db.Exec(`INSERT INTO targets(id,domain) VALUES('t','https://app.example.test:8443/api/v1/orders/42')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('ex1','t','manual','','admin.example.test')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -53,8 +55,10 @@ func TestGuidedURLInScopePlainHostsAllowSubdomainsButHonorExclusions(t *testing.
 	if err := database.RunMigrations(db); err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`INSERT INTO targets(id,domain,exclude_scope) VALUES('t','example.test','*.staging.example.test')`)
-	if err != nil {
+	if _, err = db.Exec(`INSERT INTO targets(id,domain) VALUES('t','example.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern) VALUES('ex1','t','manual','','*.staging.example.test')`); err != nil {
 		t.Fatal(err)
 	}
 	if !GuidedURLInScope(context.Background(), db, "t", "https://api.example.test/orders") {

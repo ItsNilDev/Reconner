@@ -144,7 +144,9 @@ func TestTaskScopeStateHonorsExactWildcardAndDeny(t *testing.T) {
 	}
 
 	// An applicable deny wins over a positive program rule.
-	_, _ = s.db.Exec(`UPDATE targets SET exclude_scope='*.example.test' WHERE id='sc-t'`)
+	if _, err := s.db.Exec(`INSERT INTO target_exclusions(id, target_id, source, program_id, pattern) VALUES ('excl-sc-1', 'sc-t', 'manual', '', '*.example.test')`); err != nil {
+		t.Fatal(err)
+	}
 	state, err = s.loadTaskScopeState(ctx, "sc-t")
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +178,9 @@ func TestValidateScopeOverrideRechecksApprovalAndExclusion(t *testing.T) {
 		t.Fatal("out-of-scope asset override was accepted")
 	}
 	_, _ = s.db.Exec(`UPDATE assets SET metadata='{}' WHERE id='ov-a'`)
-	_, _ = s.db.Exec(`UPDATE targets SET exclude_scope='app.example.test' WHERE id='ov-t'`)
+	if _, err := s.db.Exec(`INSERT INTO target_exclusions(id, target_id, source, program_id, pattern) VALUES ('excl-ov-1', 'ov-t', 'manual', '', 'app.example.test')`); err != nil {
+		t.Fatal(err)
+	}
 	state, err = s.loadTaskScopeState(ctx, "ov-t")
 	if err != nil {
 		t.Fatal(err)
