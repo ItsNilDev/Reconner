@@ -356,6 +356,12 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		}
 	}
 
+	if q.Get("hide_seen") == "1" {
+		uid, _ := h.callerScope(r)
+		filters = append(filters, `NOT EXISTS (SELECT 1 FROM change_seen cs WHERE cs.change_id=x.id AND cs.user_id=?)`)
+		filterArgs = append(filterArgs, uid)
+	}
+
 	if len(filters) > 0 {
 		whereSQL = ` WHERE ` + strings.Join(filters, ` AND `)
 	}

@@ -157,6 +157,7 @@ func (s *Scheduler) reclaimClaimedScopeLandings(ctx context.Context) {
 
 func (s *Scheduler) flushScopeLandings() {
 	ctx := context.Background()
+	s.consumeOutOfScopeWatchEvents(ctx)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT e.id, e.target_id, COALESCE(e.program_id,''), e.identifier
 		FROM watch_scope_events e
@@ -211,7 +212,11 @@ func (s *Scheduler) flushScopeLandings() {
 		s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
 	}
 	s.logger.Info("Closed watch landing audit rows", "count", len(claimed))
+}
 
+// consumeOutOfScopeWatchEvents records lost eligibility as history without
+// sending a scope-landed alert. It runs even when the window has no landings.
+func (s *Scheduler) consumeOutOfScopeWatchEvents(ctx context.Context) {
 	// A later loss of eligibility is recorded as history, not as a landing
 	// alert. Consume those rows silently so they cannot block the audit queue.
 	lostRows, err := s.db.QueryContext(ctx, `
@@ -243,7 +248,7 @@ func (s *Scheduler) flushScopeLandings() {
 		return
 	}
 	s.markScopeLandingsSent(claimedLost)
-	byTarget = map[string]int{}
+	byTarget := map[string]int{}
 	for _, l := range claimedLost {
 		byTarget[l.TargetID]++
 	}

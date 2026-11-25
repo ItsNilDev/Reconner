@@ -675,3 +675,29 @@ func TestFlushScopeLandingsSkipsOutOfScope(t *testing.T) {
 		t.Fatalf("landed announced=%d, want claimed/sent", landed)
 	}
 }
+
+// A window with no landed or re_eligible rows must still consume out_of_scope
+// history. No notifier is configured, so the row must close without a message.
+func TestFlushScopeLandingsConsumesOutOfScopeWithoutLandings(t *testing.T) {
+	s := newTestScheduler(t)
+	_, _ = s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('scope-t','example.test')`)
+	_, _ = s.db.Exec(`INSERT INTO watch_scope_events (id,target_id,identifier,event_type,announced,detected_at)
+		VALUES ('lost','scope-t','a.example.test','out_of_scope',0,datetime('now'))`)
+
+	s.flushScopeLandings()
+
+	var announced int
+	if err := s.db.QueryRow(`SELECT announced FROM watch_scope_events WHERE id='lost'`).Scan(&announced); err != nil {
+		t.Fatal(err)
+	}
+	if announced != 1 {
+		t.Fatalf("out_of_scope announced=%d, want 1 (consumed in an empty landing window)", announced)
+	}
+	var bells int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM notifications`).Scan(&bells); err != nil {
+		t.Fatal(err)
+	}
+	if bells != 0 {
+		t.Fatalf("notifications=%d, want 0 (no notifier message required)", bells)
+	}
+}

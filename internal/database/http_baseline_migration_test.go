@@ -100,3 +100,45 @@ func TestHTTPServiceURLNormalizationMergesBareHostDuplicates(t *testing.T) {
 		t.Fatalf("kept service = %s/%s/%d, want good/https://example.test//200", id, url, status)
 	}
 }
+
+// A newer bare-host duplicate with status 0 must not evict the canonical row
+// that has a valid status. A valid status wins over a newer last_seen.
+func TestHTTPServiceURLNormalizationKeepsValidStatusOverNewerBareDuplicate(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "normalize-status.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO targets (id,domain) VALUES ('t1','example.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO http_services (id,target_id,url,status_code,title,last_seen)
+		VALUES ('bare','t1','https://example.test',0,'','2026-02-02 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO http_services (id,target_id,url,status_code,title,last_seen)
+		VALUES ('good','t1','https://example.test/',200,'OK','2026-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM http_services WHERE target_id='t1'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("services after normalization = %d, want 1", count)
+	}
+	var id, url string
+	var status int
+	if err := db.QueryRow(`SELECT id,url,status_code FROM http_services WHERE target_id='t1'`).Scan(&id, &url, &status); err != nil {
+		t.Fatal(err)
+	}
+	if id != "good" || url != "https://example.test/" || status != 200 {
+		t.Fatalf("kept service = %s/%s/%d, want good/https://example.test//200", id, url, status)
+	}
+}

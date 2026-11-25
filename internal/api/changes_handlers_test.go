@@ -937,3 +937,78 @@ func TestChangesFeedReturnsNumericStatusColumns(t *testing.T) {
 		t.Fatalf("numeric status columns = %v, want mc=403/200 wc=200/403", got)
 	}
 }
+
+// hide_seen must remove read rows before COUNT and LIMIT run. Otherwise a page
+// of unread rows can hide a stale seen row, and the total still counts it.
+func TestListChangesHideSeenExcludesRowsBeforeCountAndPagination(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSID, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSID, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t-admin','admin.example',?)`, adminID)
+	h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t-bob','bob.example',?)`, bob.ID)
+	for _, row := range []string{
+		`'mc-seen','t-admin','https://a','http_change','2026-01-01 00:00:00'`,
+		`'mc-open','t-admin','https://b','http_change','2026-01-02 00:00:00'`,
+		`'mc-bob','t-bob','https://c','http_change','2026-01-03 00:00:00'`,
+	} {
+		if _, err := h.db.Exec(`INSERT INTO monitoring_changes (id,target_id,url,change_type,detected_at)
+			VALUES (` + row + `)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Read state is per user. Admin read mc-seen; bob read mc-bob.
+	for _, mark := range []struct {
+		id  string
+		uid int64
+	}{{"mc-seen", adminID}, {"mc-bob", bob.ID}} {
+		if _, err := h.db.Exec(`INSERT INTO change_seen (change_id,user_id,seen_at) VALUES (?,?,'2026-01-04 00:00:00')`, mark.id, mark.uid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	read := func(sid, path string) changesEnvelope {
+		t.Helper()
+		rec := serveChanges(t, h, sid, path, nil, h.handleListChanges)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var env changesEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+
+	// Without hide_seen the seen row is present for both callers.
+	all := read(adminSID, "/api/changes")
+	if all.Total != 3 || !idsOf(all.Data)["mc-seen"] {
+		t.Fatalf("admin unfiltered total=%d ids=%v, want 3 including mc-seen", all.Total, idsOf(all.Data))
+	}
+	bobAll := read(bobSID, "/api/changes")
+	if bobAll.Total != 1 || !idsOf(bobAll.Data)["mc-bob"] {
+		t.Fatalf("bob unfiltered total=%d ids=%v, want only mc-bob", bobAll.Total, idsOf(bobAll.Data))
+	}
+
+	// With hide_seen the seen row is gone before count and pagination.
+	hidden := read(adminSID, "/api/changes?hide_seen=1&limit=1")
+	if hidden.Total != 2 {
+		t.Fatalf("admin hide_seen total=%d, want 2", hidden.Total)
+	}
+	if ids := idsOf(hidden.Data); len(ids) != 1 || ids["mc-seen"] {
+		t.Fatalf("admin hide_seen ids=%v, want one row that is not mc-seen", ids)
+	}
+	bobHidden := read(bobSID, "/api/changes?hide_seen=1")
+	if bobHidden.Total != 0 || len(bobHidden.Data) != 0 {
+		t.Fatalf("bob hide_seen total=%d rows=%d, want 0 and 0", bobHidden.Total, len(bobHidden.Data))
+	}
+}

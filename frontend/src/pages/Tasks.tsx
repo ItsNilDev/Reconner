@@ -53,13 +53,21 @@ export default function Tasks() {
     // The backend broadcasts a dedicated event per lifecycle step instead of a
     // single task_update. Each event carries the current task row.
     const apply = (payload: unknown) => {
-      const task = payload as Task
-      if (!task?.id) return
-      if (statusFilter && task.status !== statusFilter) return
-      if (coverageFilter === 'breadth' && !isBreadth(task)) return
-      if (coverageFilter === 'deep' && isBreadth(task)) return
-      setTaskList(p => p.some(t => t.id === task.id) ? p.map(t => t.id === task.id ? task : t) : [task, ...p])
-      setSelected(p => p?.id === task.id ? task : p)
+      const event = payload as Partial<Task> & { task_id?: string }
+      const id = event?.id || event?.task_id
+      if (!id) return
+      // task_created carries the full row. Other lifecycle broadcasts carry
+      // only task_id/target_id/status, so refresh the filtered list instead
+      // of dropping the event.
+      if (!event.id || !event.status) {
+        void load()
+        return
+      }
+      if (statusFilter && event.status !== statusFilter) return
+      if (coverageFilter === 'breadth' && !isBreadth(event as Task)) return
+      if (coverageFilter === 'deep' && isBreadth(event as Task)) return
+      setTaskList(p => p.some(t => t.id === id) ? p.map(t => t.id === id ? event as Task : t) : [event as Task, ...p])
+      setSelected(p => p?.id === id ? event as Task : p)
     }
     const offs = [
       'task_created', 'task_started', 'task_progress', 'task_finished',

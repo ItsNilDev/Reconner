@@ -431,10 +431,13 @@ func normalizeHTTPServiceURLs(db *DB) error {
 		if err := db.QueryRow(`SELECT status_code, COALESCE(last_seen,'') FROM http_services WHERE id=?`, u.id).Scan(&oldCode, &oldSeen); err != nil {
 			return err
 		}
-		keepExisting := existingCode >= 100 && existingCode <= 599
-		if !keepExisting && oldCode >= 100 && oldCode <= 599 {
+		existingValid := existingCode >= 100 && existingCode <= 599
+		oldValid := oldCode >= 100 && oldCode <= 599
+		keepExisting := existingValid
+		if oldValid && !existingValid {
 			keepExisting = false
-		} else if oldSeen > existingSeen {
+		} else if oldSeen > existingSeen && (!existingValid || oldValid) {
+			// A newer timestamp never wins over a valid status.
 			keepExisting = false
 		}
 		if keepExisting {

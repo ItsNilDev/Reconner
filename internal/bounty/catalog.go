@@ -1055,11 +1055,10 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 		return err
 	}
 	if decision == "approve" && eventType == "modified" {
-		var currentIdentifier string
-		if err := tx.QueryRowContext(ctx, `SELECT value FROM assets WHERE target_id=? AND source_id=? AND source='bounty:catalog' LIMIT 1`, targetID, assetID).Scan(&currentIdentifier); err == nil && currentIdentifier != "" && currentIdentifier != identifier {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM assets WHERE target_id=? AND source='bounty:catalog' AND value=?`, targetID, identifier); err != nil {
-				return err
-			}
+		// The upsert above inserts the new identifier. Remove any older
+		// catalog row for the same upstream asset so a rename leaves one row.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM assets WHERE target_id=? AND source_id=? AND value<>? AND COALESCE(source,'')<>'watch:scope'`, targetID, assetID, identifier); err != nil {
+			return err
 		}
 	}
 	resolved := "rejected"
@@ -1073,7 +1072,10 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if s.onScopeEvent != nil {
+	// A rejection must not reach the scope-event hook. The hook can re-enter
+	// ResolveScopeEvent with "approve" for favorited auto-scan programs, which
+	// would reverse the operator's decision and queue a scan.
+	if decision == "approve" && s.onScopeEvent != nil {
 		s.onScopeEvent(ctx, targetID, programID, eventID, eventType, identifier)
 	}
 	return nil

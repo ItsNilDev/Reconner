@@ -905,3 +905,62 @@ func TestDenyRuleEventHasCleanIdentifierAndNotifies(t *testing.T) {
 		t.Fatalf("onScopeEvent callback missing rule_added:%q, got %v", identifier, got)
 	}
 }
+
+func TestApproveRenameKeepsNewAssetAndDropsOld(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{Provider: "hackerone", ExternalID: "rename-1", Handle: "rename", Name: "Rename", Status: "live", Assets: []Asset{
+		{ExternalID: "a1", Identifier: "old.rename.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true, RawHash: "v1"},
+	}}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{AssetIDs: []string{p.Assets[0].ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Assets[0].Identifier = "new.rename.test"
+	p.Assets[0].RawHash = "v2"
+	storeTestProgram(t, svc, &p)
+	var eventID string
+	if err := db.QueryRow(`SELECT id FROM bounty_scope_events WHERE target_id=? AND event_type='modified' AND status='pending'`, projectID).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ResolveScopeEvent(context.Background(), projectID, eventID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM assets WHERE target_id=? AND value='new.rename.test'`, projectID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("new asset row missing: n=%d err=%v", n, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM assets WHERE target_id=? AND value='old.rename.test'`, projectID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("old asset row survived: n=%d err=%v", n, err)
+	}
+}
+
+func TestRejectScopeEventDoesNotReenterHook(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{Provider: "hackerone", ExternalID: "reject-hook-1", Handle: "rejecthook", Name: "RejectHook", Status: "live", Assets: []Asset{
+		{ExternalID: "one", Identifier: "one.rejecthook.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+	}}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{AssetIDs: []string{p.Assets[0].ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Assets = append(p.Assets, Asset{ExternalID: "two", Identifier: "two.rejecthook.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true})
+	storeTestProgram(t, svc, &p)
+	var eventID string
+	if err := db.QueryRow(`SELECT id FROM bounty_scope_events WHERE target_id=? AND event_type='added' AND status='pending'`, projectID).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	svc.SetScopeEventNotify(func(_ context.Context, _, _, _, _ string, _ string) { calls++ })
+	if err := svc.ResolveScopeEvent(context.Background(), projectID, eventID, "reject"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("reject reached scope-event hook %d time(s)", calls)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM bounty_scope_events WHERE id=?`, eventID).Scan(&status); err != nil || status != "rejected" {
+		t.Fatalf("event was not rejected: status=%q err=%v", status, err)
+	}
+}
