@@ -580,8 +580,43 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// The coverage flip (deep ⇄ breadth) is one enforcement point, shared with
-	// the bulk endpoint. It refuses a mixed/network project with 400.
+	// Scope and its managed assets are resolved before the coverage flip. The
+	// flip reads the final kind and refuses a breadth project with network
+	// assets, so it must see the new scope, not the old one.
+	if rawScope != "" {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE targets SET domain = ?, kind = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			domain, kind, id); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") {
+				h.writeError(w, http.StatusConflict, "another target already uses that scope")
+				return
+			}
+			h.writeError(w, http.StatusInternalServerError, "failed to update scope")
+			return
+		}
+		if err := reconcileManualAssetsTx(tx, id, scopeValues); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to reconcile managed assets")
+			return
+		}
+	}
+
+	// A breadth project may only hold web assets. This check also covers a
+	// scope edit that does not itself change the coverage tier.
+	if req.WatchOnly == nil {
+		var currentWatchOnly int
+		var currentKind string
+		if err := tx.QueryRowContext(r.Context(), `SELECT COALESCE(watch_only,0), COALESCE(kind,'web') FROM targets WHERE id=?`, id).Scan(&currentWatchOnly, &currentKind); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to read coverage")
+			return
+		}
+		effectiveKind := kind
+		if effectiveKind == "" {
+			effectiveKind = currentKind
+		}
+		if currentWatchOnly == 1 && effectiveKind != "web" {
+			h.writeError(w, http.StatusBadRequest, "a breadth project must be web-only: switch to deep coverage first or remove network assets")
+			return
+		}
+	}
 	if req.WatchOnly != nil {
 		if err := applyWatchCoverage(r.Context(), tx, id, *req.WatchOnly); err != nil {
 			var flipErr *watchFlipError
@@ -595,10 +630,12 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.WatchPaused != nil {
 		if _, err := tx.ExecContext(r.Context(), `
-			UPDATE targets SET watch_paused = ?, watch_next_run = CASE WHEN ?=1 THEN NULL ELSE watch_next_run END,
+			UPDATE targets SET watch_paused = ?,
+				watch_next_run = CASE WHEN ?=1 THEN NULL ELSE COALESCE(watch_next_run,CURRENT_TIMESTAMP) END,
+				watch_fail_count = CASE WHEN ?=0 THEN 0 ELSE watch_fail_count END,
 				updated_at = CURRENT_TIMESTAMP
 			WHERE id = ? AND COALESCE(watch_only,0)=1`,
-			boolInt(*req.WatchPaused), boolInt(*req.WatchPaused), id); err != nil {
+			boolInt(*req.WatchPaused), boolInt(*req.WatchPaused), boolInt(*req.WatchPaused), id); err != nil {
 			h.writeError(w, http.StatusInternalServerError, "failed to update watch state")
 			return
 		}
@@ -619,21 +656,6 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		h.writeError(w, http.StatusNotFound, "target not found")
 		return
-	}
-	if rawScope != "" {
-		if _, err := tx.ExecContext(r.Context(), `UPDATE targets SET domain = ?, kind = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			domain, kind, id); err != nil {
-			if strings.Contains(err.Error(), "UNIQUE") {
-				h.writeError(w, http.StatusConflict, "another target already uses that scope")
-				return
-			}
-			h.writeError(w, http.StatusInternalServerError, "failed to update scope")
-			return
-		}
-		if err := reconcileManualAssetsTx(tx, id, scopeValues); err != nil {
-			h.writeError(w, http.StatusInternalServerError, "failed to reconcile managed assets")
-			return
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to update target")

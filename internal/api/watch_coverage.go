@@ -97,13 +97,17 @@ func applyWatchCoverage(ctx context.Context, tx *sql.Tx, targetID string, toWatc
 		// Already in the requested mode: still normalise the schedule and the
 		// monitor flag, so older breadth projects show the correct UI state.
 		if toWatch {
-			if _, err := tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_fail_count=0, monitor_enabled=1, monitor_last_run=NULL WHERE id=?`, targetID); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_next_run=COALESCE(watch_next_run,CURRENT_TIMESTAMP), watch_fail_count=0, monitor_enabled=1, monitor_last_run=NULL WHERE id=?`, targetID); err != nil {
 				return err
 			}
 			_, err = tx.ExecContext(ctx, `UPDATE assets SET monitor_enabled = 0 WHERE target_id = ?`, targetID)
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_next_run=NULL WHERE id=?`, targetID)
+		_, err = tx.ExecContext(ctx, `UPDATE targets SET watch_paused=0, watch_next_run=NULL, monitor_enabled=0 WHERE id=?`, targetID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE assets SET monitor_enabled = 0 WHERE target_id = ?`, targetID)
 		return err
 	}
 
@@ -138,22 +142,21 @@ func applyWatchCoverage(ctx context.Context, tx *sql.Tx, targetID string, toWatc
 		return nil
 	}
 
-	// Back to the deep tier: the watch schedule stops. The project flag stays
-	// on, so the operator can turn monitoring off. Approved web assets get
-	// their monitor flag back; no deep monitor ran during breadth.
+	// Back to the deep tier: the watch schedule stops and deep monitoring stays
+	// off until the operator enables it explicitly. No deep monitor ran during
+	// breadth, so no asset has a current deep baseline to reactivate.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE targets SET
 			watch_only = 0,
 			watch_next_run = NULL,
 			watch_paused = 0,
+			monitor_enabled = 0,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`, targetID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE assets SET monitor_enabled = 1
-		WHERE target_id = ? AND COALESCE(approval_status,'approved') = 'approved'
-		  AND COALESCE(kind,'web') = 'web'`, targetID); err != nil {
+		UPDATE assets SET monitor_enabled = 0 WHERE target_id = ?`, targetID); err != nil {
 		return err
 	}
 	return nil

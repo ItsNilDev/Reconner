@@ -609,3 +609,69 @@ func TestEmitWatchNewHostsManualProjectUsesProjectScope(t *testing.T) {
 		t.Fatalf("members = %+v, want only the project asset in scope", meta.Members)
 	}
 }
+
+func TestWatchHTTPServiceSkipsStatusZeroAndPrefersHTTPS(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('svc-t','example.test')`)
+	_, _ = s.db.Exec(`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-svc','svc-t','a.example.test',1)`)
+	_, _ = s.db.Exec(`INSERT INTO http_services (id,target_id,subdomain_id,url,status_code,title)
+		VALUES ('h-zero','svc-t','s-svc','https://a.example.test/old',0,'Seed'),
+		       ('h-plain','svc-t',NULL,'http://a.example.test/',200,'HTTP'),
+		       ('h-secure','svc-t',NULL,'https://a.example.test/',200,'HTTPS')`)
+	got := watchHTTPServiceForHost(ctx, s.db, "svc-t", "a.example.test")
+	if got.URL != "https://a.example.test/" || got.Title != "HTTPS" {
+		t.Fatalf("service = %+v, want the https 200 row", got)
+	}
+}
+
+func TestEmitWatchNewHostsSkipsDeadHosts(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	stmts := []string{
+		`INSERT INTO targets (id, domain) VALUES ('dead-t','example.test')`,
+		`INSERT INTO tasks (id,target_id,type,status,priority,modules,total)
+			VALUES ('round-0','dead-t','watch_scan','finished',1,'[]',1)`,
+		`INSERT INTO watch_hosts (target_id,host,first_seen_at,first_alive_at) VALUES
+			('dead-t','dead.example.test','2026-01-01 00:00:00',NULL)`,
+		`INSERT INTO subdomains (id,target_id,subdomain,is_alive) VALUES ('s-dead','dead-t','dead.example.test',0)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+	got := s.emitWatchNewHosts(ctx, "round-1", "dead-t")
+	if len(got) != 0 {
+		t.Fatalf("events = %+v, want none for a dead host", got)
+	}
+	var announced int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM watch_hosts WHERE target_id='dead-t' AND announced_at IS NOT NULL`).Scan(&announced); err != nil {
+		t.Fatal(err)
+	}
+	if announced != 0 {
+		t.Fatalf("announced dead hosts = %d, want 0", announced)
+	}
+}
+
+func TestFlushScopeLandingsSkipsOutOfScope(t *testing.T) {
+	s := newTestScheduler(t)
+	_, _ = s.db.Exec(`INSERT INTO targets (id, domain) VALUES ('scope-t','example.test')`)
+	_, _ = s.db.Exec(`INSERT INTO watch_scope_events (id,target_id,identifier,event_type,announced,detected_at)
+		VALUES ('lost','scope-t','a.example.test','out_of_scope',0,datetime('now')),
+		       ('landed','scope-t','b.example.test','landed',0,datetime('now'))`)
+	s.flushScopeLandings()
+	var lost, landed int
+	if err := s.db.QueryRow(`SELECT announced FROM watch_scope_events WHERE id='lost'`).Scan(&lost); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT announced FROM watch_scope_events WHERE id='landed'`).Scan(&landed); err != nil {
+		t.Fatal(err)
+	}
+	if lost != 1 {
+		t.Fatalf("out_of_scope announced=%d, want 1 (consumed without alert)", lost)
+	}
+	if landed != 2 && landed != 1 {
+		t.Fatalf("landed announced=%d, want claimed/sent", landed)
+	}
+}

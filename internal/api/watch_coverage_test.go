@@ -87,3 +87,61 @@ func TestPromoteWatchScopeHonorsProgramEligibility(t *testing.T) {
 		t.Fatalf("eligible host status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func coverageRequest(h *Handler, targetID string, adminID int64, body map[string]any) *httptest.ResponseRecorder {
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest("PATCH", "/api/targets/"+targetID, bytes.NewReader(raw))
+	req = mux.SetURLVars(req, map[string]string{"id": targetID})
+	req = req.WithContext(context.WithValue(req.Context(), ctxUserIDKey, adminID))
+	rec := httptest.NewRecorder()
+	h.handleUpdateTarget(rec, req)
+	return rec
+}
+
+func TestCoverageFlipDisablesMonitor(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	_, _ = h.db.Exec(`INSERT INTO targets(id,domain,watch_only,monitor_enabled,watch_next_run)
+		VALUES ('cf-t','example.test',1,1,'2026-01-01 00:00:00')`)
+	_, _ = h.db.Exec(`INSERT INTO assets(id,target_id,value,asset_type,monitor_enabled)
+		VALUES ('cf-a','cf-t','a.example.test','domain',1)`)
+
+	rec := coverageRequest(h, "cf-t", adminID, map[string]any{"watch_only": false, "kind": "web"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var watchOnly, monitor, nextNull, assetMonitor int
+	if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(monitor_enabled,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='cf-t'`).Scan(&watchOnly, &monitor, &nextNull); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.QueryRow(`SELECT COALESCE(monitor_enabled,-1) FROM assets WHERE id='cf-a'`).Scan(&assetMonitor); err != nil {
+		t.Fatal(err)
+	}
+	if watchOnly != 0 || monitor != 0 || nextNull != 1 || assetMonitor != 0 {
+		t.Fatalf("flip state watch=%d monitor=%d nextNull=%d assetMonitor=%d", watchOnly, monitor, nextNull, assetMonitor)
+	}
+}
+
+func TestUnpauseRestartsWatchRound(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	_, _ = h.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_paused,watch_fail_count)
+		VALUES ('up-t','example.test',1,1,3)`)
+
+	body, _ := json.Marshal(map[string]any{"watch_paused": false})
+	req := httptest.NewRequest("PATCH", "/api/targets/up-t", bytes.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"id": "up-t"})
+	req = req.WithContext(context.WithValue(req.Context(), ctxUserIDKey, adminID))
+	rec := httptest.NewRecorder()
+	h.handleUpdateTarget(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var paused, fails, nextNull int
+	if err := h.db.QueryRow(`SELECT COALESCE(watch_paused,-1), COALESCE(watch_fail_count,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='up-t'`).Scan(&paused, &fails, &nextNull); err != nil {
+		t.Fatal(err)
+	}
+	if paused != 0 || fails != 0 || nextNull != 1 {
+		t.Fatalf("unpause state paused=%d fails=%d nextNull=%d", paused, fails, nextNull)
+	}
+}

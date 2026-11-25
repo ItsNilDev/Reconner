@@ -142,12 +142,26 @@ type scopeLanding struct {
 // A row whose project still has a running watch round is NOT claimable: the
 // round may still land more hosts. A failed send releases the claim back to 0
 // so the next window retries, and a successful send marks the rows sent.
+// reclaimClaimedScopeLandings releases rows claimed by a previous process
+// that shut down before it could finish delivering the grouped message.
+func (s *Scheduler) reclaimClaimedScopeLandings(ctx context.Context) {
+	res, err := s.db.ExecContext(ctx, `UPDATE watch_scope_events SET announced = 0 WHERE announced = 2`)
+	if err != nil {
+		s.logger.Warn("Could not reclaim claimed watch landing rows", "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		s.logger.Info("Reclaimed claimed watch landing rows", "count", n)
+	}
+}
+
 func (s *Scheduler) flushScopeLandings() {
 	ctx := context.Background()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT e.id, e.target_id, COALESCE(e.program_id,''), e.identifier
 		FROM watch_scope_events e
 		WHERE e.announced = 0
+		  AND e.event_type IN ('landed','re_eligible')
 		  AND NOT EXISTS (
 			SELECT 1 FROM tasks t WHERE t.target_id = e.target_id
 			  AND t.type = ? AND t.status IN ('pending','running','paused','interrupted')
@@ -184,16 +198,58 @@ func (s *Scheduler) flushScopeLandings() {
 	// Deliver one grouped scope-landed alert for the whole window. The event
 	// key is derived from the claimed rows, so the outbox deduplicates retries.
 	// This makes the per-chat scope-landed switch meaningful (B9).
+	summary, hosts := s.summarizeScopeLandings(claimed)
 	if s.notifier != nil {
-		hosts := make([]string, 0, len(claimed))
-		for _, l := range claimed {
-			hosts = append(hosts, l.Identifier)
-		}
-		summary := fmt.Sprintf("%d host(s) landed in eligible scope", len(claimed))
 		s.notifier.NotifyScopeLanded("scope-landed:"+claimed[0].EventID, summary, hosts)
 	}
 	s.markScopeLandingsSent(claimed)
+	byTarget := map[string]int{}
+	for _, l := range claimed {
+		byTarget[l.TargetID]++
+	}
+	for tid, count := range byTarget {
+		s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+	}
 	s.logger.Info("Closed watch landing audit rows", "count", len(claimed))
+
+	// A later loss of eligibility is recorded as history, not as a landing
+	// alert. Consume those rows silently so they cannot block the audit queue.
+	lostRows, err := s.db.QueryContext(ctx, `
+		SELECT e.id, e.target_id, COALESCE(e.program_id,''), e.identifier
+		FROM watch_scope_events e
+		WHERE e.event_type='out_of_scope' AND e.announced = 0
+		ORDER BY e.detected_at ASC LIMIT 500`)
+	if err != nil {
+		s.logger.Warn("Could not load out-of-scope watch events", "error", err)
+		return
+	}
+	var lost []scopeLanding
+	for lostRows.Next() {
+		var l scopeLanding
+		if err := lostRows.Scan(&l.EventID, &l.TargetID, &l.ProgramID, &l.Identifier); err == nil {
+			lost = append(lost, l)
+		}
+	}
+	_ = lostRows.Close()
+	if len(lost) == 0 {
+		return
+	}
+	lostIDs := make([]string, 0, len(lost))
+	for _, l := range lost {
+		lostIDs = append(lostIDs, l.EventID)
+	}
+	claimedLost := s.claimScopeLandings(lostIDs)
+	if len(claimedLost) == 0 {
+		return
+	}
+	s.markScopeLandingsSent(claimedLost)
+	byTarget = map[string]int{}
+	for _, l := range claimedLost {
+		byTarget[l.TargetID]++
+	}
+	for tid, count := range byTarget {
+		s.hub.Broadcast("changes_written", map[string]any{"target_id": tid, "count": count})
+	}
 }
 
 // claimScopeLandings marks the given rows as in flight and returns the ones it

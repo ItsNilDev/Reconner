@@ -138,6 +138,10 @@ var DefaultMonitorWatchModules = []string{
 
 var AllModules = []string{
 	ModuleSubdomainEnum,
+	// Monitor diffs stored observations before the probe can overwrite them.
+	// ModuleHTTPProbe and ModuleJSAnalysis remain prerequisites in moduleRequires,
+	// but they must run after Monitor in the canonical pipeline.
+	ModuleMonitor,
 	ModuleHTTPProbe,
 	ModuleJSAnalysis,
 	ModuleJSEndpoints,
@@ -189,7 +193,6 @@ var AllModules = []string{
 	ModuleWPCredAudit,
 	ModuleWPVulns,
 	ModuleVerify,
-	ModuleMonitor,
 }
 
 // Notifier is implemented by the Telegram bot to receive scan/vuln events.
@@ -535,6 +538,7 @@ func (s *Scheduler) Start() {
 	// tier-scoped: deep rows and every finding row survive.
 	s.wg.Add(1)
 	go s.retentionScheduler()
+	s.reclaimClaimedScopeLandings(context.Background())
 
 	// A project that is a breadth project but no longer 'web' cannot run a
 	// watch round. Tell the operator once per state change.
@@ -600,6 +604,7 @@ func (s *Scheduler) recoverPendingTasks() {
 		rows.Close()
 		for _, id := range stale {
 			_, _ = s.db.Exec(`UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
+			s.finishUnresolvedTaskPhases(id, "cancelled", "interrupted by shutdown")
 			s.hub.Broadcast("task_cancelled", map[string]string{"task_id": id, "target_id": staleTargets[id]})
 			// A cancelled watch round needs the same terminal treatment as a
 			// normally-finished one, otherwise the project stays due in the past
@@ -634,11 +639,22 @@ func (s *Scheduler) recoverPendingTasks() {
 	// AHEAD of a scan the user just started, monopolising the concurrency slots.
 	// Reconcile it: any task still 'pending' from more than 2h ago is stale and is
 	// cancelled so the queue is clear. Recently-queued pendings (<2h) drain normally.
-	if res, err := s.db.Exec(`
-		UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-		WHERE status='pending' AND created_at < datetime('now','-2 hours')`); err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			s.logger.Info("Cleared stale pending backlog from previous runs", "count", n)
+	stalePendingRows, err := s.db.Query(`SELECT id FROM tasks WHERE status='pending' AND created_at < datetime('now','-2 hours')`)
+	if err == nil {
+		var stalePending []string
+		for stalePendingRows.Next() {
+			var id string
+			if err := stalePendingRows.Scan(&id); err == nil {
+				stalePending = append(stalePending, id)
+			}
+		}
+		stalePendingRows.Close()
+		for _, id := range stalePending {
+			_, _ = s.db.Exec(`UPDATE tasks SET status='cancelled', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
+			s.finishUnresolvedTaskPhases(id, "cancelled", "stale pending backlog")
+		}
+		if len(stalePending) > 0 {
+			s.logger.Info("Cleared stale pending backlog from previous runs", "count", len(stalePending))
 		}
 	}
 }
@@ -907,6 +923,13 @@ func normalizeRequestedModules(modules []string) ([]string, error) {
 }
 
 func (s *Scheduler) createTask(targetID string, modules []string, priority int, typeTag, scopeOverride string) (*models.Task, error) {
+	return s.createTaskWithOptions(targetID, modules, priority, typeTag, scopeOverride, true)
+}
+
+// createTaskWithOptions creates a task from an explicit module list. plan=false
+// keeps a resume from re-expanding modules that were already planned when the
+// original task was created.
+func (s *Scheduler) createTaskWithOptions(targetID string, modules []string, priority int, typeTag, scopeOverride string, plan bool) (*models.Task, error) {
 	// Hold admission read-locked through persistence/enqueue so graceful shutdown
 	// cannot begin between the stopping check and creation of a new pending row.
 	s.mu.RLock()
@@ -965,7 +988,7 @@ func (s *Scheduler) createTask(targetID string, modules []string, priority int, 
 	// against the PREVIOUS HTTP/JS baseline before http_probe/js_analysis refresh
 	// those rows. The generic capability planner sorts probes before detectors,
 	// which erased status/title/JS changes and made monitoring miss real drift.
-	if typeTag != monitorWatchType && typeTag != "guided_capture" {
+	if plan && typeTag != monitorWatchType && typeTag != "guided_capture" {
 		modules = PlanModules(modules)
 	}
 	modules = applyPlanOptions(modules)
@@ -1038,16 +1061,18 @@ var ErrNothingToResume = fmt.Errorf("nothing to resume: all modules already comp
 // "re-run the last one module" rather than "start over from zero".
 func (s *Scheduler) ResumeTask(taskID string) (*models.Task, error) {
 	var originalType string
-	_ = s.db.QueryRow(`SELECT type FROM tasks WHERE id=?`, taskID).Scan(&originalType)
+	if err := s.db.QueryRow(`SELECT COALESCE(type,'') FROM tasks WHERE id=?`, taskID).Scan(&originalType); err != nil {
+		return nil, fmt.Errorf("task not found: %w", err)
+	}
 	if originalType == "guided_capture" {
 		return nil, fmt.Errorf("restart guided runs from the capture page to review request approval and scope")
 	}
-	var targetID, status, modulesJSON, completedJSON string
+	var targetID, status, modulesJSON, completedJSON, scopeOverride string
 	var priority int
 	err := s.db.QueryRow(`
-		SELECT target_id, status, modules, COALESCE(completed_modules,'[]'), priority
+		SELECT target_id, status, modules, COALESCE(completed_modules,'[]'), priority, COALESCE(scope_override,'')
 		FROM tasks WHERE id = ?
-	`, taskID).Scan(&targetID, &status, &modulesJSON, &completedJSON, &priority)
+	`, taskID).Scan(&targetID, &status, &modulesJSON, &completedJSON, &priority, &scopeOverride)
 	if err != nil {
 		return nil, fmt.Errorf("task not found: %w", err)
 	}
@@ -1068,14 +1093,14 @@ func (s *Scheduler) ResumeTask(taskID string) (*models.Task, error) {
 	// They stay in tasks.modules for restart fidelity, but a resume must not
 	// carry them as work: with only tokens left, createTask would fail with
 	// "select at least one executable module".
-	var remaining, skipped []string
+	var remaining, optionTokens, skipped []string
 	for _, m := range all {
 		if done[m] {
 			skipped = append(skipped, m)
 			continue
 		}
 		if scanOptionToken(m) {
-			// Keep the token only when real work remains next to it.
+			optionTokens = append(optionTokens, m)
 			continue
 		}
 		remaining = append(remaining, m)
@@ -1083,10 +1108,11 @@ func (s *Scheduler) ResumeTask(taskID string) (*models.Task, error) {
 	if len(remaining) == 0 {
 		return nil, ErrNothingToResume
 	}
+	finalModules := append(remaining, optionTokens...)
 
 	// The resumed task keeps the ORIGINAL task type. A watch round resumed as a
 	// deep scan would run the whole heavy pipeline and land in the deep drain.
-	newTask, err := s.CreateTaskTyped(targetID, remaining, priority, resumeTypeTag(originalType))
+	newTask, err := s.createTaskWithOptions(targetID, finalModules, priority, resumeTypeTag(originalType), scopeOverride, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1108,8 +1134,8 @@ func shortID(id string) string {
 }
 
 func (s *Scheduler) CancelTask(taskID string) error {
-	var targetID string
-	if err := s.db.QueryRow(`SELECT target_id FROM tasks WHERE id=?`, taskID).Scan(&targetID); err != nil {
+	var targetID, taskType, status string
+	if err := s.db.QueryRow(`SELECT target_id, COALESCE(type,''), COALESCE(status,'') FROM tasks WHERE id=?`, taskID).Scan(&targetID, &taskType, &status); err != nil {
 		return fmt.Errorf("task not found: %w", err)
 	}
 	s.mu.Lock()
@@ -1121,6 +1147,7 @@ func (s *Scheduler) CancelTask(taskID string) error {
 	delete(s.cancelMap, taskID)
 	delete(s.running, taskID)
 	delete(s.taskTargets, taskID)
+	delete(s.taskTypes, taskID)
 	s.mu.Unlock()
 
 	if ok {
@@ -1140,6 +1167,15 @@ func (s *Scheduler) CancelTask(taskID string) error {
 	}
 
 	s.hub.Broadcast("task_cancelled", map[string]string{"task_id": taskID, "target_id": targetID})
+	s.finishUnresolvedTaskPhases(taskID, "cancelled", "operator cancelled")
+	if taskType == watchScanType {
+		s.applyWatchTerminalRules(targetID, "cancelled")
+	}
+	if taskType == monitorWatchType {
+		if _, err := s.db.Exec(`UPDATE targets SET monitor_last_run=CURRENT_TIMESTAMP WHERE id=?`, targetID); err != nil {
+			return err
+		}
+	}
 	if targetID != "" {
 		s.refreshTargetScanStatus(targetID, "idle", false)
 	}
@@ -1182,6 +1218,7 @@ func (s *Scheduler) CancelTasksForTarget(targetID string) error {
 		delete(s.cancelMap, id)
 		delete(s.running, id)
 		delete(s.taskTargets, id)
+		delete(s.taskTypes, id)
 	}
 	s.mu.Unlock()
 	for _, id := range ids {
@@ -1547,6 +1584,18 @@ func (s *Scheduler) tryStartTask(taskID string) {
 		return
 	}
 	isWatch := taskType == watchScanType
+	// Read target eligibility before taking the mutex. No database call may
+	// happen while the scheduler lock is held.
+	var watchOnly int
+	var kind string
+	var targetLookupErr error
+	if isWatch {
+		targetLookupErr = s.db.QueryRow(`SELECT COALESCE(watch_only,0),COALESCE(kind,'web') FROM targets WHERE id=?`, targetID).Scan(&watchOnly, &kind)
+		if targetLookupErr != nil && !errors.Is(targetLookupErr, sql.ErrNoRows) {
+			s.logger.Warn("Watch admission target lookup failed", "task_id", taskID, "error", targetLookupErr)
+			return
+		}
+	}
 
 	// Read pressure ONCE for this admission decision so the global, deep and
 	// watch caps all come from the same sample. The configured values are honored
@@ -1575,10 +1624,7 @@ func (s *Scheduler) tryStartTask(taskID string) {
 		}
 		// A queued watch round whose project was flipped back to deep (or turned
 		// mixed) must not start: the project is no longer a watch project.
-		var watchOnly int
-		var kind string
-		_ = s.db.QueryRow(`SELECT COALESCE(watch_only,0),COALESCE(kind,'web') FROM targets WHERE id=?`, targetID).Scan(&watchOnly, &kind)
-		if watchOnly != 1 || kind != "web" {
+		if targetLookupErr == sql.ErrNoRows || watchOnly != 1 || kind != "web" {
 			s.mu.Unlock()
 			s.cancelStaleWatchTask(taskID, targetID)
 			return
@@ -1918,6 +1964,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// queued but before it started — don't run it.
 	if taskStatus == "cancelled" {
 		s.logger.Info("Skipping cancelled task", "task_id", taskID)
+		s.finishUnresolvedTaskPhases(taskID, "cancelled", "task cancelled before execution")
 		return
 	}
 	if taskType == "guided_capture" {
@@ -3971,7 +4018,7 @@ func (s *Scheduler) notifyScanDone(taskID, targetID, domain, taskType, status st
 		// own audit rows, not from a global count.
 		var newHosts, landed int
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE task_id=? AND change_type='new_subdomain'`, taskID).Scan(&newHosts)
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_scope_events WHERE target_id=? AND detected_at>=?`,
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_scope_events WHERE target_id=? AND event_type IN ('landed','re_eligible') AND detected_at>=?`,
 			targetID, startedAt.UTC().Format("2006-01-02 15:04:05")).Scan(&landed)
 		stats["new_hosts"] = newHosts
 		stats["landed"] = landed

@@ -462,9 +462,15 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 	// Only web assets are monitorable. A network asset (ip/cidr) has no page to
 	// fetch: building https://10.0.0.0/24 from it would just burn a request and
 	// record a meaningless "change" on the range string itself.
+	excl, err := LoadExclusionsE(ctx, s.db, targetID)
+	if err != nil {
+		return 0, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id,value,COALESCE(asset_type,'domain'),COALESCE(metadata,'{}')
 		FROM assets WHERE target_id=? AND COALESCE(approval_status,'approved')='approved' AND COALESCE(monitor_enabled,1)=1
-		  AND COALESCE(kind,'web')='web'`, targetID)
+		  AND COALESCE(kind,'web')='web'
+		  AND NOT (COALESCE(source,'')='watch:scope' AND COALESCE(asset_type,'')='subdomain')
+		  AND COALESCE(json_extract(COALESCE(metadata,'{}'),'$.out_of_scope'),0) <> 1`, targetID)
 	if err != nil {
 		return 0, err
 	}
@@ -488,7 +494,21 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 		meta := map[string]any{}
 		_ = json.Unmarshal([]byte(a.metadata), &meta)
 		lastURL, _ := meta["monitor_url"].(string)
+		if meta["out_of_scope"] == true || meta["out_of_scope"] == float64(1) {
+			continue
+		}
 		candidates := monitorAssetCandidates(a.value, a.typ, lastURL)
+		// Apply the current scope and exclusions to every request candidate.
+		// A historical asset row may still be approved while its destination
+		// has since been denied or revoked.
+		allowed := candidates[:0]
+		for _, candidate := range candidates {
+			if excl.ExcludesDestination(ctx, URLHost(candidate)) || !urlHostInScope(ctx, candidate) {
+				continue
+			}
+			allowed = append(allowed, candidate)
+		}
+		candidates = allowed
 		if len(candidates) == 0 {
 			continue
 		}

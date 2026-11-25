@@ -433,13 +433,16 @@ func watchHTTPServiceForHost(ctx context.Context, db *database.DB, targetID, hos
 		COALESCE(s.server,''),COALESCE(s.technologies,'[]'),COALESCE(s.redirect_url,'')`
 	if h, err := scanWatchService(db.QueryRowContext(ctx, selectCols+`
 		FROM http_services s JOIN subdomains d ON d.id=s.subdomain_id
-		WHERE s.target_id=? AND LOWER(d.subdomain)=? ORDER BY s.url LIMIT 1`, targetID, wanted)); err == nil {
+		WHERE s.target_id=? AND LOWER(d.subdomain)=?
+		  AND COALESCE(s.status_code,0) BETWEEN 100 AND 599
+		ORDER BY CASE WHEN LOWER(s.url) LIKE 'https://%' THEN 0 ELSE 1 END, s.url LIMIT 1`, targetID, wanted)); err == nil {
 		return h
 	}
 
 	rows, err := db.QueryContext(ctx, selectCols+`
-		FROM http_services s WHERE s.target_id=? AND COALESCE(s.status_code,0)>0
-		  AND INSTR(LOWER(s.url), ?) > 0 ORDER BY s.url LIMIT 200`, targetID, wanted)
+		FROM http_services s WHERE s.target_id=? AND COALESCE(s.status_code,0) BETWEEN 100 AND 599
+		  AND INSTR(LOWER(s.url), ?) > 0
+		ORDER BY CASE WHEN LOWER(s.url) LIKE 'https://%' THEN 0 ELSE 1 END, s.url LIMIT 200`, targetID, wanted)
 	if err != nil {
 		return watchHTTPSnapshot{}
 	}

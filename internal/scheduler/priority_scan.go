@@ -254,8 +254,24 @@ func (s *Scheduler) runPerAssetPhase(ctx context.Context, taskID, targetID strin
 				}
 			}
 			logFn("info", m, fmt.Sprintf("[asset %d/%d score=%d] %s", i+1, total, aw.score, aw.host))
-			if err := runPlannedModule(assetCtx, m); err != nil && results[m].err == nil {
-				results[m].err = err
+			// Use the same cancellation-aware collector as the grouped batch so
+			// a single module cannot leave the worker alive after its context
+			// is cancelled.
+			oneResult := make(chan phaseRunResult, 1)
+			oneStarted := time.Now()
+			go func(module string) {
+				err := runPlannedModule(assetCtx, module)
+				oneResult <- phaseRunResult{module: module, err: err, duration: time.Since(oneStarted)}
+			}(m)
+			collected, forced := collectPhaseResults(assetCtx, []string{m}, oneResult, phaseStopGrace)
+			if forced {
+				logFn("warn", "scheduler", fmt.Sprintf("[asset %d/%d] Module %s did not stop within %s after cancellation; force-released.", i+1, total, m, phaseStopGrace))
+			}
+			if len(collected) > 0 {
+				results[m].duration = collected[0].duration
+				if collected[0].err != nil && results[m].err == nil {
+					results[m].err = collected[0].err
+				}
 			}
 			j++
 		}
