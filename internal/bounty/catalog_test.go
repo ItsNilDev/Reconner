@@ -825,3 +825,83 @@ func TestListScopeEventsHidesNonWebHistory(t *testing.T) {
 		t.Fatalf("scope events=%+v, want only evt-web", events)
 	}
 }
+
+func TestReplaceAssetsRefusesEmptyScrape(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{
+		Provider: "hackerone", ExternalID: "empty-1", Handle: "empty", Name: "Empty",
+		Status: "live", ProgramType: "bug_bounty",
+		Assets: []Asset{{ExternalID: "a1", Identifier: "app.example.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true}},
+	}
+	storeTestProgram(t, svc, &p)
+	p.Assets = nil
+	if err := svc.replaceAssets(context.Background(), &p); err == nil {
+		t.Fatal("empty scrape must refuse to wipe active scope")
+	}
+	var active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM bounty_program_assets WHERE program_id=? AND active=1`, p.ID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active == 0 {
+		t.Fatal("active scope was wiped by an empty scrape")
+	}
+}
+
+func TestSplitManagedExclusionsKeepsMultiWordRules(t *testing.T) {
+	raw := "#bounty:p1|*.api.example.com, staging.example.com\nmanual.example.com"
+	other, mine, manual := splitManagedExclusions(raw, "p1")
+	if len(mine) != 1 || mine[0] != "#bounty:p1|*.api.example.com, staging.example.com" {
+		t.Fatalf("managed line was split: %v", mine)
+	}
+	if len(other) != 0 {
+		t.Fatalf("unexpected other rules: %v", other)
+	}
+	if len(manual) != 1 || manual[0] != "manual.example.com" {
+		t.Fatalf("manual rules = %v", manual)
+	}
+}
+
+func TestDenyRuleEventHasCleanIdentifierAndNotifies(t *testing.T) {
+	svc, db := testCatalog(t)
+	var got []string
+	svc.SetScopeEventNotify(func(_ context.Context, _, _, _, eventType, identifier string) {
+		got = append(got, eventType+":"+identifier)
+	})
+	p := Program{
+		Provider: "hackerone", ExternalID: "rule-1", Handle: "rule", Name: "Rule",
+		Status: "live", ProgramType: "bug_bounty",
+		Assets: []Asset{
+			{ExternalID: "in", Identifier: "app.example.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+			{ExternalID: "out", Identifier: "admin.example.test", AssetType: "DOMAIN", InScope: false, EligibleSubmission: false, Active: true},
+		},
+	}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{Name: "Rule", AssetIDs: []string{p.Assets[0].ID}, MonitorEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	if !svc.createRuleEvent(context.Background(), projectID, p.ID, "rule_added", "admin.example.test",
+		"{}", mustJSON(map[string]any{"identifier": "admin.example.test", "rule": "admin.example.test", "in_scope": false})) {
+		t.Fatal("createRuleEvent reported no insert")
+	}
+	var identifier, newJSON string
+	if err := db.QueryRow(`SELECT identifier, new_json FROM bounty_scope_events WHERE target_id=? AND event_type='rule_added'`, projectID).Scan(&identifier, &newJSON); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(identifier, "#bounty:") || strings.Contains(identifier, "|") {
+		t.Fatalf("rule event identifier is not clean: %q", identifier)
+	}
+	if !strings.Contains(newJSON, `"in_scope":false`) {
+		t.Fatalf("rule event JSON is not valid: %q", newJSON)
+	}
+	found := false
+	for _, v := range got {
+		if v == "rule_added:"+identifier {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("onScopeEvent callback missing rule_added:%q, got %v", identifier, got)
+	}
+}

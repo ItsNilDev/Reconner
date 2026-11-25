@@ -261,7 +261,14 @@ func IsWatchScopeHostEligibleE(ctx context.Context, db *database.DB, targetID, r
 	if err != nil {
 		return false, "", "", err
 	}
+	excl, err := LoadExclusionsE(ctx, db, targetID)
+	if err != nil {
+		return false, "", "", err
+	}
 	if !hasProgram || len(entries) == 0 {
+		return false, "", "", nil
+	}
+	if excl.ExcludesDestination(ctx, rawHost) {
 		return false, "", "", nil
 	}
 	host, ok := normalizeWatchHost(rawHost)
@@ -307,6 +314,11 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 		logFn("info", "watch_scope", "no eligible program assets: nothing landed this round")
 		return nil
 	}
+	excl, err := LoadExclusionsE(ctx, db, targetID)
+	if err != nil {
+		logFn("warn", "watch_scope", fmt.Sprintf("Scope landing skipped: %v", err))
+		return nil
+	}
 
 	seen := map[string]bool{}
 	var landed []string
@@ -316,6 +328,9 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 			continue
 		}
 		seen[host.Value] = true
+		if excl.ExcludesDestination(ctx, raw) {
+			continue
+		}
 		entry, ok := matchWatchHost(entries, host)
 		if !ok {
 			continue // outside the eligible scope: not added, not notified
@@ -472,6 +487,10 @@ func SweepWatchScopeOutOfScope(ctx context.Context, db *database.DB, targetID st
 	if err != nil {
 		return 0
 	}
+	excl, err := LoadExclusionsE(ctx, db, targetID)
+	if err != nil {
+		return 0
+	}
 	if !hasProgram {
 		return 0
 	}
@@ -501,8 +520,11 @@ func SweepWatchScopeOutOfScope(ctx context.Context, db *database.DB, targetID st
 		if !ok {
 			continue
 		}
-		if _, ok := matchWatchHost(entries, host); ok {
-			continue // still eligible
+		excluded := excl.ExcludesDestination(ctx, a.value)
+		if !excluded {
+			if _, ok := matchWatchHost(entries, host); ok {
+				continue // still eligible
+			}
 		}
 		if watchMetadataOutOfScope(a.metadata) {
 			continue // already marked
@@ -522,7 +544,8 @@ func SweepWatchScopeOutOfScope(ctx context.Context, db *database.DB, targetID st
 			eventMeta, _ := json.Marshal(map[string]any{
 				"out_of_scope": 1, "task_id": taskIDFromContext(ctx),
 			})
-			_ = insertWatchScopeEvent(ctx, db, targetID, "", a.value, "out_of_scope", a.id, eventMeta)
+			programID, _ := meta["program_id"].(string)
+			_ = insertWatchScopeEvent(ctx, db, targetID, programID, a.value, "out_of_scope", a.id, eventMeta)
 		}
 	}
 	if marked > 0 {

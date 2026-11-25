@@ -29,8 +29,11 @@ var baseDialer = &net.Dialer{
 // ordinary scans pay no extra lookup.
 func scopeGuardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	excl := exclusionsFromContext(ctx)
-	if excl.Empty() || !excl.HasCIDRs() {
+	if excl.Empty() {
 		return baseDialer.DialContext(ctx, network, addr)
+	}
+	if excl.Excludes(addr) {
+		return nil, fmt.Errorf("%w: %s is excluded", ErrDestinationBlocked, addr)
 	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -70,8 +73,8 @@ func scopeGuardedDialContext(ctx context.Context, network, addr string) (net.Con
 }
 
 var baseHTTPTransport = &http.Transport{
-	Proxy:       http.ProxyFromEnvironment,
-	DialContext: scopeGuardedDialContext,
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           scopeGuardedDialContext,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          512,
 	MaxIdleConnsPerHost:   16,

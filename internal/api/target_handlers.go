@@ -334,7 +334,7 @@ func (h *Handler) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		ScanHeaders:   scanHeaders,
 	}
 
-	h.hub.Broadcast("target_created", target)
+	h.hub.BroadcastToTarget(id, "target_created", map[string]any{"id": id, "target_id": id, "domain": target.Domain, "name": target.Name, "kind": string(target.Kind)})
 	h.writeJSON(w, http.StatusCreated, map[string]any{"data": target, "success": true})
 }
 
@@ -662,7 +662,7 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]string{"message": "updated"})
 }
 
@@ -708,6 +708,10 @@ func (h *Handler) deleteTargetByID(id string) error {
 		}
 	}
 
+	var ownerID int64
+	if err := tx.QueryRow("SELECT COALESCE(owner_id,0) FROM targets WHERE id = ?", id).Scan(&ownerID); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	res, err := tx.Exec("DELETE FROM targets WHERE id = ?", id)
 	if err != nil {
 		return err
@@ -719,7 +723,7 @@ func (h *Handler) deleteTargetByID(id string) error {
 		return err
 	}
 	if h.hub != nil {
-		h.hub.Broadcast("target_deleted", map[string]string{"id": id})
+		h.hub.BroadcastToOwner(ownerID, "target_deleted", map[string]string{"id": id, "target_id": id})
 	}
 	return nil
 }
@@ -827,7 +831,7 @@ func (h *Handler) handleUpdateMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.hub != nil {
-		h.hub.Broadcast("target_updated", map[string]string{"id": id})
+		h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	}
 	h.writeSuccess(w, map[string]any{"monitor_enabled": req.Enabled, "monitor_interval_hours": req.IntervalHours})
 }

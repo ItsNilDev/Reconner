@@ -42,7 +42,7 @@ func (h *Handler) handleSetFindingTriage(w http.ResponseWriter, r *http.Request)
 		h.writeError(w, http.StatusNotFound, "finding not found")
 		return
 	}
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]string{"triage": req.Triage})
 }
 

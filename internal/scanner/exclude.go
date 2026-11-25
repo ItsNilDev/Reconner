@@ -46,7 +46,11 @@ func (e ExclusionSet) HasCIDRs() bool { return len(e.cidrs) > 0 }
 // bracketed IPv6 intact. It never strips a leading dot: callers use that to
 // recognize a leading-dot suffix rule.
 func normalizeExclusionHost(host string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	host = strings.TrimSpace(host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
 // ParseExclusions compiles a raw exclude_scope string into an ExclusionSet.
@@ -55,17 +59,27 @@ func ParseExclusions(raw string) ExclusionSet {
 		hosts:     map[string]bool{},
 		endpoints: map[string]map[string]bool{},
 	}
-	for _, tok := range strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == ';'
-	}) {
+	// A managed rule is one whole line: its identifier may contain commas or
+	// spaces. Tokenize only non-managed lines.
+	var tokens []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#bounty:") {
+			tokens = append(tokens, line)
+			continue
+		}
+		tokens = append(tokens, strings.FieldsFunc(line, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == ';'
+		})...)
+	}
+	for _, tok := range tokens {
 		tok = strings.TrimSpace(tok)
 		if tok == "" {
 			continue
 		}
-
-		// Program-managed deny rules carry a provenance marker so reconciliation
-		// can refresh them without touching manual operator rules. The marker is
-		// one token (no spaces) and the rule after '|' is parsed normally.
 		if strings.HasPrefix(tok, "#bounty:") {
 			parts := strings.SplitN(tok, "|", 2)
 			if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
@@ -83,13 +97,24 @@ func ParseExclusions(raw string) ExclusionSet {
 			}
 		}
 
-		// CIDR. Normalize before parsing so IPv6 and casing behave.
+		// CIDR. Normalize before parsing so IPv6 and casing behave. A token
+		// with a slash that is not a CIDR is a schemeless path rule; let it
+		// fall through to the host-wide truncation below.
 		if strings.Contains(tok, "/") {
-			_, n, err := net.ParseCIDR(strings.ToLower(strings.TrimSpace(tok)))
-			if err == nil {
+			if _, n, err := net.ParseCIDR(strings.ToLower(strings.TrimSpace(tok))); err == nil {
 				e.cidrs = append(e.cidrs, n)
+				continue
 			}
-			continue
+		}
+
+		// A schemeless rule such as admin.example.com/panel or
+		// *.staging.example.com/* excludes the whole host. Paths never narrow
+		// an exclusion, so drop everything after the first slash.
+		if !strings.Contains(tok, "://") && strings.Contains(tok, "/") {
+			tok = strings.SplitN(tok, "/", 2)[0]
+			if tok == "" {
+				continue
+			}
 		}
 
 		// Leading-dot and "*.x" forms both mean the apex and all descendants.

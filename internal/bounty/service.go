@@ -477,6 +477,17 @@ func (s *Service) replaceAssets(ctx context.Context, p *Program) error {
 		return err
 	}
 	defer tx.Rollback()
+	// An empty scrape from an upstream provider must not suspend every known
+	// asset. Keep the previous scope until the provider returns real data.
+	if len(p.Assets) == 0 {
+		var active int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bounty_program_assets WHERE program_id=? AND active=1`, p.ID).Scan(&active); err != nil {
+			return err
+		}
+		if active > 0 {
+			return fmt.Errorf("program %s returned 0 assets (had %d active); refusing to wipe scope", p.ID, active)
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE bounty_program_assets SET active=0 WHERE program_id=?`, p.ID); err != nil {
 		return err
 	}

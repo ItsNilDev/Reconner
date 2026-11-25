@@ -104,7 +104,7 @@ func (h *Handler) handleCreateProjectFromProgram(w http.ResponseWriter, r *http.
 		h.writeError(w, status, err.Error())
 		return
 	}
-	h.hub.Broadcast("target_created", map[string]string{"id": id})
+	h.hub.BroadcastToTarget(id, "target_created", map[string]string{"id": id, "target_id": id})
 	h.writeJSON(w, http.StatusCreated, map[string]any{"success": true, "data": map[string]string{"id": id, "url": "/targets/" + id}})
 }
 
@@ -126,7 +126,7 @@ func (h *Handler) handleBulkCreateProjectsFromPrograms(w http.ResponseWriter, r 
 	for _, res := range results {
 		if res.OK && res.TargetID != "" {
 			created++
-			h.hub.Broadcast("target_created", map[string]string{"id": res.TargetID})
+			h.hub.BroadcastToTarget(res.TargetID, "target_created", map[string]string{"id": res.TargetID, "target_id": res.TargetID})
 		}
 	}
 	h.writeJSON(w, http.StatusCreated, map[string]any{
@@ -193,6 +193,7 @@ func (h *Handler) handleResolveBountyEvent(w http.ResponseWriter, r *http.Reques
 		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.hub.Broadcast("target_updated", map[string]string{"id": mux.Vars(r)["id"]})
+	tid := mux.Vars(r)["id"]
+	h.hub.Broadcast("target_updated", map[string]string{"id": tid, "target_id": tid})
 	h.writeSuccess(w, map[string]string{"status": req.Decision})
 }

@@ -117,3 +117,20 @@ func TestExclusionSyntaxNormalization(t *testing.T) {
 		}
 	})
 }
+
+func TestExclusionSchemelessPathsAndWildcards(t *testing.T) {
+	set := ParseExclusions("admin.example.com/panel\n*.staging.example.com/*")
+	if !set.Excludes("admin.example.com") {
+		t.Error("schemeless path rule must exclude the whole host")
+	}
+	if !set.Excludes("api.staging.example.com") {
+		t.Error("wildcard path rule must exclude descendants")
+	}
+}
+
+func TestExclusionBracketedIPv6(t *testing.T) {
+	set := ParseExclusions("[2001:db8::1]")
+	if !set.Excludes("2001:db8::1") {
+		t.Error("bracketed IPv6 rule must exclude the literal host")
+	}
+}

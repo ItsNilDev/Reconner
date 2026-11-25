@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -26,9 +27,12 @@ import (
 var cmsFingerprintClient = &http.Client{
 	Timeout:   10 * time.Second,
 	Transport: sharedHTTPTransport,
-	CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 3 {
 			return http.ErrUseLastResponse
+		}
+		if !urlHostInScope(req.Context(), req.URL.String()) {
+			return fmt.Errorf("%w: redirect to %s is outside scope", ErrDestinationBlocked, req.URL.Host)
 		}
 		return nil
 	},

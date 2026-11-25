@@ -464,17 +464,7 @@ func hostInScope(ctx context.Context, host string) bool {
 
 // urlHostInScope extracts the host from rawURL and checks hostInScope.
 func urlHostInScope(ctx context.Context, rawURL string) bool {
-	if hostExcluded(ctx, URLHost(rawURL)) {
-		return false
-	}
-	if hostScopeSet(ctx) == nil && strictWatchScopeSet(ctx) == nil {
-		return true
-	}
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || u.Host == "" {
-		return false
-	}
-	return hostInScope(ctx, u.Host)
+	return hostInScope(ctx, URLHost(rawURL))
 }
 
 // filterURLsByHostScope drops URLs whose host is outside the per-asset scope

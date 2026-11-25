@@ -36,7 +36,19 @@ func NewCSRFScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, l
 	return &CSRFScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
 }
 
-var csrfClient = &http.Client{Timeout: 12 * time.Second, Transport: sharedHTTPTransport}
+var csrfClient = &http.Client{
+	Timeout:   12 * time.Second,
+	Transport: sharedHTTPTransport,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return http.ErrUseLastResponse
+		}
+		if !urlHostInScope(req.Context(), req.URL.String()) {
+			return fmt.Errorf("%w: redirect to %s is outside scope", ErrDestinationBlocked, req.URL.Host)
+		}
+		return nil
+	},
+}
 
 // csrfTokenName matches hidden-input names that are anti-CSRF tokens.
 var csrfTokenName = regexp.MustCompile(`(?i)csrf|xsrf|_token|authenticity_token|nonce|request[_-]?verification|anti[_-]?forgery`)

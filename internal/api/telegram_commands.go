@@ -586,7 +586,7 @@ func (b *TelegramBot) createTelegramTarget(ctx context.Context, rawScope, name s
 		return telegramTarget{}, err
 	}
 	if b.h.hub != nil {
-		b.h.hub.Broadcast("target_created", map[string]any{"id": id, "domain": domain, "name": strings.TrimSpace(name), "kind": kind})
+		b.h.hub.BroadcastToTarget(id, "target_created", map[string]any{"id": id, "target_id": id, "domain": domain, "name": strings.TrimSpace(name), "kind": kind})
 	}
 	return b.resolveTelegramTarget(ctx, id)
 }
@@ -665,7 +665,7 @@ func (b *TelegramBot) editTelegramTarget(ctx context.Context, target telegramTar
 		return err
 	}
 	if b.h.hub != nil {
-		b.h.hub.Broadcast("target_updated", map[string]string{"id": target.ID})
+		b.h.hub.Broadcast("target_updated", map[string]string{"id": target.ID, "target_id": target.ID})
 	}
 	return nil
 }

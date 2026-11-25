@@ -202,7 +202,7 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to add asset")
 		return
 	}
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, models.Asset{ID: aid, TargetID: id, Name: strings.TrimSpace(req.Name), Value: value, Kind: kind, AssetType: assetType, Source: "manual", ApprovalStatus: "approved", MonitorEnabled: true})
 }
 
@@ -317,7 +317,7 @@ func (h *Handler) handleUpdateAsset(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to update asset")
 		return
 	}
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]string{"message": "updated"})
 }
 
@@ -354,7 +354,7 @@ func (h *Handler) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusNotFound, "asset not found")
 		return
 	}
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]string{"message": "deleted"})
 }
 

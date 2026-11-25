@@ -703,7 +703,20 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 			var m map[string]any
 			_ = json.Unmarshal([]byte(meta), &m)
 			raw, _ := m["raw_hash"].(string)
-			oldAsset := Asset{ID: sid, Identifier: value, AssetType: bType, RawHash: raw}
+			oldAsset := Asset{
+				ID: sid, Identifier: value, AssetType: bType, RawHash: raw,
+				ProgramID: programID, Active: true, InScope: true, EligibleSubmission: true,
+				IsWildcard: strings.HasPrefix(value, "*."),
+			}
+			if v, ok := m["eligible_bounty"].(bool); ok {
+				oldAsset.EligibleBounty = v
+			}
+			if v, ok := m["max_severity"].(string); ok {
+				oldAsset.MaxSeverity = v
+			}
+			if v, ok := m["instruction"].(string); ok {
+				oldAsset.Instruction = v
+			}
 			existing[sid] = struct{ ID, Value, Status, Raw, JSON string }{id, value, status, raw, mustJSON(oldAsset)}
 		}
 	}
@@ -722,6 +735,15 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 			if old, ok := existing[a.ID]; !ok {
 				// Carry the raw hash so approval can detect an upstream edit
 				// made after this "added" event was recorded (A13).
+				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "added", a.Identifier, "{}", mustJSON(a), a.RawHash) {
+					added++
+				}
+			} else if old.Status == "suspended" {
+				if _, err := s.db.ExecContext(ctx, `DELETE FROM bounty_scope_decisions
+					WHERE target_id=? AND program_id=? AND program_asset_id=? AND event_type='added'`,
+					targetID, p.ID, a.ID); err != nil {
+					return err
+				}
 				if s.createScopeEvent(ctx, targetID, p.ID, a.ID, "added", a.Identifier, "{}", mustJSON(a), a.RawHash) {
 					added++
 				}
@@ -745,12 +767,21 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	// program owns are replaced. Manual edits, other programs' rules, and legacy
 	// unmarked rules survive, so a sync never widens or narrows them by accident.
 	var excludeRaw string
-	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&excludeRaw)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(exclude_scope,'') FROM targets WHERE id=?`, targetID).Scan(&excludeRaw); err != nil {
+		return err
+	}
 	other, mine, manual := splitManagedExclusions(excludeRaw, programID)
 	merged := append(manual, other...)
 	newDenyRules := programDenyRules(p)
 	merged = append(merged, newDenyRules...)
-	_, _ = s.db.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID)
+	if _, err := tx.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID); err != nil {
+		return err
+	}
 
 	// A deny rule can be added or withdrawn without any asset row. Record the
 	// rule itself as an approved upstream event so Changes shows the real edit.
@@ -777,9 +808,14 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 			}
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	if added+removed+modified+ruleAdded+ruleRemoved > 0 {
 		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified, %d rules added, %d rules withdrawn. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified, ruleAdded, ruleRemoved)
-		_, _ = s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium")
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -799,18 +835,13 @@ func programExclusionLine(programID, identifier string) string {
 // programs, rules owned by programID, and manual/legacy rules.
 func splitManagedExclusions(raw, programID string) (other, mine, manual []string) {
 	prefix := bountyExclusionMarker + programID + "|"
-	// Use the same delimiter set as ParseExclusions. A line can hold several
-	// rules separated by commas or spaces; splitting only on newlines made a
-	// sync of one program drop another program's rule on the same line.
-	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == ';'
-	}) {
+	// Managed rules are one per line and may contain spaces. Split on newlines
+	// first so a sync never breaks another program's rule into fragments.
+	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// Only a well-formed marker is managed. A manual rule that merely
-		// begins with the marker text stays untouched.
 		if strings.HasPrefix(line, bountyExclusionMarker) {
 			parts := strings.SplitN(line, "|", 2)
 			if len(parts) == 2 && parts[1] != "" {
@@ -822,7 +853,13 @@ func splitManagedExclusions(raw, programID string) (other, mine, manual []string
 				continue
 			}
 		}
-		manual = append(manual, line)
+		for _, token := range strings.FieldsFunc(line, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == ';'
+		}) {
+			if token = strings.TrimSpace(token); token != "" {
+				manual = append(manual, token)
+			}
+		}
 	}
 	return
 }
@@ -854,11 +891,18 @@ func (s *Service) createRuleEvent(ctx context.Context, targetID, programID, even
 	if err == nil && latest == eventType {
 		return false
 	}
+	eventID := uuid.New().String()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO bounty_scope_events
 		(id,target_id,program_id,event_type,identifier,old_json,new_json,status,detected_at,resolved_at)
 		VALUES(?,?,?,?,?,?,?,'approved',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-		uuid.New().String(), targetID, programID, eventType, identifier, oldJSON, newJSON)
-	return err == nil
+		eventID, targetID, programID, eventType, identifier, oldJSON, newJSON)
+	if err != nil {
+		return false
+	}
+	if s.onScopeEvent != nil {
+		s.onScopeEvent(ctx, targetID, programID, eventID, eventType, identifier)
+	}
+	return true
 }
 
 // scopeEventFingerprint identifies one specific scope state. "added" and
@@ -954,6 +998,13 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			if active != 1 || inScope != 1 || submit != 1 {
 				return fmt.Errorf("scope asset is no longer active and submission-eligible")
 			}
+			var watchOnly int
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(watch_only,0) FROM targets WHERE id=?`, targetID).Scan(&watchOnly); err != nil {
+				return err
+			}
+			if watchOnly == 1 && managedAssetKind(a) != "web" {
+				return fmt.Errorf("cannot approve network asset on a breadth watch project; switch to deep coverage first")
+			}
 			// Refuse to apply a proposal against a different upstream state. A
 			// later edit supersedes the pending row; approving the stale one
 			// must not silently land the new state under the old decision key.
@@ -966,9 +1017,16 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			// (source='watch:scope'): that row is the operator's landed scope
 			// and keeps its own source, asset_type and metadata. The WHERE on
 			// the conflict clause leaves the landed row untouched.
-			_, err = tx.ExecContext(ctx, `INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status,monitor_enabled,metadata,updated_at) VALUES(?,?,?,?,?,?, 'bounty:catalog',?,'approved',1,?,CURRENT_TIMESTAMP) ON CONFLICT(target_id,value) DO UPDATE SET value=excluded.value,kind=excluded.kind,asset_type=excluded.asset_type,source='bounty:catalog',source_id=excluded.source_id,approval_status='approved',monitor_enabled=1,metadata=excluded.metadata,updated_at=CURRENT_TIMESTAMP WHERE assets.source <> 'watch:scope'`, uuid.New().String(), targetID, a.Identifier, a.Identifier, managedAssetKind(a), a.AssetType, a.ID, string(metaJSON))
+			res, err := tx.ExecContext(ctx, `INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status,monitor_enabled,metadata,updated_at) VALUES(?,?,?,?,?,?, 'bounty:catalog',?,'approved',1,?,CURRENT_TIMESTAMP) ON CONFLICT(target_id,value) DO UPDATE SET value=excluded.value,kind=excluded.kind,asset_type=excluded.asset_type,source='bounty:catalog',source_id=excluded.source_id,approval_status='approved',monitor_enabled=1,metadata=excluded.metadata,updated_at=CURRENT_TIMESTAMP WHERE assets.source <> 'watch:scope'`, uuid.New().String(), targetID, a.Identifier, a.Identifier, managedAssetKind(a), a.AssetType, a.ID, string(metaJSON))
 			if err != nil {
 				return err
+			}
+			if affected, err := res.RowsAffected(); err != nil {
+				return err
+			} else if affected == 0 {
+				if _, err := tx.ExecContext(ctx, `UPDATE assets SET source_id=?, asset_type=CASE WHEN asset_type='subdomain' THEN ? ELSE asset_type END, approval_status='approved', updated_at=CURRENT_TIMESTAMP WHERE target_id=? AND value=? AND source='watch:scope'`, a.ID, managedAssetKind(a), targetID, a.Identifier); err != nil {
+					return err
+				}
 			}
 		case "removed":
 			_, err = tx.ExecContext(ctx, `UPDATE assets SET approval_status='suspended',monitor_enabled=0,updated_at=CURRENT_TIMESTAMP WHERE target_id=? AND source_id=?`, targetID, assetID)
@@ -993,6 +1051,14 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 	if err != nil {
 		return err
 	}
+	if decision == "approve" && eventType == "modified" {
+		var currentIdentifier string
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM assets WHERE target_id=? AND source_id=? AND source='bounty:catalog' LIMIT 1`, targetID, assetID).Scan(&currentIdentifier); err == nil && currentIdentifier != "" && currentIdentifier != identifier {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM assets WHERE target_id=? AND source='bounty:catalog' AND value=?`, targetID, identifier); err != nil {
+				return err
+			}
+		}
+	}
 	resolved := "rejected"
 	if decision == "approve" {
 		resolved = "approved"
@@ -1001,5 +1067,11 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.onScopeEvent != nil {
+		s.onScopeEvent(ctx, targetID, programID, eventID, eventType, identifier)
+	}
+	return nil
 }

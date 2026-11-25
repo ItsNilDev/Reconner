@@ -79,3 +79,37 @@ func assertReceives(t *testing.T, who string, ch chan []byte, want bool) {
 		}
 	}
 }
+
+func TestBroadcastToTargetAndOwnerRespectTenantBoundary(t *testing.T) {
+	h := NewHub()
+	go h.Run()
+	h.SetOwnerLookup(func(targetID string) (int64, bool) {
+		switch targetID {
+		case "t1":
+			return 1, true
+		case "t2":
+			return 2, true
+		default:
+			return 0, false
+		}
+	})
+	memberA := &Client{hub: h, send: make(chan []byte, 4), userID: 1, isAdmin: false}
+	memberB := &Client{hub: h, send: make(chan []byte, 4), userID: 2, isAdmin: false}
+	admin := &Client{hub: h, send: make(chan []byte, 4), userID: 99, isAdmin: true}
+	for _, c := range []*Client{memberA, memberB, admin} {
+		h.register <- c
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	h.BroadcastToTarget("t2", "target_created", map[string]any{"id": "t2", "target_id": "t2"})
+	time.Sleep(20 * time.Millisecond)
+	assertReceives(t, "member A", memberA.send, false)
+	assertReceives(t, "member B", memberB.send, true)
+	assertReceives(t, "admin", admin.send, true)
+
+	h.BroadcastToOwner(2, "target_deleted", map[string]any{"id": "t2", "target_id": "t2"})
+	time.Sleep(20 * time.Millisecond)
+	assertReceives(t, "member A after owner delete", memberA.send, false)
+	assertReceives(t, "member B after owner delete", memberB.send, true)
+	assertReceives(t, "admin after owner delete", admin.send, true)
+}

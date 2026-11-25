@@ -377,7 +377,7 @@ func (h *Handler) handlePromoteWatchScope(w http.ResponseWriter, r *http.Request
 		return
 	}
 	n, _ := res.RowsAffected()
-	h.hub.Broadcast("target_updated", map[string]string{"id": id})
+	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]any{"promoted": n})
 }
 

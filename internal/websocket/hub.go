@@ -42,6 +42,7 @@ type Client struct {
 type envelope struct {
 	data     []byte
 	targetID string
+	ownerID  int64
 }
 
 type Hub struct {
@@ -127,6 +128,9 @@ func (h *Hub) Run() {
 		case env := <-h.broadcast:
 			h.mu.RLock()
 			for client := range h.clients {
+				if env.ownerID != 0 && !client.isAdmin && client.userID != env.ownerID {
+					continue
+				}
 				if !h.canReceive(client, env.targetID) {
 					continue
 				}
@@ -186,6 +190,38 @@ func (h *Hub) Broadcast(msgType string, payload any) {
 
 	select {
 	case h.broadcast <- envelope{data: data, targetID: scoped.Payload.TargetID}:
+	default:
+		slog.Warn("WebSocket broadcast channel full, dropping message")
+	}
+}
+
+// BroadcastToTarget sends a message only to the connections allowed to see
+// targetID. The target is forced in the envelope even when the payload has no
+// target_id of its own.
+func (h *Hub) BroadcastToTarget(targetID, msgType string, payload any) {
+	data, err := json.Marshal(Message{Type: msgType, Payload: payload})
+	if err != nil {
+		slog.Error("Failed to marshal websocket message", "error", err)
+		return
+	}
+	select {
+	case h.broadcast <- envelope{data: data, targetID: targetID}:
+	default:
+		slog.Warn("WebSocket broadcast channel full, dropping message")
+	}
+}
+
+// BroadcastToOwner sends a message only to the given user (or an admin). It
+// is used after a target is deleted, when no target row remains for the owner
+// lookup to resolve.
+func (h *Hub) BroadcastToOwner(ownerID int64, msgType string, payload any) {
+	data, err := json.Marshal(Message{Type: msgType, Payload: payload})
+	if err != nil {
+		slog.Error("Failed to marshal websocket message", "error", err)
+		return
+	}
+	select {
+	case h.broadcast <- envelope{data: data, ownerID: ownerID}:
 	default:
 		slog.Warn("WebSocket broadcast channel full, dropping message")
 	}

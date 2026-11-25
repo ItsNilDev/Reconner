@@ -132,9 +132,13 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	if err != nil {
 		return nil, err
 	}
+	excl := exclusionsFromContext(ctx)
+	if !excl.Empty() && excl.Excludes(net.JoinHostPort(host, port)) {
+		return nil, fmt.Errorf("%w: %s", ErrDestinationBlocked, host)
+	}
 	// Literal-IP destination: validate directly (no DNS), then dial it.
 	if ip := net.ParseIP(host); ip != nil {
-		if isDisallowedDestIP(ip) {
+		if isDisallowedDestIP(ip) || (!excl.Empty() && excl.ExcludesWithIPs(host, []net.IP{ip})) {
 			return nil, fmt.Errorf("%w: %s", ErrDestinationBlocked, host)
 		}
 		return credentialBaseDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
