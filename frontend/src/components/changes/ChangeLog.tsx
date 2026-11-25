@@ -5,6 +5,7 @@ import type { ChangeEntry, Target, WatchRound } from '../../types'
 import { Badge, Button, CopyButton, Empty, SkeletonRows } from '../ui'
 import { cn, safeHref, timeAgo } from '../../lib/utils'
 import { ws } from '../../lib/websocket'
+import { notifyNotificationsChanged } from '../../lib/notifications'
 import {
   CHANGE_FILTERS, changeBadgeVariant, changeHosts, isDefaultFeedRow, isScopeEvent,
   scopeEventSummary, type ChangeFilter,
@@ -220,7 +221,7 @@ function SourceBadge({ source }: { source: string }) {
   const map: Record<string, { label: string; className: string }> = {
     watch: { label: 'Watch', className: 'border-accent/50 bg-accent/10 text-accent' },
     monitor: { label: 'Deep', className: 'border-border text-text-muted' },
-    scope: { label: 'Scope', className: 'border-severity-medium/40 bg-severity-medium/10 text-severity-medium' },
+    watch_scope: { label: 'Watch scope', className: 'border-severity-medium/40 bg-severity-medium/10 text-severity-medium' },
     bounty: { label: 'Bounty', className: 'border-severity-medium/40 bg-severity-medium/10 text-severity-medium' },
     notification: { label: 'Bell', className: 'border-severity-low/40 bg-severity-low/10 text-severity-low' },
   }
@@ -237,9 +238,10 @@ interface Props {
   compact?: boolean
   initialEventId?: string
   initialQuery?: string
+  onClearEventId?: () => void
 }
 
-export default function ChangeLog({ targetId, compact, initialEventId, initialQuery = '' }: Props) {
+export default function ChangeLog({ targetId, compact, initialEventId, initialQuery = '', onClearEventId }: Props) {
   const [hours, setHours] = useState('0')
   const [customSince, setCustomSince] = useState('')
   const [categories, setCategories] = useState<Set<ChangeFilter>>(() => new Set<ChangeFilter>(['all']))
@@ -254,6 +256,8 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedTaskId, setSelectedTaskId] = useState('')
   const [hideSeen, setHideSeen] = useState(false)
+  const [viewMode, setViewMode] = useState<'signals' | 'all'>('signals')
+  const [activeEventId, setActiveEventId] = useState(initialEventId || '')
   const [rows, setRows] = useState<ChangeEntry[]>([])
   const [rounds, setRounds] = useState<WatchRound[]>([])
   const [targetList, setTargetList] = useState<Target[]>([])
@@ -264,6 +268,9 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   const [programNames, setProgramNames] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<ChangeCard | null>(null)
   const handledEventRef = useRef('')
+
+  useEffect(() => { setQ(initialQuery) }, [initialQuery])
+  useEffect(() => { setActiveEventId(initialEventId || '') }, [initialEventId])
   const [diffView, setDiffView] = useState<DiffView | null>(null)
 
   const requestSeq = useRef(0)
@@ -272,7 +279,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   // Coalescing state. A refresh triggered while one is running is collapsed
   // into a single follow-up, so overlapping WS events cannot stack queries.
   const inFlight = useRef(false)
-  const pending = useRef(false)
+  const pendingMode = useRef<LoadMode | null>(null)
   const hasLoaded = useRef(false)
   const loadRef = useRef<((mode?: LoadMode) => Promise<void>) | null>(null)
 
@@ -289,10 +296,10 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   // buildParams, so reads and Mark all read agree even inside the debounce
   // window (A11, review findings #2 and #6).
   const isDefaultView = useCallback((searchText: string, codesText: string) =>
-    categories.has('all') && !source && !severity && !selectedTaskId && !initialEventId &&
+    viewMode === 'signals' && categories.has('all') && !source && !severity && !selectedTaskId && !activeEventId &&
     !searchText.trim() && !statusOnly && statusClasses.size === 0 &&
     parseStatusCodes(codesText).length === 0,
-    [categories, source, severity, selectedTaskId, statusOnly, statusClasses, initialEventId])
+    [viewMode, categories, source, severity, selectedTaskId, statusOnly, statusClasses, activeEventId])
 
   const defaultView = isDefaultView(debouncedQ, debouncedCodes)
 
@@ -302,6 +309,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   const buildParams = useCallback((searchText: string, codesText: string): Record<string, string> => {
     const p: Record<string, string> = {}
     if (isDefaultView(searchText, codesText)) p.default_view = '1'
+    if (hideSeen) p.hide_seen = '1'
     const since = sinceFor(hours, customSince)
     if (since) p.since = since
     const cats = [...categories].filter(c => c !== 'all')
@@ -314,11 +322,11 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     if (source) p.source = source
     if (severity) p.severity = severity
     if (selectedTaskId) p.task_id = selectedTaskId
-    if (initialEventId) p.event_id = initialEventId
+    if (activeEventId) p.event_id = activeEventId
     const t = targetId || selectedTargetId
     if (t) p.target_id = t
     return p
-  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, initialEventId, isDefaultView])
+  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, activeEventId, hideSeen, isDefaultView])
 
   const params = useCallback((): Record<string, string> => buildParams(debouncedQ, debouncedCodes),
     [buildParams, debouncedQ, debouncedCodes])
@@ -333,7 +341,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
 
   const load = useCallback(async (mode: LoadMode = 'refresh') => {
     if (inFlight.current) {
-      pending.current = true
+      if (mode === 'initial' || pendingMode.current === null) pendingMode.current = mode
       return
     }
     inFlight.current = true
@@ -352,10 +360,18 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     try {
       const [changeRows, roundRows] = await Promise.all([
         targetId
-          ? changes.forTargetPage(targetId, { ...p, page: '1', limit: String(PAGE) }).then(page => {
+          ? Promise.all(
+            Array.from({ length: pageCount.current }, (_, i) =>
+              changes.forTargetPage(targetId, { ...p, page: String(i + 1), limit: String(PAGE) })),
+          ).then(pages => {
+            const merged: ChangeEntry[] = []
+            const ids = new Set<string>()
+            for (const page of pages) {
               fetchedTotal = page.total
-              return page.data
-            })
+              for (const row of page.data) if (!ids.has(row.id)) { ids.add(row.id); merged.push(row) }
+            }
+            return merged
+          })
           : Promise.all(
             Array.from({ length: pageCount.current }, (_, i) =>
               changes.listPage({ ...p, page: String(i + 1), limit: String(PAGE) })),
@@ -385,10 +401,9 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       hasLoaded.current = true
       setLoading(false)
       setRefreshing(false)
-      if (pending.current) {
-        pending.current = false
-        void loadRef.current?.('refresh')
-      }
+      const next = pendingMode.current
+      pendingMode.current = null
+      if (next) void loadRef.current?.(next)
     }
   }, [params, targetId, selectedTargetId])
   loadRef.current = load
@@ -396,7 +411,11 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   useEffect(() => { void load('initial') }, [load])
 
   useEffect(() => {
-    const schedule = () => {
+    const schedule = (payload?: unknown) => {
+      if (targetId) {
+        const p = payload as { target_id?: string } | undefined
+        if (p?.target_id && p.target_id !== targetId) return
+      }
       if (reloadTimer.current) clearTimeout(reloadTimer.current)
       reloadTimer.current = setTimeout(() => { void load('refresh') }, 2500)
     }
@@ -414,12 +433,12 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   }, [load])
 
   useEffect(() => {
-    if (!initialEventId || handledEventRef.current === initialEventId) return
-    const found = rows.find(r => r.id === initialEventId)
+    if (!activeEventId || handledEventRef.current === activeEventId) return
+    const found = rows.find(r => r.id === activeEventId)
     if (!found) return
-    handledEventRef.current = initialEventId
+    handledEventRef.current = activeEventId
     setDetail(groupIntoCards([found])[0] || null)
-  }, [initialEventId, rows])
+  }, [activeEventId, rows])
 
   const loadMore = async () => {
     const next = pageCount.current + 1
@@ -480,6 +499,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     try {
       await changes.setSeen(ids, seen)
       applySeen(ids, seen)
+      notifyNotificationsChanged()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update read state')
     }
@@ -491,6 +511,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       // marks only the rows the user currently sees.
       const res = await changes.markAllSeen(buildParams(q, statusCodes))
       if (res.updated > 0) await load('refresh')
+      notifyNotificationsChanged()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to mark all read')
     }
@@ -499,13 +520,32 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   // Keep the client guard as a safety net; the server now applies the same
   // filter before pagination.
   const visibleRows = useMemo(() => {
-    const base = hideSeen ? rows.filter(r => !r.seen) : rows
+    const base = rows
     return defaultView ? base.filter(isDefaultFeedRow) : base
   }, [rows, hideSeen, defaultView])
   const cards = useMemo(() => groupIntoCards(visibleRows), [visibleRows])
 
   return (
     <div className={cn('space-y-3', compact && 'space-y-2')}>
+      {activeEventId && (
+        <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-xs text-text-primary">
+          Showing focused event
+          <button type="button" className="text-accent hover:underline" onClick={() => {
+            setActiveEventId('')
+            setDetail(null)
+            onClearEventId?.()
+          }}>Show all changes</button>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button type="button" onClick={() => setViewMode('signals')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'signals' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>Daily signals</button>
+        <button type="button" onClick={() => setViewMode('all')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'all' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>All history</button>
+        <span className="mx-1 text-[10px] text-text-muted">Quick filters</span>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['assets'])); setQ(''); setStatusOnly(false) }}>New hosts</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['http'])); setStatusOnly(true) }}>Status flips</button>
+        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted" onClick={() => { setViewMode('all'); setCategories(new Set<ChangeFilter>(['assets'])); setStatusOnly(false) }}>Scope changes</button>
+      </div>
+
       {/* Time filter */}
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">Since</span>
@@ -604,7 +644,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         />
         <select className="input w-auto py-1 text-xs" value={source} onChange={e => setSource(e.target.value)}>
           <option value="">All sources</option>
-          {['monitor', 'watch', 'bounty', 'notification'].map(s => <option key={s} value={s}>{s}</option>)}
+          {([['monitor','Deep monitor'],['watch','Watch round'],['watch_scope','Watch scope'],['bounty','Program scope'],['notification','Bell']] as const).map(([v,label]) => <option key={v} value={v}>{label}</option>)}
         </select>
         <select className="input w-auto py-1 text-xs" value={severity} onChange={e => setSeverity(e.target.value)}>
           <option value="">All severities</option>
@@ -686,8 +726,8 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         ) : (
           cards.map(card => {
             const first = card.items[0]
-            const canDiff = first.source === 'monitor' &&
-              (first.change_type === 'css_change' || first.change_type === 'js_change') && !!first.url
+            const diffItem = card.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
+            const canDiff = !!diffItem
             const href = safeHref(card.url)
             return (
               <div
@@ -733,15 +773,20 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                       return <ScopeEventView key={`${item.id}-${i}`} item={item} variant="card" programName={item.program_id ? programNames[item.program_id] : undefined} />
                     }
                     const hosts = changeHosts(item)
-                    const singleHost = hosts?.length === 1 ? hosts[0] : null
                     return (
                       <div key={`${item.id}-${i}`} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
                         <span className="w-32 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
                           {fieldLabel(item.change_type)}
                         </span>
-                        {singleHost ? (
-                          <span className="max-w-[420px] break-all font-mono text-xs text-text-primary" title={singleHost}>
-                            {singleHost}
+                        {hosts && hosts.length > 0 ? (
+                          <span className="flex flex-wrap items-center gap-1">
+                            {hosts.slice(0, 5).map(host => (
+                              <span key={host} className="rounded border border-border px-1 font-mono text-[10px] text-text-primary">{host}</span>
+                            ))}
+                            {hosts.length > 5 && <span className="text-[10px] text-text-muted">+{hosts.length - 5} more</span>}
+                            <CopyButton text={hosts.join('\n')} />
+                            {typeof item.metadata?.status === 'number' && <Badge variant="info">HTTP {item.metadata.status}</Badge>}
+                            {item.metadata?.in_scope === true && <Badge variant="low">in scope</Badge>}
                           </span>
                         ) : (
                           <InlineChangeDiff oldValue={item.old_value} newValue={item.new_value} changeType={item.change_type} oldStatus={item.old_status} newStatus={item.new_status} />
@@ -799,7 +844,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
               <div className="min-w-0">
                 <h3 className="text-sm font-semibold">
                   {detail.items[0] && isScopeEvent(detail.items[0])
-                    ? scopeEventSummary(detail.items[0])
+                    ? scopeEventSummary(detail.items[0], programNames[detail.items[0]?.program_id || ''])
                     : fieldLabel(detail.items[0]?.change_type || '')}
                 </h3>
                 <p className="mt-1 break-all text-xs text-text-muted">{detail.url || detail.target_name}</p>

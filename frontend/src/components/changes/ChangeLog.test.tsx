@@ -17,8 +17,8 @@ const watchHost: ChangeEntry = {
 }
 
 const alertRow: ChangeEntry = {
-  id: 'b1', source: 'notification', target_id: 't1', target_name: 'alpha.test',
-  task_id: '', url: 'https://alpha.test/alert', change_type: 'watch_failed',
+  id: 'b1', source: 'monitor', target_id: 't1', target_name: 'alpha.test',
+  task_id: '', url: 'https://alpha.test/alert', change_type: 'status_change', old_status: 403, new_status: 200,
   category: 'alerts', severity: 'medium', seen: false,
   old_value: '', new_value: 'Watch round failed',
   detected_at: '2026-01-03 10:00:00',
@@ -147,7 +147,7 @@ describe('ChangeLog loading and refresh', () => {
     first.resolve(envelope([watchHost]))
     // The follow-up refresh runs once the first load finishes.
     await vi.waitFor(() => expect(changesCount(fetchMock)).toBe(2))
-    await vi.waitFor(() => expect(screen.getByText('WATCH FAILED')).toBeInTheDocument())
+    await vi.waitFor(() => expect(screen.getByText('STATUS CODE')).toBeInTheDocument())
     await vi.waitFor(() => {
       expect(document.querySelectorAll('.skeleton').length).toBe(0)
     })

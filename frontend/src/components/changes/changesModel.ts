@@ -34,6 +34,7 @@ export const CATEGORY_BY_TYPE: Record<string, ChangeCategory> = {
   scope_modified: 'assets',
   scope_removed: 'assets',
   scope_rejected: 'assets',
+  out_of_scope: 'assets',
   watch_failed: 'alerts',
   watch_kind_conflict: 'alerts',
   monitor_failed: 'alerts',
@@ -57,19 +58,26 @@ export const BOUNTY_SCOPE_TYPES = [
   'scope_rule_added', 'scope_rule_removed', 'scope_re_eligible',
 ] as const
 
-const notificationTypes: ReadonlySet<string> = new Set(NOTIFICATION_ALLOWED_TYPES)
 
 // isDefaultFeedRow keeps the default view free of routine monitor noise even
 // when the server sends a wider feed. Category chips opt out of this filter so
 // an operator can still inspect deep changes explicitly.
-export function isDefaultFeedRow(row: { source?: string; change_type?: string }): boolean {
+export function isDefaultFeedRow(row: {
+  source?: string; change_type?: string; old_status?: number; new_status?: number; old_value?: string; new_value?: string
+}): boolean {
   const type = row.change_type || ''
-  // An actual HTTP status transition is a daily signal. Routine monitor diffs
-  // stay out of the default view (A8).
-  if (row.source === 'monitor') return type === 'http_change' || type === 'status_change'
-  if (row.source === 'watch') return type === 'new_subdomain'
+  if (row.source === 'watch' && type === 'new_subdomain') return true
+  if (row.source === 'watch' || row.source === 'monitor') {
+    if (type === 'status_change' || type === 'http_change' || type === 'page_change') {
+      const parsed = parseStatusTransition(row.old_value || '', row.new_value || '')
+      const oldCode = row.old_status || parsed.oldCode || 0
+      const newCode = row.new_status || parsed.newCode || 0
+      return oldCode >= 100 && oldCode <= 599 && newCode >= 100 && newCode <= 599 && oldCode !== newCode
+    }
+    return false
+  }
   if (row.source === 'watch_scope' || row.source === 'bounty') return isScopeEvent(row)
-  if (row.source === 'notification') return notificationTypes.has(type)
+  if (row.source === 'notification') return type === 'new_host'
   return false
 }
 
@@ -228,6 +236,7 @@ const SCOPE_VERBS: Record<string, string> = {
   scope_re_eligible: 'Host re-eligible.',
   scope_rule_added: 'Rule added.',
   scope_rule_removed: 'Rule withdrawn.',
+  out_of_scope: 'Removed from eligible scope.',
 }
 
 function scopeDisplayValue(value: unknown): string {
@@ -280,13 +289,23 @@ export function scopeIdentifier(item: { url?: string; program_asset_id?: string;
 
 // scopeEventSummary builds "api.example.test · Example Program · Host landed."
 export function scopeEventSummary(
-  item: { change_type?: string; url?: string; program_id?: string; program_asset_id?: string; old_value?: string; new_value?: string },
+  item: { change_type?: string; url?: string; program_id?: string; program_asset_id?: string; old_value?: string; new_value?: string; source?: string; scope_status?: string },
   programName?: string,
 ): string {
   const identifier = scopeIdentifier(item)
   const program = (programName || item.program_id || '').trim()
   const type = item.change_type || ''
-  const verb = SCOPE_VERBS[type] || `${type.replace(/_/g, ' ')}.`
+  let verb = SCOPE_VERBS[type] || `${type.replace(/_/g, ' ')}.`
+  if (type === 'scope_landed') {
+    if (item.source === 'bounty') {
+      if (item.scope_status === 'pending') verb = 'Scope proposed.'
+      else if (item.scope_status === 'superseded') verb = 'Proposal superseded.'
+      else if (item.scope_status === 'rejected') verb = 'Proposal dismissed.'
+      else verb = 'Scope added.'
+    } else if (item.source === 'watch_scope') {
+      verb = 'Host landed.'
+    }
+  }
   return [identifier, program, verb].filter(Boolean).join(' · ')
 }
 

@@ -464,7 +464,7 @@ function ReportMenu({ targetId }: { targetId: string }) {
 export default function TargetDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   // A bell notification deep-links with ?tab=monitor&q=<host>. Honor it so the
   // operator lands on the Changes tab with the host already filtered (B4).
   const initialTab = useMemo(() => {
@@ -1476,7 +1476,7 @@ export default function TargetDetail() {
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
         {tab === 'monitor'
-          ? <div className="p-3"><ChangeLog targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} /></div>
+          ? <div className="p-3"><ChangeLog key={id} targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} onClearEventId={() => setSearchParams((prev: URLSearchParams) => { const next = new URLSearchParams(prev); next.delete('event'); return next })} /></div>
           : dataError && !tabLoading
           ? <div className="p-4 text-sm text-severity-high" role="alert">{dataError}</div>
           : tabLoading

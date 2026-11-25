@@ -10,6 +10,7 @@ import {
   monitorRowKind,
   NOTIFICATION_ALLOWED_TYPES,
   parseStatusTransition,
+  scopeEventSummary,
 } from './changesModel'
 import type { MonitoringChange } from '../../types'
 
@@ -66,7 +67,7 @@ describe('isDefaultFeedRow', () => {
 
   it('keeps only allow-listed alert notifications', () => {
     for (const type of NOTIFICATION_ALLOWED_TYPES) {
-      expect(isDefaultFeedRow({ source: 'notification', change_type: type })).toBe(true)
+      expect(isDefaultFeedRow({ source: 'notification', change_type: type })).toBe(type === 'new_host')
     }
     expect(isDefaultFeedRow({ source: 'notification', change_type: 'finding' })).toBe(false)
     expect(isDefaultFeedRow({ source: 'notification', change_type: 'scan_deep' })).toBe(false)
@@ -74,10 +75,10 @@ describe('isDefaultFeedRow', () => {
 
   it('drops routine monitor and watch noise', () => {
     // An actual status transition is a daily signal and stays visible.
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change' })).toBe(true)
-    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'http_change' })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change', old_status: 403, new_status: 200 })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'http_change', old_status: 403, new_status: 200 })).toBe(true)
     expect(isDefaultFeedRow({ source: 'monitor', change_type: 'tech_change' })).toBe(false)
-    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change', old_status: 403, new_status: 200 })).toBe(true)
     expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain_extra' })).toBe(false)
     expect(isDefaultFeedRow({ change_type: 'new_subdomain' })).toBe(false)
   })
@@ -194,5 +195,24 @@ describe('scope event recognition', () => {
     expect(isScopeEvent({ change_type: 'scope_re_eligible' })).toBe(true)
     expect(isScopeEvent({ change_type: 'out_of_scope' })).toBe(true)
     expect(isDefaultFeedRow({ source: 'watch_scope', change_type: 'scope_re_eligible' })).toBe(true)
+  })
+})
+
+describe('Phase 5 default feed contract', () => {
+  it('admits watch new hosts and real status changes only', () => {
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'new_subdomain' })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'status_change', old_status: 200, new_status: 403 })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'watch', change_type: 'tech_change' })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'monitor', change_type: 'status_change', old_status: 200, new_status: 200 })).toBe(false)
+    expect(isDefaultFeedRow({ source: 'notification', change_type: 'new_host' })).toBe(true)
+    expect(isDefaultFeedRow({ source: 'notification', change_type: 'watch_failed' })).toBe(false)
+  })
+
+  it('uses review-state aware scope verbs', () => {
+    const base = { change_type: 'scope_landed', url: 'api.example.test' }
+    expect(scopeEventSummary({ ...base, source: 'bounty', scope_status: 'pending', program_id: 'p1' })).toContain('Scope proposed.')
+    expect(scopeEventSummary({ ...base, source: 'bounty', scope_status: 'superseded', program_id: 'p1' })).toContain('Proposal superseded.')
+    expect(scopeEventSummary({ ...base, source: 'watch_scope', program_id: 'p1' })).toContain('Host landed.')
+    expect(scopeEventSummary({ change_type: 'out_of_scope', url: 'api.example.test' })).toContain('Removed from eligible scope.')
   })
 })

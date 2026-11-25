@@ -7,8 +7,8 @@ import type { ChangeEntry, WatchRound } from '../types'
 
 const changeRows: ChangeEntry[] = [
   {
-    id: 'c1', source: 'watch', target_id: 't1', target_name: 'alpha.test',
-    task_id: 'round-1', url: 'alpha.test', change_type: 'new_subdomain',
+    id: 'c1', source: 'notification', target_id: 't1', target_name: 'alpha.test',
+    task_id: 'round-1', url: 'alpha.test', change_type: 'new_host',
     category: 'assets', severity: 'info', seen: false,
     old_value: '', new_value: '1 new subdomain(s) found on alpha.test',
     metadata: { hosts: ['new.alpha.test'], total: 1 },
@@ -24,14 +24,14 @@ const changeRows: ChangeEntry[] = [
     detected_at: '2026-01-01 09:00:00',
   },
   {
-    id: 'c3', source: 'notification', target_id: 't1', target_name: 'alpha.test',
-    task_id: '', url: '', change_type: 'watch_failed',
+    id: 'c3', source: 'monitor', target_id: 't1', target_name: 'alpha.test',
+    task_id: '', url: '', change_type: 'status_change', old_status: 403, new_status: 200,
     category: 'alerts', severity: 'high', seen: false,
     old_value: '', new_value: 'Watch round failed',
     detected_at: '2026-01-01 08:00:00',
   },
-  // Kept in the fixture so explicit category chips still exercise the wider
-  // history; both rows are hidden from the default real-events view.
+  // A real watch status flip: explicit status codes make it a default signal.
+  // It also keeps the HTTP category chip meaningful.
   {
     id: 'c4', source: 'watch', target_id: 't1', target_name: 'alpha.test',
     task_id: 'round-1', url: 'https://alpha.test', change_type: 'status_change',
@@ -93,8 +93,9 @@ function mockApi(opts?: { changes?: ChangeEntry[]; rounds?: WatchRound[] }) {
       const u = new URL(url, 'http://localhost')
       const cat = u.searchParams.get('category')
       const cats = cat ? cat.split(',').filter(c => c && c !== 'all') : []
+      const hideSeen = u.searchParams.get('hide_seen') === '1'
       const filtered = cats.length ? rows.filter(r => cats.includes(r.category)) : rows
-      return envelope(filtered)
+      return envelope(hideSeen ? filtered.filter(r => !r.seen) : filtered)
     }
     if (url.startsWith('/api/watch/rounds?')) return envelope(roundRows)
     if (url.startsWith('/api/targets?')) return success(targetList)
@@ -114,12 +115,12 @@ describe('global Changes page', () => {
     await screen.findByRole('heading', { name: 'Changes' })
     expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
     expect(screen.getByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument()
-    expect(screen.getByText('WATCH FAILED')).toBeInTheDocument()
+    expect(screen.getAllByText('STATUS CODE').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Watch').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Bounty').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Bell').length).toBeGreaterThan(0)
     expect(screen.getByText('In scope:')).toBeInTheDocument()
-    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('hash=aaa')
     expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument()
   })
 
