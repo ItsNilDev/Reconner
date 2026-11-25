@@ -261,3 +261,136 @@ func TestStoreBasicServiceResolvesBareLowercaseSubdomain(t *testing.T) {
 		t.Fatalf("subdomain_id=%q, want %q", gotSubID, subID)
 	}
 }
+
+func TestMonitorHashOnlyJSAndCSSChangesDoNotAlertBellOrTelegram(t *testing.T) {
+	db := newMonitorTestDB(t)
+	targetID := uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO targets(id,domain) VALUES(?,?)`, targetID, "app.example.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	type broadcastEvent struct {
+		eventType string
+		payload   map[string]any
+	}
+	var events []broadcastEvent
+	s := &MonitorScanner{
+		db: db,
+		broadcast: func(eventType string, payload any) {
+			m, _ := payload.(map[string]any)
+			events = append(events, broadcastEvent{eventType: eventType, payload: m})
+		},
+	}
+
+	// Non-alertable changes: hash-only JS/CSS changes and stylesheet attribute churn.
+	if err := s.recordChange(targetID, "https://app.example.test/static/app.js", "js_change",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "medium"); err != nil {
+		t.Fatalf("recordChange js_change: %v", err)
+	}
+	if err := s.recordChange(targetID, "https://app.example.test/static/site.css", "css_change",
+		"11111111111111111111111111111111", "22222222222222222222222222222222", "low"); err != nil {
+		t.Fatalf("recordChange css_change: %v", err)
+	}
+	if err := s.recordChange(targetID, "https://app.example.test/", "security:stylesheet_added",
+		"", "https://cdn.example.test/site.css", "low"); err != nil {
+		t.Fatalf("recordChange security:stylesheet_added: %v", err)
+	}
+
+	var changeCount, notifCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=?`, targetID).Scan(&changeCount); err != nil {
+		t.Fatal(err)
+	}
+	if changeCount != 3 {
+		t.Fatalf("monitoring_changes count=%d, want 3", changeCount)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE target_id=?`, targetID).Scan(&notifCount); err != nil {
+		t.Fatal(err)
+	}
+	if notifCount != 0 {
+		t.Fatalf("notifications count=%d after JS/CSS/stylesheet changes, want 0", notifCount)
+	}
+
+	changesWritten := 0
+	notifBroadcasts := 0
+	for _, ev := range events {
+		switch ev.eventType {
+		case "changes_written":
+			changesWritten++
+		case "notification_created":
+			notifBroadcasts++
+		}
+	}
+	if changesWritten != 3 {
+		t.Fatalf("changes_written broadcasts=%d, want 3", changesWritten)
+	}
+	if notifBroadcasts != 0 {
+		t.Fatalf("notification_created broadcasts=%d after JS/CSS/stylesheet changes, want 0", notifBroadcasts)
+	}
+
+	// Actionable security & header regressions MUST alert both Bell and Telegram broadcast.
+	if err := s.recordChange(targetID, "https://app.example.test/", "security:script_added",
+		"", "https://evil.example.net/hook.js", "high"); err != nil {
+		t.Fatalf("recordChange security:script_added: %v", err)
+	}
+	if err := s.recordChange(targetID, "https://app.example.test/", "security_header_removed",
+		"Content-Security-Policy", "", "high"); err != nil {
+		t.Fatalf("recordChange security_header_removed: %v", err)
+	}
+
+	if err := db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=?`, targetID).Scan(&changeCount); err != nil {
+		t.Fatal(err)
+	}
+	if changeCount != 5 {
+		t.Fatalf("monitoring_changes count=%d, want 5", changeCount)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE target_id=?`, targetID).Scan(&notifCount); err != nil {
+		t.Fatal(err)
+	}
+	if notifCount != 2 {
+		t.Fatalf("notifications count=%d after actionable security changes, want 2", notifCount)
+	}
+
+	var alertedTypes []string
+	changesWritten = 0
+	for _, ev := range events {
+		switch ev.eventType {
+		case "changes_written":
+			changesWritten++
+		case "notification_created":
+			if typ, ok := ev.payload["type"].(string); ok {
+				alertedTypes = append(alertedTypes, typ)
+			}
+		}
+	}
+	if changesWritten != 5 {
+		t.Fatalf("changes_written broadcasts=%d, want 5", changesWritten)
+	}
+	if len(alertedTypes) != 2 || alertedTypes[0] != "security:script_added" || alertedTypes[1] != "security_header_removed" {
+		t.Fatalf("notification_created types=%v, want [security:script_added security_header_removed]", alertedTypes)
+	}
+
+	// Verify insertChangeTx directly for HTTP status transitions vs hash-only js_change.
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	jsRec, err := insertChangeTx(ctx, tx, targetID, "https://app.example.test/bundle.js", "js_change", "deadbeef", "cafebabe", "medium")
+	if err != nil {
+		t.Fatalf("insertChangeTx js_change: %v", err)
+	}
+	if jsRec.alertable {
+		t.Fatal("insertChangeTx marked hash-only js_change alertable, want false")
+	}
+	statusRec, err := insertChangeTx(ctx, tx, targetID, "https://app.example.test/admin", "http_change", "status=403 title=Forbidden", "status=200 title=Admin", "medium")
+	if err != nil {
+		t.Fatalf("insertChangeTx http_change: %v", err)
+	}
+	if !statusRec.alertable {
+		t.Fatal("insertChangeTx marked 403->200 http_change non-alertable, want true")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}

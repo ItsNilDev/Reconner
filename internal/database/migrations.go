@@ -213,6 +213,11 @@ func RunMigrations(db *DB) error {
 		createHTTPObservationBaselinesTable,
 		createTargetExclusionsTable,
 		createTargetExclusionsTargetIndex,
+		// Telegram outbox coalescing columns & batch lookup index.
+		alterTelegramOutboxAddBatchKey,
+		alterTelegramOutboxAddTargetID,
+		alterTelegramOutboxAddItemJSON,
+		createTelegramOutboxBatchIndex,
 	}
 
 	for i, m := range migrations {
@@ -2309,6 +2314,11 @@ CREATE TABLE IF NOT EXISTS target_exclusions (
 
 const createTargetExclusionsTargetIndex = `
 CREATE INDEX IF NOT EXISTS idx_target_exclusions_target ON target_exclusions(target_id);`
+
+const alterTelegramOutboxAddBatchKey = `ALTER TABLE telegram_outbox ADD COLUMN batch_key TEXT NOT NULL DEFAULT '';`
+const alterTelegramOutboxAddTargetID = `ALTER TABLE telegram_outbox ADD COLUMN target_id TEXT NOT NULL DEFAULT '';`
+const alterTelegramOutboxAddItemJSON = `ALTER TABLE telegram_outbox ADD COLUMN item_json TEXT NOT NULL DEFAULT '';`
+const createTelegramOutboxBatchIndex = `CREATE INDEX IF NOT EXISTS idx_telegram_outbox_batch ON telegram_outbox(status, chat_entry_id, batch_key, next_attempt_at);`
 
 // migrateTargetExclusions performs a one-time backfill from legacy
 // targets.exclude_scope text into typed target_exclusions rows, then clears

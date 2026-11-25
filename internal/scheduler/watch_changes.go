@@ -332,8 +332,8 @@ func (s *Scheduler) emitWatchNewHosts(ctx context.Context, taskID, targetID stri
 	}
 	if len(notifyHosts) > 0 {
 		var domain string
-		if err := s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil {
-			s.logger.Warn("watch new-host: target domain lookup failed", "target_id", targetID, "error", err)
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil {
+			s.logger.Warn("watch new-host: target display lookup failed", "target_id", targetID, "error", err)
 		}
 		summary := fmt.Sprintf("%d new host(s) up on %s", len(notifyHosts), domain)
 		previewHosts := notifyHosts

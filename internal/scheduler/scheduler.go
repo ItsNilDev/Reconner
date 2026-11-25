@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -417,7 +418,11 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		oldStatus, _ := m["old_status"].(int)
 		newStatus, _ := m["new_status"].(int)
 		var domain, title string
-		_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+		if err := s.db.QueryRow(`SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			if s.logger != nil {
+				s.logger.Warn("notification target display lookup failed", "target_id", targetID, "error", err)
+			}
+		}
 		if changeID != "" {
 			_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,'') FROM notifications WHERE change_id=? ORDER BY created_at DESC LIMIT 1`, changeID).Scan(&title, &rawURL)
 		} else {
@@ -442,11 +447,10 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 					}
 				}
 			}
-			preview := hosts
-			if len(preview) > 20 {
-				preview = preview[:20]
-			}
-			s.notifier.NotifyNewHosts("newhost:"+changeID, newVal, preview, targetID)
+			s.notifier.NotifyNewHosts("newhost:"+changeID, newVal, hosts, targetID)
+			return
+		}
+		if changeType == "js_change" || changeType == "css_change" || strings.HasPrefix(changeType, "security:stylesheet") {
 			return
 		}
 		// Only a real status transition belongs on the HTTP status channel.
@@ -454,8 +458,8 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		// produce a "status change" alert with two identical codes.
 		statusTransition := oldStatus > 0 && newStatus > 0 && oldStatus != newStatus
 		if statusTransition {
-			oldVal = fmt.Sprintf("HTTP %d", oldStatus)
-			newVal = fmt.Sprintf("HTTP %d", newStatus)
+			oldVal = strconv.Itoa(oldStatus)
+			newVal = strconv.Itoa(newStatus)
 		}
 		if statusTransition && (changeType == "http_change" || changeType == "status_change" || changeType == "page_change") {
 			s.notifier.NotifyHTTPStatus(targetID, domain, changeType, title, rawURL, oldVal, newVal, changeID)
@@ -492,7 +496,11 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 	if err != nil {
 		return
 	}
-	_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+	if err := s.db.QueryRow(`SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if s.logger != nil {
+			s.logger.Warn("finding target display lookup failed", "target_id", targetID, "error", err)
+		}
+	}
 	// A verified finding gets a durable bell row as well as a Telegram alert.
 	// The bell had no subscription to finding events, so without this row the
 	// Findings bucket stayed empty for live detections (B2). Key the row on the
@@ -1870,9 +1878,13 @@ func shouldWriteWatchDiff(taskType string, skipped, timedOut bool, phaseErr, mod
 func (s *Scheduler) finalizeBlockedTask(taskID, targetID, reason, finalStatus string) {
 	var taskType, domain string
 	var started sql.NullTime
-	_ = s.db.QueryRow(`SELECT COALESCE(type,''), started_at,
-		(SELECT domain FROM targets WHERE id=?) FROM tasks WHERE id=?`, targetID, taskID).
-		Scan(&taskType, &started, &domain)
+	if err := s.db.QueryRow(`SELECT COALESCE(type,''), started_at,
+		COALESCE((SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?), '') FROM tasks WHERE id=?`, targetID, taskID).
+		Scan(&taskType, &started, &domain); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if s.logger != nil {
+			s.logger.Warn("blocked task target display lookup failed", "task_id", taskID, "target_id", targetID, "error", err)
+		}
+	}
 	startedAt := started.Time
 	if startedAt.IsZero() {
 		startedAt = time.Now()
@@ -1961,9 +1973,21 @@ func (s *Scheduler) validateScopeOverrideE(ctx context.Context, targetID, scopeO
 	return nil
 }
 
+type targetDisplayInfo struct {
+	Name   string
+	Domain string
+}
+
+func targetDisplayOrDomain(t targetDisplayInfo) string {
+	if name := strings.TrimSpace(t.Name); name != "" {
+		return name
+	}
+	return t.Domain
+}
+
 func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	var targetID, modulesJSON, taskStatus, kind, taskType, scopeOverride string
-	var target struct{ Domain string }
+	var target targetDisplayInfo
 	var knownSubdomains int
 	// surface carries the per-phase adaptive-watchdog signals (subdomains, live
 	// URLs, discovered parameters); refreshed from the live tables before each
@@ -1973,10 +1997,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	var surface scanSurface
 
 	err := s.db.QueryRow(`
-		SELECT t.target_id, t.modules, t.status, COALESCE(t.type,''), COALESCE(t.scope_override,''), tgt.domain, COALESCE(tgt.kind,'web'), COALESCE(tgt.subdomain_count,0)
+		SELECT t.target_id, t.modules, t.status, COALESCE(t.type,''), COALESCE(t.scope_override,''), COALESCE(tgt.name,''), tgt.domain, COALESCE(tgt.kind,'web'), COALESCE(tgt.subdomain_count,0)
 		FROM tasks t JOIN targets tgt ON tgt.id = t.target_id
 		WHERE t.id = ?
-	`, taskID).Scan(&targetID, &modulesJSON, &taskStatus, &taskType, &scopeOverride, &target.Domain, &kind, &knownSubdomains)
+	`, taskID).Scan(&targetID, &modulesJSON, &taskStatus, &taskType, &scopeOverride, &target.Name, &target.Domain, &kind, &knownSubdomains)
 	if err != nil {
 		// No row → the target (and its tasks) was deleted; nothing to run.
 		s.logger.Info("Skipping task: target/task no longer exists", "task_id", taskID)
@@ -2333,9 +2357,9 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		// The two tiers get different templates. A watch round uses the watch
 		// start message, never the deep one, so the two workloads never mix.
 		if taskType == watchScanType {
-			s.notifier.NotifyWatchScanStarted(taskID, targetID, target.Domain)
+			s.notifier.NotifyWatchScanStarted(taskID, targetID, targetDisplayOrDomain(target))
 		} else {
-			s.notifier.NotifyScanStarted(taskID, targetID, target.Domain)
+			s.notifier.NotifyScanStarted(taskID, targetID, targetDisplayOrDomain(target))
 		}
 	}
 
@@ -2561,7 +2585,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 				phaseStatus, reason := phaseOutcome(result.err, skipped, timedOut && result.err != nil, ctx.Err())
 				s.finishTaskPhase(taskID, result.module, phaseStatus, reason, result.duration)
 				if s.notifier != nil && taskType != watchScanType {
-					s.notifier.NotifyPhaseFinished(taskID, targetID, target.Domain, result.module, phaseStatus, result.duration, s.terminalTaskPhaseCount(taskID), len(modules))
+					s.notifier.NotifyPhaseFinished(taskID, targetID, targetDisplayOrDomain(target), result.module, phaseStatus, result.duration, s.terminalTaskPhaseCount(taskID), len(modules))
 				}
 				if result.err == nil && !skipped {
 					completedModules = markModulesCompleted(completedModules, []string{result.module})
@@ -2637,7 +2661,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 					for _, result := range results {
 						phaseStatus, reason := phaseOutcome(result.err, skipped, timedOut && result.err != nil, ctx.Err())
 						s.finishTaskPhase(taskID, result.module, phaseStatus, reason, result.duration)
-						s.notifier.NotifyPhaseFinished(taskID, targetID, target.Domain, result.module, phaseStatus, result.duration, s.terminalTaskPhaseCount(taskID), len(modules))
+						s.notifier.NotifyPhaseFinished(taskID, targetID, targetDisplayOrDomain(target), result.module, phaseStatus, result.duration, s.terminalTaskPhaseCount(taskID), len(modules))
 					}
 				} else {
 					for _, result := range results {
@@ -2689,7 +2713,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 
 		s.finishTaskPhase(taskID, module, phaseStatus, phaseReason, time.Since(phaseStartedAt))
 		if s.notifier != nil && taskType != watchScanType {
-			s.notifier.NotifyPhaseFinished(taskID, targetID, target.Domain, module, phaseStatus, time.Since(phaseStartedAt), s.terminalTaskPhaseCount(taskID), len(modules))
+			s.notifier.NotifyPhaseFinished(taskID, targetID, targetDisplayOrDomain(target), module, phaseStatus, time.Since(phaseStartedAt), s.terminalTaskPhaseCount(taskID), len(modules))
 		}
 		if timedOut {
 			taskErr = fmt.Errorf("phase %q exceeded its %s watchdog and was stopped; completed results were saved", module, watchdog)
@@ -2818,7 +2842,7 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		// Persist the terminal alert before the task goroutine exits. Keeping this
 		// synchronous prevents shutdown from closing the database between task
 		// completion and outbox insertion.
-		s.notifyScanDone(taskID, targetID, target.Domain, taskType, finalStatus, startedAt)
+		s.notifyScanDone(taskID, targetID, targetDisplayOrDomain(target), taskType, finalStatus, startedAt)
 	}
 	if taskType == monitorWatchType && finalStatus == "failed" {
 		// Persist a durable warning, but let due scheduling retry after its short
@@ -3241,10 +3265,6 @@ func (s *Scheduler) escalateIfChanged(targetID, domain string, baselineSubs int,
 
 	s.logger.Info("Watch pass found changes — escalating", "target", domain,
 		"new_subdomains", newSubs, "changes", changes)
-	if s.notifier != nil {
-		summary := fmt.Sprintf("%d new subdomain(s), %d change(s) — scheduling change-specific verification", newSubs, changes)
-		s.notifier.NotifyMonitorChange(targetID, domain, "new-asset", summary, "", "", "")
-	}
 
 	// Build a selective follow-up from the actual diff. A changed JS seed needs
 	// recursive JS/endpoints/DOM analysis; an HTTP/security change needs web
@@ -3324,7 +3344,11 @@ func (s *Scheduler) notifyBountyScopeEvent(ctx context.Context, targetID, progra
 		})
 	}
 	var domain string
-	_ = s.db.QueryRow(`SELECT domain FROM targets WHERE id=?`, targetID).Scan(&domain)
+	if err := s.db.QueryRow(`SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if s.logger != nil {
+			s.logger.Warn("bounty scope target display lookup failed", "target_id", targetID, "error", err)
+		}
+	}
 	// Every scope change reaches the scope channel, favorited or not. Favorites
 	// only decide whether an automated follow-up scan runs (B9).
 	if s.notifier != nil {

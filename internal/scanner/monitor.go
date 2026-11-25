@@ -894,13 +894,16 @@ func (s *MonitorScanner) recordChange(targetID, url, changeType, oldVal, newVal,
 }
 
 // monitorAlertableChange reports whether a monitoring change is a real signal
-// for the bell and Telegram. Equal codes with a changed title are detail rows.
+// for the bell and Telegram. Hash-only js_change/css_change, stylesheet
+// attribute churn, and routine title/body/tech/redirect diffs stay in
+// monitoring_changes for the Changes tab and Diff viewer without alerting.
 func monitorAlertableChange(changeType string, oldStatus, newStatus int) bool {
 	if ValidHTTPStatus(oldStatus) && ValidHTTPStatus(newStatus) && oldStatus != newStatus {
 		return true
 	}
-	if strings.HasPrefix(changeType, "security:") || strings.HasSuffix(changeType, "_header_removed") ||
-		strings.Contains(changeType, "header_regression") || changeType == "js_change" || changeType == "css_change" {
+	if (strings.HasPrefix(changeType, "security:") && !strings.HasPrefix(changeType, "security:stylesheet")) ||
+		strings.HasSuffix(changeType, "_header_removed") ||
+		strings.Contains(changeType, "header_regression") {
 		return true
 	}
 	return false

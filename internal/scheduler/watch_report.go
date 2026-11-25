@@ -312,10 +312,7 @@ func (s *Scheduler) releaseScopeLandings(landings []scopeLanding) {
 // summarizeScopeLandings builds the grouped message body: the total, the
 // per-program counts, and up to WatchNotifyHostCap host names.
 func (s *Scheduler) summarizeScopeLandings(landings []scopeLanding) (string, []string) {
-	cap := 20
-	if s.cfg != nil && s.cfg.WatchNotifyHostCap > 0 {
-		cap = s.cfg.WatchNotifyHostCap
-	}
+	_ = s.cfg
 	perProgram := map[string]int{}
 	programNames := map[string]string{}
 	var hosts []string
@@ -343,11 +340,7 @@ func (s *Scheduler) summarizeScopeLandings(landings []scopeLanding) (string, []s
 	sort.Strings(parts)
 	summary := fmt.Sprintf("%d new eligible host(s) across %d program(s) — %s",
 		len(hosts), len(perProgram), strings.Join(parts, ", "))
-	shown := hosts
-	if len(shown) > cap {
-		shown = shown[:cap]
-	}
-	return summary, shown
+	return summary, hosts
 }
 
 // shortProgramLabel is a short fallback name for a program without a name.

@@ -144,7 +144,7 @@ func (b *TelegramBot) handleCommand(ctx context.Context, token string, chat Tele
 			task, err = b.startTelegramScan(ctx, t, profile)
 			if err == nil {
 				b.audit(chat.ChatID, "scan_start", t.ID, "ok", profile)
-				reply("Scan queued for "+displayDomain(t.Domain)+"\nProfile: "+profile+"\nTask: "+shortBotID(task.ID), b.scanKeyboard(t.ID))
+				reply("Scan queued for "+targetDisplayName(t)+"\nProfile: "+profile+"\nTask: "+shortBotID(task.ID), b.scanKeyboard(t.ID))
 				return
 			}
 		}
@@ -170,7 +170,7 @@ func (b *TelegramBot) handleCommand(ctx context.Context, token string, chat Tele
 		if err != nil {
 			reply("Scan control failed: "+err.Error(), nil)
 		} else {
-			reply("Scan "+name+" requested for "+displayDomain(t.Domain), b.scanKeyboard(t.ID))
+			reply("Scan "+name+" requested for "+targetDisplayName(t), b.scanKeyboard(t.ID))
 		}
 	case "addtarget":
 		if !b.requireRole(chat, "admin", reply) {
@@ -231,7 +231,7 @@ func (b *TelegramBot) handleCommand(ctx context.Context, token string, chat Tele
 			{Text: "Delete permanently", CallbackData: "delete_confirm:" + t.ID},
 			{Text: "Keep target", CallbackData: "delete_cancel:" + t.ID},
 		}}}
-		reply("Delete target?\n"+displayDomain(t.Domain)+"\nRunning scans and all results will be removed.", keyboard)
+		reply("Delete target?\n"+targetDisplayName(t)+"\nRunning scans and all results will be removed.", keyboard)
 	default:
 		reply("Unknown command. Use /help.", nil)
 	}
@@ -271,7 +271,7 @@ func (b *TelegramBot) handleCallback(ctx context.Context, token string, chat Tel
 			reply("Could not start scan: "+runErr.Error(), nil)
 		} else {
 			b.answerCallback(ctx, token, q.ID, "Scan queued")
-			reply("Scan queued for "+displayDomain(t.Domain)+"\nTask: "+shortBotID(task.ID), b.scanKeyboard(t.ID))
+			reply("Scan queued for "+targetDisplayName(t)+"\nTask: "+shortBotID(task.ID), b.scanKeyboard(t.ID))
 		}
 	case "pause", "resume", "skip", "cancel":
 		if roleRank(chat.Role) < roleRank("operator") {
@@ -298,7 +298,7 @@ func (b *TelegramBot) handleCallback(ctx context.Context, token string, chat Tel
 			reply("Could not delete target: "+runErr.Error(), nil)
 		} else {
 			b.answerCallback(ctx, token, q.ID, "Target deleted")
-			reply("Target deleted: "+displayDomain(t.Domain), nil)
+			reply("Target deleted: "+targetDisplayName(t), nil)
 		}
 	case "delete_cancel":
 		b.answerCallback(ctx, token, q.ID, "Deletion cancelled")
@@ -356,7 +356,7 @@ func (b *TelegramBot) targetsText(ctx context.Context, role string) (string, *tg
 		if rows.Scan(&id, &domain, &name, &status, &findings) != nil {
 			continue
 		}
-		label := name
+		label := capRunes(strings.TrimSpace(name), 60)
 		if label == "" {
 			label = displayDomain(domain)
 		}
@@ -374,10 +374,7 @@ func (b *TelegramBot) targetsText(ctx context.Context, role string) (string, *tg
 }
 
 func (b *TelegramBot) targetText(t telegramTarget) string {
-	label := t.Name
-	if label == "" {
-		label = displayDomain(t.Domain)
-	}
+	label := targetDisplayName(t)
 	return fmt.Sprintf("Target: %s\nScope: %s\nID: %s\nKind: %s · Priority: %s\nScan: %s\nFindings: %d",
 		label, displayDomain(t.Domain), t.ID, t.Kind, t.Priority, t.ScanStatus, t.FindingCount)
 }
@@ -408,6 +405,7 @@ func (b *TelegramBot) scansText(ctx context.Context) string {
 		if rows.Scan(&id, &name, &domain, &status, &progress, &total, &module) != nil {
 			continue
 		}
+		name = capRunes(strings.TrimSpace(name), 60)
 		if name == "" {
 			name = displayDomain(domain)
 		}
@@ -430,7 +428,7 @@ func (b *TelegramBot) findingsText(ctx context.Context, targetRef string) string
 		if err != nil {
 			return "Target: " + err.Error()
 		}
-		targetID, title = t.ID, "Latest findings · "+displayDomain(t.Domain)
+		targetID, title = t.ID, "Latest findings · "+targetDisplayName(t)
 	}
 	query := `WITH verified(target_id,type,severity,url,parameter,created_at) AS (
 		SELECT target_id,type,severity,url,COALESCE(parameter,''),created_at FROM vuln_findings
@@ -715,4 +713,11 @@ func targetResource(t telegramTarget) string {
 		return t.ID
 	}
 	return t.Domain
+}
+
+func targetDisplayName(t telegramTarget) string {
+	if name := strings.TrimSpace(t.Name); name != "" {
+		return capRunes(name, 60)
+	}
+	return displayDomain(t.Domain)
 }
