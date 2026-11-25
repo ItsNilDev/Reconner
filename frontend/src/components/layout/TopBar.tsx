@@ -148,15 +148,14 @@ export const TopBar = () => {
     }
     load()
     const t = setInterval(load, 60 * 1000) // poll every minute
-    // Monitoring persists its notification before emitting this event. Task
-    // completion is a fallback for older/new-subdomain producers that only
-    // persist a bell row. This removes the previous one-minute blind spot.
-    // scope_landed is its own event: a watch round writes the bell row without
-    // the notification_created broadcast, so the bell needs this listener.
+    // Monitoring persists its notification before emitting these events. Task
+    // completion, new findings and written changes are fallbacks for producers
+    // that only persist a bell row, so the bell never misses a round.
     const offs = [
       ws.on('notification_created', load),
       ws.on('task_finished', load),
-      ws.on('scope_landed', load),
+      ws.on('new_vuln_finding', load),
+      ws.on('changes_written', load),
       ws.on('bounty_scope_change', load),
       ws.on('bounty_catalog_sync', load),
       onNotificationsChanged(load),
@@ -246,7 +245,7 @@ export const TopBar = () => {
                       <option value="watch">Watch</option>
                       <option value="findings">Findings</option>
                     </select>
-                    {unread > 0 && (
+                    {items.some(n => !n.is_read) && (
                       <button onClick={markAllRead} className="text-[11px] text-accent hover:underline">Mark all read</button>
                     )}
                   </div>
@@ -277,6 +276,10 @@ export const TopBar = () => {
                       </span>
                     </button>
                   ))}
+                  <Link to="/changes" onClick={() => setOpen(false)}
+                    className="block px-4 py-2.5 text-center text-[11px] text-accent hover:bg-white/[.04] border-t border-border">
+                    View all changes →
+                  </Link>
                 </div>
               </div>
             )}

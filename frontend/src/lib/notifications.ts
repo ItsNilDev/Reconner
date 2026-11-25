@@ -32,6 +32,24 @@ const FEED_EVENT_TYPES = new Set([
   'redirect_change', 'content_change', 'js_change', 'css_change',
   'security_header_removed', 'header_regression', 'content_security_change',
 ])
+
+// Monitor/watch bells open the Changes tab. These types do not carry a feed
+// row id, so they get the tab without an &event= deep link.
+const MONITOR_TYPES = new Set([
+  'bounty_scope_change', 'scope_landed', 'watch_failed', 'watch_kind_conflict',
+  'monitor_failed', 'monitor_escalation_started', 'scan_auto_paused',
+])
+// Verified finding bells open the Confirmed tab; the narrower checks get their
+// own dedicated tab so the operator lands on the matching result list.
+const FINDING_TYPES = new Set([
+  'finding', 'vuln', 'new_vuln_finding', 'xss', 'sqli', 'ssrf', 'idor',
+  'takeover', 'lfi', 'ssti', 'cmdi', 'xxe', 'csrf', 'cors', 'jwt', 'authz',
+  'ato', 'oast', 'cache_poison', 'file_upload', 'nosqli', 'blh', 'csti',
+])
+const FINDING_TAB: Record<string, string> = {
+  nuclei: 'nuclei', js_finding: 'js-findings', backup: 'backups',
+  open_redirect: 'redirects', admin_panel: 'admin-panels',
+}
 export function openNotification(
   n: Notification,
   navigate: (path: string) => void,
@@ -47,6 +65,12 @@ export function openNotification(
     const eventID = n.metadata?.change_id || n.metadata?.event_id || n.change_id
     if (FEED_EVENT_TYPES.has(n.type) && typeof eventID === 'string' && eventID) {
       navigate(`/targets/${n.target_id}?tab=monitor&event=${encodeURIComponent(eventID)}`)
+    } else if (MONITOR_TYPES.has(n.type)) {
+      navigate(`/targets/${n.target_id}?tab=monitor`)
+    } else if (FINDING_TYPES.has(n.type)) {
+      navigate(`/targets/${n.target_id}?tab=vulns`)
+    } else if (FINDING_TAB[n.type]) {
+      navigate(`/targets/${n.target_id}?tab=${FINDING_TAB[n.type]}`)
     } else {
       navigate(first
         ? `/targets/${n.target_id}?tab=monitor&q=${encodeURIComponent(first)}`

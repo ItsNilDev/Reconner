@@ -50,16 +50,23 @@ export default function Tasks() {
   useEffect(() => { load() }, [statusFilter, coverageFilter, page])
 
   useEffect(() => {
-    const off = ws.on('task_update', (payload: unknown) => {
+    // The backend broadcasts a dedicated event per lifecycle step instead of a
+    // single task_update. Each event carries the current task row.
+    const apply = (payload: unknown) => {
       const task = payload as Task
+      if (!task?.id) return
       if (statusFilter && task.status !== statusFilter) return
       if (coverageFilter === 'breadth' && !isBreadth(task)) return
       if (coverageFilter === 'deep' && isBreadth(task)) return
       setTaskList(p => p.some(t => t.id === task.id) ? p.map(t => t.id === task.id ? task : t) : [task, ...p])
       setSelected(p => p?.id === task.id ? task : p)
-    })
+    }
+    const offs = [
+      'task_created', 'task_started', 'task_progress', 'task_finished',
+      'task_cancelled', 'task_paused', 'task_resumed',
+    ].map(event => ws.on(event, apply))
     const i = setInterval(() => load(), 15000)
-    return () => { off(); clearInterval(i) }
+    return () => { offs.forEach(off => off()); clearInterval(i) }
   }, [statusFilter, coverageFilter, page])
 
   useEffect(() => {

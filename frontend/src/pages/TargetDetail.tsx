@@ -1,33 +1,32 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
-import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, bounty as bountyApi, changes as changesApi } from '../lib/api'
+import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, bounty as bountyApi } from '../lib/api'
 import type { WatchScopeEvent } from '../lib/api'
 import { useUIStore } from '../store/ui'
 import { Badge, Button, Spinner, Empty, CopyButton, ErrorBoundary, SkeletonRows, Modal } from '../components/ui'
 import { ScanModal } from '../components/targets/ScanModal'
 import { EvidenceViewer } from '../components/targets/EvidenceViewer'
-import { ChangeDiffViewer } from '../components/targets/ChangeDiffViewer'
 import { LiveResults } from '../components/targets/LiveResults'
 import { ws } from '../lib/websocket'
-import { timeAgo, timeUntil, statusCodeColor, truncate, cn, safeHref } from '../lib/utils'
-import {
-  CHANGE_FILTERS, OCCURRENCE_PAGE_SIZE, changeBadgeVariant, groupMonitorChanges,
-  isScopeEvent, scopeChangedFields, scopeEventSummary, scopeReviewLabel,
-  monitorRowKind, type ChangeFilter, type MonitorChangeGroup,
-} from '../components/changes/changesModel'
-import ScopeEventView from '../components/changes/ScopeEventView'
+import { timeAgo, timeUntil, statusCodeColor, truncate, cn } from '../lib/utils'
+import { scopeChangedFields, scopeReviewLabel } from '../components/changes/changesModel'
 import ChangeLog from '../components/changes/ChangeLog'
 import type {
   Target, Subdomain, HTTPService, JSFile, JSFinding, Parameter,
-  DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService, ChangeEntry
+  DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService
 } from '../types'
 
 const isScannableProjectAsset = (asset: Asset) =>
 	(asset.kind === 'web' && ['domain', 'wildcard', 'url', 'page', 'js', 'api'].includes(asset.asset_type || 'domain')) ||
 	(asset.kind === 'network' && ['ip', 'cidr'].includes(asset.asset_type || 'ip'))
 
-// Changes-tab categories, badges and grouping are shared with the global feed
-// so both views agree on what Assets, Alerts and the other chips contain.
+// Hosts and URLs discovered in the last 24h get a NEW badge and can be isolated
+// with the "New 24h" filter on the Hosts/URLs tabs.
+const isRecentHost = (createdAt?: string): boolean => {
+  if (!createdAt) return false
+  const t = Date.parse(createdAt)
+  return Number.isFinite(t) && Date.now() - t < 24 * 60 * 60 * 1000
+}
 
 // Projects created from the WP Scanner page carry this tag (see WPScanner.tsx) —
 // the same signal used there to decide this is a WordPress project, reused here
@@ -490,9 +489,14 @@ export default function TargetDetail() {
   // every <tr> at once froze the page and blew out the layout, so we render an
   // incremental window (PAGE at a time) and let the operator pull more on demand.
   const [visibleCount, setVisibleCount] = useState(PAGE)
-  const [sort, setSort] = useState<{ key: 'size' | 'status' | 'severity' | null; dir: 'asc' | 'desc' }>({ key: null, dir: 'desc' })
+  const [sort, setSort] = useState<{ key: 'size' | 'status' | 'severity' | 'created' | null; dir: 'asc' | 'desc' }>({ key: null, dir: 'desc' })
   // Status-class filter for the URLs tab: 'all' | '2' | '3' | '4' | '5' (2xx…5xx).
   const [statusClass, setStatusClass] = useState<'all' | '2' | '3' | '4' | '5'>('all')
+  // Client-side Hosts/URLs filters: text search, alive hosts only, and rows
+  // first seen in the last 24h.
+  const [hostSearch, setHostSearch] = useState('')
+  const [aliveOnly, setAliveOnly] = useState(false)
+  const [newOnly, setNewOnly] = useState(false)
   const [scanOpen, setScanOpen] = useState(false)
   const [assets, setAssets] = useState<Asset[]>([])
   const [scanAsset, setScanAsset] = useState<Asset | null>(null)
@@ -503,15 +507,6 @@ export default function TargetDetail() {
   const [scopeTab, setScopeTab] = useState<'pending' | 'approved' | 'rejected' | 'superseded'>('pending')
   const [eventBusy, setEventBusy] = useState<string | null>(null)
   const [evidence, setEvidence] = useState<{ id: string; url: string; type: string } | null>(null)
-  // Changes-tab noise filter + the open content-diff drawer (css/js rows).
-  const [changeFilter, setChangeFilter] = useState<ChangeFilter>('all')
-  const [changeQuery, setChangeQuery] = useState(initialQuery)
-  // Changes tab: group key -> how many occurrence rows are currently mounted.
-  // Presence in the map means the group is expanded.
-  const [expandedOccurrences, setExpandedOccurrences] = useState<Map<string, number>>(new Map())
-  const [diffView, setDiffView] = useState<{ url: string; kind: 'css' | 'js' } | null>(null)
-  // Scope-event Details drawer. Uses the same renderer as the sidebar feed.
-  const [scopeDetail, setScopeDetail] = useState<ChangeEntry | null>(null)
   const [isScanning, setIsScanning] = useState(false)
   const [monitorSaving, setMonitorSaving] = useState(false)
   const [catchallSaving, setCatchallSaving] = useState(false)
@@ -582,6 +577,8 @@ export default function TargetDetail() {
       if (nextStatus === 'rejected') setScopeTab('rejected')
       loadAssets()
       loadScopeEvents()
+      loadWatchScope()
+      targetsApi.get(id).then(setTarget).catch(() => {})
       addToast('success', decision === 'approve' ? 'Scope change approved' : 'Scope change dismissed')
     } catch (e) { addToast('error', e instanceof Error ? e.message : 'Could not resolve scope change') }
     finally { setEventBusy(null) }
@@ -683,33 +680,26 @@ export default function TargetDetail() {
     })
   }, [id, tab])
 
-  // Changes rows are written by watch rounds and by the bounty scope feed.
-  // Reload the open Changes tab on those events only — task_progress is a
-  // per-module tick and scope_landed is already covered by bounty_scope_change.
+  // The review panel is outside the Changes tab, so its data must refresh on
+  // scope events even when another tab is open (B16). The Changes tab itself is
+  // owned by ChangeLog; it refreshes from its own feed events.
   useEffect(() => {
-    // The review panel is outside the Changes tab, so its data must refresh on
-    // scope events even when another tab is open (B16).
     const onScope = () => {
       loadScopeEvents()
       loadWatchScope()
     }
-    const offs: (() => void)[] = [ws.on('bounty_scope_change', onScope)]
-    if (tab === 'monitor') {
-      const reload = (payload: unknown) => {
-        const p = payload as { target_id?: string }
-        if (p?.target_id && p.target_id !== id) return
-        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
-        refreshTimerRef.current = setTimeout(() => loadTab('monitor'), 1200)
-      }
-      offs.push(ws.on('changes_written', reload), ws.on('bounty_scope_change', reload))
-    }
-    return () => offs.forEach(off => off())
-  }, [id, tab, loadScopeEvents])
+    return ws.on('bounty_scope_change', onScope)
+  }, [id, loadScopeEvents])
 
   // Detect scan start/finish
   useEffect(() => {
     const unsubs = [
-      ws.on('task_started', (p) => { const ev = p as { target_id: string }; if (ev.target_id === id) setIsScanning(true) }),
+      ws.on('task_started', (p) => {
+        const ev = p as { target_id: string }
+        if (ev.target_id !== id) return
+        setIsScanning(true)
+        setTarget(t => t ? { ...t, scan_status: 'running' } : t)
+      }),
       ws.on('task_finished', (p) => {
         const ev = p as { target_id: string }
         if (ev.target_id !== id) return
@@ -721,7 +711,10 @@ export default function TargetDetail() {
         loadWatchScope()
         targetsApi.get(id!).then(setTarget).catch(() => {})
       }),
-      ws.on('task_cancelled', () => setIsScanning(false)),
+      ws.on('task_cancelled', (p) => {
+        const ev = p as { target_id?: string }
+        if (ev?.target_id === id) setIsScanning(false)
+      }),
     ]
     return () => unsubs.forEach(u => u())
   }, [id, tab, loadScopeEvents])
@@ -739,9 +732,18 @@ export default function TargetDetail() {
   // critical → high → medium → low → info, so "desc" reads as most-severe-first
   // (the usual triage order) and "asc" flips to low→high per your request.
   const severityRank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 }
-  const applySort = (key: 'size' | 'status' | 'severity') => {
+  const applySort = (key: 'size' | 'status' | 'severity' | 'created') => {
     const dir: 'asc' | 'desc' = sort.key === key && sort.dir === 'desc' ? 'asc' : 'desc'
     setSort({ key, dir })
+    if (key === 'created') {
+      setData(prev => [...prev].sort((a, b) => {
+        const av = String((a as Record<string, unknown>)?.created_at || '')
+        const bv = String((b as Record<string, unknown>)?.created_at || '')
+        const cmp = av.localeCompare(bv)
+        return dir === 'desc' ? -cmp : cmp
+      }))
+      return
+    }
     const get = key === 'size'
       ? (i: unknown) => numOf(i, ['content_length', 'size', 'contentLength'])
       : key === 'status'
@@ -751,22 +753,27 @@ export default function TargetDetail() {
   }
   const isSeverityTab = tab === 'nuclei' || tab === 'vulns' || tab === 'candidates'
 
-  // URLs (http) tab: optional filter by HTTP status class (2xx…5xx) before windowing.
-  const filteredData = (tab === 'http' && statusClass !== 'all')
-    ? data.filter(row => {
+  // Filter Hosts/URLs client-side before windowing. The status-class filter is
+  // URLs-only; search, alive-only and New 24h apply to both surface tabs.
+  const filteredData = (() => {
+    let rows = data
+    if (tab === 'http' && statusClass !== 'all') {
+      rows = rows.filter(row => {
         const code = Number((row as { status_code?: number })?.status_code || 0)
         return Math.floor(code / 100) === Number(statusClass)
       })
-    : tab === 'monitor'
-    ? (data as MonitoringChange[]).filter(row => {
-        if (changeFilter !== 'all' && monitorRowKind(row) !== changeFilter) return false
-        if (!changeQuery.trim()) return true
-        const q = changeQuery.trim().toLowerCase()
-        const c = row as ChangeEntry
-        return [c.url, c.change_type, c.old_value, c.new_value, c.metadata ? JSON.stringify(c.metadata) : '']
-          .some(v => (v || '').toLowerCase().includes(q))
+    }
+    if (tab === 'subdomains' || tab === 'http') {
+      const q = hostSearch.trim().toLowerCase()
+      if (q) rows = rows.filter(row => {
+        const o = row as Record<string, unknown>
+        return [o.subdomain, o.url, o.ip, o.page_title].some(v => typeof v === 'string' && v.toLowerCase().includes(q))
       })
-    : data
+      if (tab === 'subdomains' && aliveOnly) rows = rows.filter(row => !!(row as Subdomain).is_alive)
+      if (newOnly) rows = rows.filter(row => isRecentHost((row as { created_at?: string }).created_at))
+    }
+    return rows
+  })()
   // Windowed view of the loaded rows — only the first `visibleCount` are mounted.
   const pageData = filteredData.slice(0, visibleCount)
   const hasMore = filteredData.length > visibleCount
@@ -782,59 +789,14 @@ export default function TargetDetail() {
   // more hooks than during the previous render" invariant (crashed the whole
   // page in production the moment the target finished loading).
   const isVulnTab = tab === 'vulns' || tab === 'candidates'
-  const isMonitorTab = tab === 'monitor'
   const vulnGroups = useMemo(
     () => (isVulnTab ? groupVulnFindings(filteredData as VulnFinding[]) : []),
     [isVulnTab, filteredData]
   )
-  // Changes tab: dedupe the FULL dataset once, not just the windowed rows.
-  // Grouping inside the table meant the chip counts, the "+N more URLs" labels
-  // and the footer disagreed, and they changed as you loaded more rows.
-  const monitorGroups = useMemo(() => {
-    if (!isMonitorTab) return [] as MonitorChangeGroup[]
-    // Group by host and day. A collision on two different hosts or two
-    // different days must not collapse into one undated representative (B15).
-    return groupMonitorChanges(data as MonitoringChange[], (c) => {
-      let host = c.url || ''
-      try { host = new URL(c.url).hostname } catch { /* keep the raw value */ }
-      return `${host}\u0000${(c.detected_at || '').slice(0, 10)}`
-    })
-  }, [isMonitorTab, data])
-  // Chip counts: distinct groups (what the table shows) plus raw row counts
-  // (tooltip), so "HTTP 18" and "58 changes" are both visible and explained.
-  const monitorCounts = useMemo(() => {
-    const groups: Record<string, number> = { all: monitorGroups.length }
-    const raw: Record<string, number> = { all: isMonitorTab ? (data as MonitoringChange[]).length : 0 }
-    if (isMonitorTab) {
-      for (const g of monitorGroups) {
-        const k = monitorRowKind(g.rep)
-        groups[k] = (groups[k] || 0) + 1
-      }
-      for (const row of (data as MonitoringChange[])) {
-        const k = monitorRowKind(row)
-        raw[k] = (raw[k] || 0) + 1
-      }
-    }
-    return { groups, raw }
-  }, [isMonitorTab, monitorGroups, data])
-  const monitorFilteredGroups = useMemo(() => {
-    if (!isMonitorTab) return monitorGroups
-    const q = changeQuery.trim().toLowerCase()
-    return monitorGroups.filter(g => {
-      if (changeFilter !== 'all' && monitorRowKind(g.rep) !== changeFilter) return false
-      if (!q) return true
-      return g.items.some(row => {
-        const c = row as ChangeEntry
-        return [c.url, c.change_type, c.old_value, c.new_value, c.metadata ? JSON.stringify(c.metadata) : '']
-          .some(v => (v || '').toLowerCase().includes(q))
-      })
-    })
-  }, [isMonitorTab, monitorGroups, changeFilter, changeQuery])
   const vulnGroupPage = vulnGroups.slice(0, visibleCount)
-  const monitorGroupPage = monitorFilteredGroups.slice(0, visibleCount)
-  const footerShownCount = isVulnTab ? vulnGroupPage.length : isMonitorTab ? monitorGroupPage.length : pageData.length
-  const footerTotalCount = isVulnTab ? vulnGroups.length : isMonitorTab ? monitorFilteredGroups.length : filteredData.length
-  const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : isMonitorTab ? monitorFilteredGroups.length > visibleCount : hasMore
+  const footerShownCount = isVulnTab ? vulnGroupPage.length : pageData.length
+  const footerTotalCount = isVulnTab ? vulnGroups.length : filteredData.length
+  const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : hasMore
 
   const loadTab = async (t: string) => {
     if (!id) return
@@ -845,9 +807,9 @@ export default function TargetDetail() {
       // load the old full-history table in the background.
       setData([])
       setDataError('')
-      setTabLoading(false)
       return
     }
+    setTabLoading(true)
     try {
       let r: unknown[] = []
       if (t === 'subdomains') r = await findingsApi.subdomains(id)
@@ -880,19 +842,7 @@ export default function TargetDetail() {
         r = all.filter(f => want.has(f.type))
       }
       else if (t === 'cameras') r = await findingsApi.ingram(id)
-      else if (t === 'monitor') {
-        // One feed: deep monitor changes plus watch-round diffs, scope landings
-        // and bell rows. Keep the original table and its stylesheet diff.
-        const feed = await changesApi.forTarget(id)
-        r = feed.map(c => ({
-          ...c,
-          // Keep source, category, metadata and seen. Fleet members and
-          // per-member scope live only in metadata (A9).
-          metadata: c.metadata || {},
-        }))
-      }
       if (seq !== requestSeqRef.current || t !== activeTabRef.current || requestTarget !== activeIdRef.current) return
-      setTabLoading(true)
       setDataError('')
       setData(r || [])
       setVisibleCount(PAGE)
@@ -979,6 +929,7 @@ export default function TargetDetail() {
       } : prev)
       addToast('success', toBreadth ? 'Project switched to breadth watch' : 'Project switched to deep scan')
       setCoverageDialogOpen(false)
+      targetsApi.get(id).then(setTarget).catch(() => {})
       if (toBreadth) loadWatchScope()
     } catch (e) {
       addToast('error', e instanceof Error ? e.message : 'Could not change coverage')
@@ -990,6 +941,7 @@ export default function TargetDetail() {
     try {
       await targetsApi.update(id, { watch_paused: paused })
       setTarget(prev => prev ? { ...prev, watch_paused: paused } : prev)
+      targetsApi.get(id).then(setTarget).catch(() => {})
       addToast('success', paused ? 'Watching paused' : 'Watching resumed')
     } catch (e) {
       addToast('error', e instanceof Error ? e.message : 'Could not change the watch state')
@@ -1011,6 +963,7 @@ export default function TargetDetail() {
       const res = await targetsApi.promoteWatchScope(id, values)
       addToast('success', `${res.promoted} host${res.promoted === 1 ? '' : 's'} promoted to deep seed`)
       loadAssets()
+      loadWatchScope()
     } catch (e) {
       addToast('error', e instanceof Error ? e.message : 'Could not promote hosts')
     }
@@ -1090,7 +1043,9 @@ export default function TargetDetail() {
             { label: 'Alive surface', value: target.alive_host_count, color: 'text-severity-low' },
             { label: 'Verified findings', value: target.finding_count, color: target.finding_count > 0 ? 'text-severity-high' : undefined },
             { label: 'Automation', value: target.watch_only ? 'Watch rounds' : target.monitor_enabled ? `Every ${target.monitor_interval_hours || 12}h` : 'Manual' },
-            { label: 'Last scan', value: target.last_scan_at ? timeAgo(target.last_scan_at) : 'Never' },
+            target.watch_only
+              ? { label: 'Last watch', value: target.watch_last_run ? timeAgo(target.watch_last_run) : 'Never' }
+              : { label: 'Last scan', value: target.last_scan_at ? timeAgo(target.last_scan_at) : 'Never' },
             { label: 'Asset type', value: target.kind || 'web' },
           ].map(metric => (
             <div key={metric.label} className="min-w-0 px-4 py-3.5">
@@ -1149,6 +1104,14 @@ export default function TargetDetail() {
 		  </div>
 		</div>
 	  )}
+
+      {target.watch_only && target.watch_paused && (target.watch_fail_count || 0) > 0 && (
+        <div className="px-4 py-2.5 rounded-lg bg-severity-medium/10 border border-severity-medium/30 text-xs text-severity-medium flex items-center gap-3">
+          <span className="font-semibold">Watch auto-paused after {target.watch_fail_count} failed round(s)</span>
+          <button onClick={() => saveWatchPaused(false)}
+            className="ml-auto shrink-0 btn-secondary text-[11px] whitespace-nowrap">Resume watching</button>
+        </div>
+      )}
 
       {target.scan_status === 'failed' && lastFailedTask?.error && (
         <div className="px-4 py-2.5 rounded-lg bg-severity-critical/10 border border-severity-critical/30 text-xs text-severity-critical flex items-center gap-3">
@@ -1315,8 +1278,9 @@ export default function TargetDetail() {
         )}
       </div>
 
-      {/* Watch scope: hosts landed by breadth rounds from bounty-eligible scope */}
-      {target.watch_only && (
+      {/* Watch scope: hosts landed by breadth rounds from bounty-eligible scope.
+          Kept visible after a flip to Deep so the audit trail stays inspectable. */}
+      {(target.watch_only || watchScopeEvents.length > 0) && (
         <div className="card p-4">
           <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
             <div>
@@ -1329,15 +1293,29 @@ export default function TargetDetail() {
             <p className="text-xs text-text-muted py-2">No hosts landed yet. Eligible hosts appear after a watch round finds them alive.</p>
           ) : (
             <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
-              {watchScopeEvents.map(ev => (
-                <div key={ev.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white/[.02] border border-white/[.05] flex-wrap">
-                  <code className="text-[11px] font-mono text-text-primary min-w-0 flex-1 break-all">{ev.identifier}</code>
-                  <span className="text-[10px] text-text-muted">{timeAgo(ev.detected_at)}</span>
-                  <Button size="sm" variant="ghost" onClick={() => promoteWatchHosts([ev.identifier].map(v => v.toLowerCase()))}>
-                    Promote to Deep seed
-                  </Button>
-                </div>
-              ))}
+              {watchScopeEvents.map(ev => {
+                const label = ev.event_type === 'landed' ? 'Landed'
+                  : ev.event_type === 're_eligible' ? 'Re-eligible'
+                  : ev.event_type === 'out_of_scope' ? 'Out of scope' : ev.event_type
+                const variant = ev.event_type === 'landed' ? 'low'
+                  : ev.event_type === 're_eligible' ? 'info' : 'critical'
+                const promoted = assets.some(a =>
+                  ((!!ev.asset_id && a.id === ev.asset_id) || a.value.toLowerCase() === ev.identifier.toLowerCase()) &&
+                  a.asset_type === 'url')
+                return (
+                  <div key={ev.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white/[.02] border border-white/[.05] flex-wrap">
+                    <Badge variant={variant}>{label}</Badge>
+                    <code className="text-[11px] font-mono text-text-primary min-w-0 flex-1 break-all">{ev.identifier}</code>
+                    <span className="text-[10px] text-text-muted">{timeAgo(ev.detected_at)}</span>
+                    {promoted
+                      ? <span className="badge-low">Promoted</span>
+                      : <Button size="sm" variant="ghost" disabled={ev.event_type === 'out_of_scope'}
+                          onClick={() => promoteWatchHosts([ev.identifier].map(v => v.toLowerCase()))}>
+                          Promote to Deep seed
+                        </Button>}
+                  </div>
+                )
+              })}
             </div>
           )}
         </div>
@@ -1431,7 +1409,7 @@ export default function TargetDetail() {
         ) : null
       })()}
 
-      {tab !== 'cameras' && (
+      {tab !== 'cameras' && tab !== 'monitor' && (
       <div className="flex gap-2 items-center px-1 py-2 text-xs text-text-muted flex-wrap">
         {tab === 'vulns' && (
           <button onClick={() => setFpView(v => !v)}
@@ -1447,10 +1425,36 @@ export default function TargetDetail() {
             Severity {sort.key === 'severity' ? (sort.dir === 'asc' ? '↑ low→high' : '↓ high→low') : ''}
           </button>
         )}
-        <button onClick={() => applySort('size')}
-          className={cn('px-2 py-1 rounded border', sort.key === 'size' ? 'border-accent text-accent' : 'border-border')}>
-          File size {sort.key === 'size' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
-        </button>
+        {(tab === 'subdomains' || tab === 'http') && (
+          <>
+            <input type="search" value={hostSearch}
+              onChange={e => { setHostSearch(e.target.value); setVisibleCount(PAGE) }}
+              placeholder={tab === 'subdomains' ? 'Search hosts…' : 'Search URLs…'}
+              aria-label={tab === 'subdomains' ? 'Search hosts' : 'Search URLs'}
+              className="rounded border border-border bg-surface px-2 py-1 text-[11px] text-text-primary placeholder:text-text-muted w-44" />
+            <button onClick={() => applySort('created')}
+              className={cn('px-2 py-1 rounded border', sort.key === 'created' ? 'border-accent text-accent' : 'border-border')}>
+              Newest {sort.key === 'created' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+            </button>
+            {tab === 'subdomains' && (
+              <label className="flex items-center gap-1 cursor-pointer select-none">
+                <input type="checkbox" checked={aliveOnly} onChange={e => { setAliveOnly(e.target.checked); setVisibleCount(PAGE) }}
+                  className="accent-accent w-3.5 h-3.5" />
+                Alive only
+              </label>
+            )}
+            <button onClick={() => { setNewOnly(v => !v); setVisibleCount(PAGE) }}
+              className={cn('px-2 py-1 rounded border', newOnly ? 'border-accent bg-accent/15 text-accent' : 'border-border')}>
+              New 24h
+            </button>
+          </>
+        )}
+        {tab !== 'subdomains' && (
+          <button onClick={() => applySort('size')}
+            className={cn('px-2 py-1 rounded border', sort.key === 'size' ? 'border-accent text-accent' : 'border-border')}>
+            File size {sort.key === 'size' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+          </button>
+        )}
         <button onClick={() => applySort('status')}
           className={cn('px-2 py-1 rounded border', sort.key === 'status' ? 'border-accent text-accent' : 'border-border')}>
           Response {sort.key === 'status' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
@@ -1476,7 +1480,7 @@ export default function TargetDetail() {
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
         {tab === 'monitor'
-          ? <div className="p-3"><ChangeLog key={id} targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} onClearEventId={() => setSearchParams((prev: URLSearchParams) => { const next = new URLSearchParams(prev); next.delete('event'); return next })} /></div>
+          ? <div className="p-3"><ChangeLog key={id} targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} onClearEventId={() => { const next = new URLSearchParams(searchParams); next.delete('event'); setSearchParams(next, { replace: true }) }} /></div>
           : dataError && !tabLoading
           ? <div className="p-4 text-sm text-severity-high" role="alert">{dataError}</div>
           : tabLoading
@@ -1516,38 +1520,11 @@ export default function TargetDetail() {
             )
             : (
               <>
-              {tab === 'monitor' && (
-                <div className="flex items-center gap-1.5 flex-wrap mb-3">
-                  <input
-                    type="search"
-                    value={changeQuery}
-                    onChange={e => { setChangeQuery(e.target.value); setVisibleCount(PAGE) }}
-                    placeholder="Filter changes (host, value…)"
-                    className="rounded border border-border bg-surface px-2 py-1 text-[11px] text-text-primary placeholder:text-text-muted w-48"
-                    aria-label="Filter changes"
-                  />
-                  {CHANGE_FILTERS.map(f => {
-                    const n = monitorCounts.groups[f.id] || 0
-                    const rawN = monitorCounts.raw[f.id] || 0
-                    return (
-                      <button key={f.id}
-                        title={`${rawN.toLocaleString()} raw change(s)`}
-                        onClick={() => { setChangeFilter(f.id); setVisibleCount(PAGE) }}
-                        className={cn('px-2.5 py-1 rounded-full border text-[11px] transition-colors',
-                          changeFilter === f.id
-                            ? 'bg-accent/15 border-accent text-accent'
-                            : 'border-border text-text-muted hover:text-text-primary hover:border-text-muted')}>
-                        {f.label} <span className="opacity-60">{n.toLocaleString()}</span>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-border">
-                      {tab === 'subdomains' && ['Subdomain', 'IP', 'Status', 'Title', 'Server', 'Last Seen'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'subdomains' && ['Subdomain', 'IP', 'Status', 'Title', 'Server', 'Last Seen', 'First Seen'].map(h => <th key={h} className="table-header">{h}</th>)}
                       {tab === 'http' && ['URL', 'Status', 'Title', 'Size', 'Time'].map(h => <th key={h} className="table-header">{h}</th>)}
                       {tab === 'js' && ['URL', 'Size', 'Hash', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
                       {tab === 'js-findings' && ['Severity', 'Type', 'Value', 'JS File Source', 'Context', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
@@ -1561,7 +1538,6 @@ export default function TargetDetail() {
                       {tab === 'redirects' && ['URL', 'Redirects To', 'Verified', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
                       {tab === 'nuclei' && ['Severity', 'Template', 'URL', 'Description', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
                       {(tab === 'vulns' || tab === 'candidates') && ['Severity', 'Type', 'URL', 'Parameter', 'Evidence / Provenance', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
-                      {tab === 'monitor' && ['URL', 'Change Type', 'Old Value', 'New Value', 'Detected'].map(h => <th key={h} className="table-header">{h}</th>)}
                     </tr>
                   </thead>
                   <tbody>
@@ -1571,6 +1547,9 @@ export default function TargetDetail() {
                           <div className="flex items-center gap-2">
                             <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', s.is_alive ? 'bg-severity-low' : 'bg-text-muted')} />
                             <span className="font-mono text-xs">{s.subdomain}</span>
+                            {isRecentHost(s.created_at) && (
+                              <span className="shrink-0 rounded bg-severity-low/15 px-1.5 py-0.5 text-[10px] font-semibold text-severity-low">NEW</span>
+                            )}
                             {s.source === 'vhost' && (
                               <span title="Discovered via virtual-host scan (not in DNS)" className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-accent/20 text-accent-hover shrink-0">vhost</span>
                             )}
@@ -1582,6 +1561,7 @@ export default function TargetDetail() {
                         <td className="table-cell text-xs">{truncate(s.page_title || '', 40) || '—'}</td>
                         <td className="table-cell text-xs">{truncate(s.server || '', 30) || '—'}</td>
                         <td className="table-cell text-xs">{timeAgo(s.last_seen)}</td>
+                        <td className="table-cell text-xs">{timeAgo(s.created_at)}</td>
                       </tr>
                     ))}
                     {tab === 'http' && (pageData as HTTPService[]).map(s => (
@@ -1952,134 +1932,6 @@ export default function TargetDetail() {
                       </tr>
                       )
                     })}
-                    {tab === 'monitor' && monitorGroupPage.map(g => {
-                      const c = g.rep
-                      const change = c as ChangeEntry
-                      const scopeRow = isScopeEvent(change)
-                      const scopeFields = scopeRow ? scopeChangedFields(change.old_value, change.new_value) : []
-                      const cHref = safeHref(c.url)
-                      const occurrences = g.items.length - 1
-                      const shownCount = expandedOccurrences.get(g.key) ?? 0
-                      const expanded = expandedOccurrences.has(g.key)
-                      return (
-                        <Fragment key={c.id}>
-                          <tr className="table-row align-top">
-                            <td className="table-cell max-w-xs">
-                              {scopeRow ? (
-                                <div className="flex flex-wrap items-center gap-1.5">
-                                  <span className="text-xs text-text-primary">{scopeEventSummary(change)}</span>
-                                  {scopeReviewLabel(change.scope_status) && (
-                                    <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted">
-                                      {scopeReviewLabel(change.scope_status)}
-                                    </span>
-                                  )}
-                                  <button type="button" onClick={() => setScopeDetail(change)}
-                                    className="text-[10px] text-accent hover:underline">Details</button>
-                                </div>
-                              ) : (
-                                <div className="flex items-center gap-1.5">
-                                  {cHref
-                                    ? <a href={cHref} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
-                                    : <span className="text-xs font-mono truncate">{truncate(c.url, 50)}</span>}
-                                  <CopyButton text={c.url} />
-                                  {/* Content-capture diff for monitored stylesheets/scripts.
-                                      Legacy rows (recorded before capture) open too, but
-                                      show the not-captured note + hashes only. */}
-                                  {(c.change_type === 'css_change' || c.change_type === 'js_change') && (
-                                    <button onClick={() => setDiffView({ url: c.url, kind: c.change_type === 'css_change' ? 'css' : 'js' })}
-                                      className="btn-secondary text-[10px] px-1.5 py-0.5 shrink-0">Diff</button>
-                                  )}
-                                </div>
-                              )}
-                              {occurrences > 0 && (
-                                <button
-                                  onClick={() => setExpandedOccurrences(prev => {
-                                    const next = new Map(prev)
-                                    if (next.has(g.key)) next.delete(g.key)
-                                    else next.set(g.key, OCCURRENCE_PAGE_SIZE)
-                                    return next
-                                  })}
-                                  title={g.urls.join('\n')}
-                                  className="mt-0.5 inline-block text-[10px] text-accent hover:underline"
-                                >
-                                  {expanded ? 'Hide occurrences' : `+${occurrences} more change${occurrences === 1 ? '' : 's'} · ${g.urls.length} URL${g.urls.length === 1 ? '' : 's'}`}
-                                </button>
-                              )}
-                            </td>
-                            <td className="table-cell">
-                              <Badge variant={changeBadgeVariant(c)}>{scopeRow ? 'Scope' : c.change_type}</Badge>
-                            </td>
-                            {/* Old/new values were truncated to 50 chars with no way to read the
-                                rest. Now each value wraps, shows the full text on hover, and has a
-                                copy button, so a full diff is actually inspectable. */}
-                            <td className="table-cell text-xs text-text-muted break-all whitespace-pre-wrap max-w-sm">
-                              {scopeRow ? (
-                                scopeFields.length
-                                  ? scopeFields.map(f => <div key={f.field}><span className="text-text-muted">{f.field}:</span> <span className="text-severity-medium line-through">{f.before}</span></div>)
-                                  : <span className="text-text-muted">—</span>
-                              ) : (
-                                <div className="flex items-start gap-1 font-mono">
-                                  <span title={c.old_value} className="flex-1">{c.old_value || '—'}</span>
-                                  {c.old_value && <CopyButton text={c.old_value} />}
-                                </div>
-                              )}
-                            </td>
-                            <td className="table-cell text-xs text-severity-medium break-all whitespace-pre-wrap max-w-sm">
-                              {scopeRow ? (
-                                scopeFields.length
-                                  ? scopeFields.map(f => <div key={f.field}><span className="text-text-muted">{f.field}:</span> <span className="text-severity-low">{f.after}</span></div>)
-                                  : <span className="text-text-muted">—</span>
-                              ) : (
-                                <div className="flex items-start gap-1 font-mono">
-                                  <span title={c.new_value} className="flex-1">{c.new_value || '—'}</span>
-                                  {c.new_value && <CopyButton text={c.new_value} />}
-                                </div>
-                              )}
-                            </td>
-                            <td className="table-cell text-xs whitespace-nowrap">{timeAgo(c.detected_at)}</td>
-                          </tr>
-                          {expanded && g.items.slice(1, 1 + shownCount).map(it => {
-                            const itHref = safeHref(it.url)
-                            return (
-                              <tr key={it.id} className="table-row bg-bg-secondary/30 align-top">
-                                <td colSpan={5} className="table-cell text-[11px]">
-                                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pl-3 text-text-muted">
-                                    <span className="text-accent">↳</span>
-                                    {itHref
-                                      ? <a href={itHref} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono break-all">{truncate(it.url, 80)}</a>
-                                      : <span className="font-mono break-all">{truncate(it.url, 80)}</span>}
-                                    <CopyButton text={it.url} />
-                                    {isScopeEvent(it as ChangeEntry)
-                                      ? <span className="break-all">{scopeEventSummary(it as ChangeEntry)}</span>
-                                      : <span className="font-mono break-all">{it.old_value || '—'} → {it.new_value || '—'}</span>}
-                                    <span className="whitespace-nowrap">{timeAgo(it.detected_at)}</span>
-                                  </div>
-                                </td>
-                              </tr>
-                            )
-                          })}
-                          {expanded && occurrences > shownCount && (
-                            <tr key={`more-${g.key}`} className="table-row bg-bg-secondary/30">
-                              <td colSpan={5} className="table-cell text-[11px]">
-                                <div className="flex flex-wrap items-center gap-3 pl-3 text-text-muted">
-                                  <span>Showing {shownCount.toLocaleString()} of {occurrences.toLocaleString()} occurrence{occurrences === 1 ? '' : 's'}</span>
-                                  <button
-                                    onClick={() => setExpandedOccurrences(prev => {
-                                      const next = new Map(prev)
-                                      next.set(g.key, (next.get(g.key) ?? 0) + OCCURRENCE_PAGE_SIZE)
-                                      return next
-                                    })}
-                                    className="text-accent hover:underline"
-                                  >
-                                    Show {Math.min(OCCURRENCE_PAGE_SIZE, occurrences - shownCount).toLocaleString()} more
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </Fragment>
-                      )
-                    })}
                   </tbody>
                 </table>
               </div>
@@ -2089,11 +1941,7 @@ export default function TargetDetail() {
           <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
             <span className="text-text-muted">
               Showing {footerShownCount.toLocaleString()} of {footerTotalCount.toLocaleString()}
-              {isVulnTab
-                ? ' distinct issue(s)'
-                : isMonitorTab
-                ? ` distinct change group(s) · ${filteredData.length.toLocaleString()} change(s)`
-                : ''}
+              {isVulnTab ? ' distinct issue(s)' : ''}
             </span>
             <button onClick={() => setVisibleCount(c => c + PAGE)} className="btn-secondary text-xs">
               Load {Math.min(PAGE, footerTotalCount - visibleCount).toLocaleString()} more
@@ -2133,22 +1981,6 @@ export default function TargetDetail() {
           open={true}
           onClose={() => setEvidence(null)}
         />
-      )}
-      {diffView && (
-        <ChangeDiffViewer targetId={id!} url={diffView.url} kind={diffView.kind} onClose={() => setDiffView(null)} />
-      )}
-      {scopeDetail && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={() => setScopeDetail(null)}>
-          <div className="h-full w-full max-w-lg overflow-y-auto border-l border-border bg-surface-1 p-5" onClick={e => e.stopPropagation()}>
-            <div className="flex items-start justify-between gap-3">
-              <h3 className="text-sm font-semibold">Scope event</h3>
-              <Button size="sm" variant="ghost" onClick={() => setScopeDetail(null)}>Close</Button>
-            </div>
-            <div className="mt-4">
-              <ScopeEventView item={scopeDetail} variant="details" programName={scopeDetail.program_id ? programNames[scopeDetail.program_id] : undefined} />
-            </div>
-          </div>
-        </div>
       )}
 
       {/* Coverage change confirmation */}

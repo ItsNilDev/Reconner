@@ -38,6 +38,13 @@ export const LiveResults = ({ targetId, active }: { targetId: string; active: bo
   const [assetProg, setAssetProg] = useState<AssetProg | null>(null)
   const [, setTick] = useState(0) // 1s ticker so the countdown ticks between module updates
 
+  // A target switch must not show the previous target's results or ETA.
+  useEffect(() => {
+    setEvents([])
+    setProg(null)
+    setAssetProg(null)
+  }, [targetId])
+
   // Live countdown between server updates.
   useEffect(() => {
     if (!active) return
@@ -67,11 +74,10 @@ export const LiveResults = ({ targetId, active }: { targetId: string; active: bo
     return un
   }, [targetId, active])
 
-  // Seed the ETA from the running task on mount. task_progress is broadcast only
-  // when a module STARTS, so a user opening the target mid-module would otherwise
-  // see no ETA until the next module begins (possibly minutes). The tasks table
-  // already persists the live eta_seconds/module_eta_seconds/current_module, so
-  // fetch them once immediately; WS ticks then keep the banner fresh.
+  // Seed ETA and asset progress from the running task. These are broadcast only
+  // when a module or asset STARTS, so a user opening the target mid-module would
+  // otherwise see nothing until the next boundary (possibly minutes). One fetch
+  // fills both banners; WS ticks then keep them fresh.
   useEffect(() => {
     if (!active) return
     let cancelled = false
@@ -83,22 +89,9 @@ export const LiveResults = ({ targetId, active }: { targetId: string; active: bo
           module: t.current_module || '', eta: t.eta_seconds || 0, moduleEta: t.module_eta_seconds || 0,
           progress: t.progress || 0, total: t.total || 0, at: Date.now(),
         })
-      })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [targetId, active])
-
-  // Same seeding problem for asset progress: a user opening/reloading the
-  // target mid-asset would otherwise see nothing until the next asset starts.
-  useEffect(() => {
-    if (!active) return
-    let cancelled = false
-    tasksApi.list({ target_id: targetId, status: 'running', limit: '1' })
-      .then(list => {
-        if (cancelled || !list || list.length === 0) return
-        const t = list[0]
-        if (!t.current_asset) return
-        setAssetProg(prev => prev ?? { host: t.current_asset || '', done: t.assets_done || 0, total: t.assets_total || 0 })
+        if (t.current_asset) {
+          setAssetProg(prev => prev ?? { host: t.current_asset || '', done: t.assets_done || 0, total: t.assets_total || 0 })
+        }
       })
       .catch(() => {})
     return () => { cancelled = true }

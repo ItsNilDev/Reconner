@@ -4,7 +4,7 @@ import { targets as targetsApi } from '../lib/api'
 import { Button, Input, Modal, Spinner, EmptyState, Badge } from '../components/ui'
 import { ScanModal } from '../components/targets/ScanModal'
 import { useUIStore } from '../store/ui'
-import { timeAgo, cn } from '../lib/utils'
+import { timeAgo, timeUntil, cn } from '../lib/utils'
 import { ws } from '../lib/websocket'
 import type { Target } from '../types'
 
@@ -105,7 +105,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
   const selectedVisibleNames = coverageTargets.filter(t => selected.has(t.id)).map(t => t.name || t.domain)
 
   const handleBulkDelete = async () => {
-    if (selected.size === 0) return
+    if (selectedVisibleIDs.length === 0) return
     setBulkDeleting(true)
     try {
       const res = await targetsApi.bulkDelete(selectedVisibleIDs)
@@ -123,7 +123,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
   // enforcement point: a project with network assets is refused a breadth
   // flip, and the response reports the refusal per project.
   const applyBulkCoverage = async (toBreadth: boolean) => {
-    if (selected.size === 0) return
+    if (selectedVisibleIDs.length === 0) return
     setCoverageBusy(true)
     try {
       const res = await targetsApi.bulkCoverage(selectedVisibleIDs, toBreadth)
@@ -158,8 +158,10 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => { void load(search, true) }, 250)
     }
-    const offs = ['target_created', 'target_updated', 'target_deleted', 'task_started', 'task_finished']
-      .map(event => ws.on(event, refresh))
+    const offs = [
+      'target_created', 'target_updated', 'target_deleted',
+      'task_started', 'task_finished', 'task_cancelled', 'task_paused', 'task_resumed',
+    ].map(event => ws.on(event, refresh))
     return () => {
       if (timer) clearTimeout(timer)
       offs.forEach(off => off())
@@ -338,7 +340,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} aria-label="Filter by scan status"
           className="bg-surface-alt border border-border rounded px-2 py-1.5 text-xs text-text-primary">
           <option value="" className="bg-surface-3">All statuses</option>
-          {['running', 'pending', 'paused', 'failed', 'idle'].map(s => <option key={s} value={s} className="bg-surface-3 capitalize">{s}</option>)}
+          {['running', 'pending', 'paused', 'finished', 'failed', 'idle'].map(s => <option key={s} value={s} className="bg-surface-3 capitalize">{s}</option>)}
         </select>
         {/* Coverage axis: deep scans vs breadth watch rounds. */}
         <div className="flex items-center gap-1 rounded border border-border bg-surface-alt p-0.5" role="group" aria-label="Filter by coverage">
@@ -378,15 +380,15 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
               <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} className="accent-accent w-3.5 h-3.5" />
               Select all
             </label>
-            <span className="text-text-muted">{selected.size} selected</span>
+            <span className="text-text-muted">{selectedVisibleIDs.length} selected</span>
             {/* The coverage action is pointless in the Network view: a network
                 project can never run watch rounds. */}
             {filterKind !== 'network' && (
-              <Button size="sm" variant="ghost" disabled={selected.size === 0} onClick={() => setCoverageOpen(true)}>
+              <Button size="sm" variant="ghost" disabled={selectedVisibleIDs.length === 0} onClick={() => setCoverageOpen(true)}>
                 Set coverage
               </Button>
             )}
-            <Button size="sm" variant="danger" disabled={selected.size === 0} onClick={() => setBulkOpen(true)}>
+            <Button size="sm" variant="danger" disabled={selectedVisibleIDs.length === 0} onClick={() => setBulkOpen(true)}>
               Delete selected
             </Button>
           </div>
@@ -443,6 +445,12 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
                       {t.watch_only && t.watch_paused && (
                         <span className="shrink-0 rounded bg-severity-medium/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-medium" title="Watching is paused">
                           Paused
+                        </span>
+                      )}
+                      {t.watch_only && t.watch_paused && (t.watch_fail_count || 0) > 0 && (
+                        <span className="shrink-0 rounded bg-severity-critical/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-critical"
+                          title={`Auto-paused after ${t.watch_fail_count} failed round(s)`}>
+                          {t.watch_fail_count} failed
                         </span>
                       )}
                     </div>
@@ -502,8 +510,8 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
                   </div>
                   {t.watch_only && (
                     <div className="flex justify-between text-xs text-text-muted">
-                      <span>Breadth watch</span>
-                      <span>{t.watch_last_run ? timeAgo(t.watch_last_run) : 'never'}</span>
+                      <span>Watch: {t.watch_last_run ? timeAgo(t.watch_last_run) : 'never'}</span>
+                      <span>Next: {t.watch_paused ? 'paused' : t.watch_next_run ? timeUntil(t.watch_next_run) : 'not scheduled'}</span>
                     </div>
                   )}
                   {t.monitor_last_run && (
@@ -618,8 +626,8 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
       <Modal open={coverageOpen} onClose={() => !coverageBusy && setCoverageOpen(false)} title="Set coverage" width="sm">
         <div className="space-y-4">
           <p className="text-sm text-text-secondary">
-            Apply the scan tier to <span className="font-semibold text-text-primary">{selected.size}</span> selected
-            project{selected.size === 1 ? '' : 's'}.
+            Apply the scan tier to <span className="font-semibold text-text-primary">{selectedVisibleIDs.length}</span> selected
+            project{selectedVisibleIDs.length === 1 ? '' : 's'}.
           </p>
           <div className="space-y-2">
             <label className="flex items-start gap-2 cursor-pointer">
@@ -655,7 +663,7 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
           <div className="flex justify-end gap-2 pt-2 border-t border-border">
             <Button variant="ghost" disabled={coverageBusy} onClick={() => setCoverageOpen(false)}>Cancel</Button>
             <Button variant="primary" loading={coverageBusy} onClick={() => applyBulkCoverage(coverageChoice === 'breadth')}>
-              Apply to {selected.size}
+              Apply to {selectedVisibleIDs.length}
             </Button>
           </div>
         </div>

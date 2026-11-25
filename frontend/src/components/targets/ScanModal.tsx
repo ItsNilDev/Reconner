@@ -108,6 +108,14 @@ export const ScanModal = ({ target, asset, open, onClose, onStarted }: Props) =>
     : (target.name?.trim()
       || (hostCount > 1 ? `${hostCount} hosts` : (target.domain.length > 40 ? target.domain.slice(0, 40) + '…' : target.domain)))
 
+  // A breadth-watch project normally runs passive rounds only. Starting a scan
+  // from here runs active Deep modules outside that schedule — warn up front.
+  const watchModeBanner = target.watch_only ? (
+    <div className="rounded-lg border border-severity-medium/30 bg-severity-medium/10 p-3 text-[11px] leading-5 text-severity-medium">
+      This project is in Breadth Watch mode. Starting this scan runs active Deep modules outside the breadth schedule.
+    </div>
+  ) : null
+
   // Start a scan against the whole target, or against just this asset when the
   // modal was opened for one.
   const startModules = (mods: string[]) =>
@@ -188,7 +196,7 @@ export const ScanModal = ({ target, asset, open, onClose, onStarted }: Props) =>
   const idorReady = !idorSelected || idCount >= 2 || (idorA.trim() !== '' && idorB.trim() !== '')
 
 	if (scopeKind === 'mixed' && !asset) {
-		return <Modal open={open} onClose={onClose} title={`Scan — ${label}`} width="md"><div className="space-y-4"><div className="rounded-xl border border-accent/30 bg-accent/[.06] p-4"><p className="text-sm font-semibold text-text-primary">Choose one asset to scan</p><p className="mt-2 text-xs leading-5 text-text-secondary">This project contains both web and network scope. Start the scan from an individual asset below so Reconner can show exactly the compatible web or network pipeline and never mix them accidentally.</p></div><div className="flex justify-end"><Button variant="ghost" onClick={onClose}>Close</Button></div></div></Modal>
+		return <Modal open={open} onClose={onClose} title={`Scan — ${label}`} width="md"><div className="space-y-4">{watchModeBanner}<div className="rounded-xl border border-accent/30 bg-accent/[.06] p-4"><p className="text-sm font-semibold text-text-primary">Choose one asset to scan</p><p className="mt-2 text-xs leading-5 text-text-secondary">This project contains both web and network scope. Start the scan from an individual asset below so Reconner can show exactly the compatible web or network pipeline and never mix them accidentally.</p></div><div className="flex justify-end"><Button variant="ghost" onClick={onClose}>Close</Button></div></div></Modal>
 	}
 
   if (networkMode) {
@@ -237,6 +245,7 @@ export const ScanModal = ({ target, asset, open, onClose, onStarted }: Props) =>
 			<div className="flex items-center justify-end gap-2"><Button variant="ghost" onClick={onClose}>Cancel</Button><Button variant="primary" loading={loading} onClick={startNetwork}>▶ Start Network Scan</Button></div>
 		}>
 			<div className="space-y-5">
+				{watchModeBanner}
 				<div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
 					{!networkOnly && <button type="button" onClick={() => setNetworkMode(false)} className="rounded-lg border border-border px-3 py-2 text-left"><span className="block text-xs font-semibold">Web scan</span><span className="text-[10px] text-text-muted">Application pipeline</span></button>}
 					{(['fast','normal','deep'] as const).map(profile => <button key={profile} type="button" onClick={() => applyNetworkProfile(profile)} className={cn('rounded-lg border px-3 py-2 text-left',networkProfile===profile?'border-accent bg-accent-muted text-accent':'border-border text-text-secondary')}><span className="block text-xs font-semibold capitalize">Network {profile}</span><span className="text-[10px] text-text-muted">{profile==='fast'?'Important ports':profile==='normal'?'Top 1000 + validation':'All TCP ports + validation'}</span></button>)}
@@ -357,6 +366,7 @@ export const ScanModal = ({ target, asset, open, onClose, onStarted }: Props) =>
   return (
     <Modal open={open} onClose={onClose} title={`Scan — ${label}`} width="xl" footer={footer}>
       <div className="space-y-4">
+        {watchModeBanner}
         {/* Scan profile presets (Acunetix/Burp-style). */}
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-wider text-text-muted mb-1.5">Scan profile</p>
