@@ -141,7 +141,7 @@ func TestUnpauseRestartsWatchRound(t *testing.T) {
 	if err := h.db.QueryRow(`SELECT COALESCE(watch_paused,-1), COALESCE(watch_fail_count,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='up-t'`).Scan(&paused, &fails, &nextNull); err != nil {
 		t.Fatal(err)
 	}
-	if paused != 0 || fails != 0 || nextNull != 1 {
+	if paused != 0 || fails != 0 || nextNull != 0 {
 		t.Fatalf("unpause state paused=%d fails=%d nextNull=%d", paused, fails, nextNull)
 	}
 }

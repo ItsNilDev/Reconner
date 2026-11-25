@@ -782,6 +782,12 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	if _, err := tx.ExecContext(ctx, `UPDATE targets SET exclude_scope=? WHERE id=?`, strings.Join(merged, "\n"), targetID); err != nil {
 		return err
 	}
+	// Commit the deny snapshot before recording rule events. createRuleEvent
+	// writes through s.db on another connection; an open write transaction here
+	// would block that insert until the SQLite busy timeout and drop the event.
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 
 	// A deny rule can be added or withdrawn without any asset row. Record the
 	// rule itself as an approved upstream event so Changes shows the real edit.
@@ -807,9 +813,6 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 				ruleAdded++
 			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
 	}
 	if added+removed+modified+ruleAdded+ruleRemoved > 0 {
 		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified, %d rules added, %d rules withdrawn. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified, ruleAdded, ruleRemoved)
