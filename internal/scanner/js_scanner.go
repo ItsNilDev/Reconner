@@ -265,22 +265,36 @@ func (s *JSScanner) Run(ctx context.Context, targetID string, logFn LogFunc) err
 	return nil
 }
 
+type secretVerdict int
+
+const (
+	secretInconclusive secretVerdict = iota
+	secretConfirmed
+	secretInvalid
+)
+
 // verifySecrets actively checks discovered API keys against their providers and
 // flags the ones that are live (verified=1, severity bumped to critical). Keys
-// that fail verification are downgraded to info to cut triage noise.
+// that explicitly fail provider auth (401/403 or negative 200 payload) are
+// downgraded to info; transient errors, rate limits (429), 5xx responses, and
+// unsupported providers are inconclusive and never downgraded.
 func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn LogFunc) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, type, value FROM js_findings
+		SELECT id, js_file_id, type, value FROM js_findings
 		WHERE target_id = ? AND type IN ('aws_key','slack_token','google_api','stripe_key','sendgrid','github_token','secret')
 	`, targetID)
 	if err != nil {
+		logFn("warn", "js_analysis", fmt.Sprintf("Failed to query candidate secrets: %v", err))
+		if s.logger != nil {
+			s.logger.Warn("Failed to query candidate secrets", "target_id", targetID, "error", err)
+		}
 		return
 	}
-	type row struct{ id, typ, val string }
+	type row struct{ id, jsFileID, typ, val string }
 	var items []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.typ, &r.val); err == nil {
+		if err := rows.Scan(&r.id, &r.jsFileID, &r.typ, &r.val); err == nil {
 			items = append(items, r)
 		}
 	}
@@ -296,19 +310,62 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 		if ctx.Err() != nil {
 			return
 		}
-		ok := verifySecretValue(ctx, it.typ, it.val)
-		if ok {
-			_, _ = s.db.Exec(`UPDATE js_findings SET verified = 1, severity = 'critical' WHERE id = ?`, it.id)
+		switch verifySecretValue(ctx, it.typ, it.val) {
+		case secretConfirmed:
+			if _, err := s.db.ExecContext(ctx, `UPDATE js_findings SET verified = 1, severity = 'critical' WHERE id = ?`, it.id); err != nil {
+				logFn("warn", "js_analysis", fmt.Sprintf("Failed to mark verified secret %s: %v", it.id, err))
+				if s.logger != nil {
+					s.logger.Warn("Failed to mark verified secret", "target_id", targetID, "finding_id", it.id, "error", err)
+				}
+				continue
+			}
 			verified++
+			var jsURL string
+			if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(url,'') FROM js_files WHERE id = ?`, it.jsFileID).Scan(&jsURL); err != nil && s.logger != nil {
+				s.logger.Warn("Failed to look up JS file URL for verified secret", "target_id", targetID, "js_file_id", it.jsFileID, "error", err)
+			}
+			obsIDs, obsErr := RecordDetectorObservation(ctx, s.db, DetectorObservation{
+				TargetID:        targetID,
+				Type:            "verified_secret_" + it.typ,
+				Subtype:         it.typ,
+				Severity:        "critical",
+				URL:             jsURL,
+				Method:          "GET",
+				Parameter:       it.typ,
+				Location:        "js",
+				Evidence:        fmt.Sprintf("Live %s credential confirmed against provider API", it.typ),
+				Source:          "js_scanner",
+				DetectionMethod: "secret-provider-verify",
+				Confidence:      99,
+				Priority:        99,
+				Provenance:      "js_findings:" + it.id,
+				Verdict:         VerifyVerified,
+			})
+			if obsErr != nil {
+				logFn("warn", "js_analysis", fmt.Sprintf("Failed to record verified secret finding for %s: %v", it.typ, obsErr))
+				if s.logger != nil {
+					s.logger.Warn("Failed to record verified secret finding", "target_id", targetID, "type", it.typ, "error", obsErr)
+				}
+			}
 			logFn("warn", "js_analysis", fmt.Sprintf("VERIFIED live secret: %s", it.typ))
 			if s.broadcast != nil {
 				s.broadcast("new_vuln_finding", map[string]any{
-					"target_id": targetID, "type": "verified_secret_" + it.typ, "url": "",
+					"target_id":  targetID,
+					"type":       "verified_secret_" + it.typ,
+					"url":        jsURL,
+					"finding_id": obsIDs.FindingID,
 				})
 			}
-		} else {
-			// Unverifiable → likely placeholder/expired; lower the noise.
-			_, _ = s.db.Exec(`UPDATE js_findings SET severity = 'info' WHERE id = ? AND verified = 0`, it.id)
+		case secretInvalid:
+			// Explicitly rejected by provider → likely placeholder/expired; lower the noise.
+			if _, err := s.db.ExecContext(ctx, `UPDATE js_findings SET severity = 'info' WHERE id = ? AND verified = 0`, it.id); err != nil {
+				logFn("warn", "js_analysis", fmt.Sprintf("Failed to downgrade invalid secret %s: %v", it.id, err))
+				if s.logger != nil {
+					s.logger.Warn("Failed to downgrade invalid secret", "target_id", targetID, "finding_id", it.id, "error", err)
+				}
+			}
+		case secretInconclusive:
+			// Transient network/rate-limit/5xx or unsupported provider: preserve existing severity.
 		}
 	}
 	logFn("info", "js_analysis", fmt.Sprintf("Secret verification done. %d live secrets confirmed.", verified))
@@ -317,10 +374,10 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 var secretHTTPClient = ExternalClient(10 * time.Second)
 
 // verifySecretValue makes a minimal, read-only auth call to the provider.
-func verifySecretValue(ctx context.Context, typ, value string) bool {
+func verifySecretValue(ctx context.Context, typ, value string) secretVerdict {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return false
+		return secretInvalid
 	}
 	switch typ {
 	case "slack_token":
@@ -340,29 +397,41 @@ func verifySecretValue(ctx context.Context, typ, value string) bool {
 		u := "https://maps.googleapis.com/maps/api/geocode/json?address=test&key=" + value
 		return verifyHTTP(ctx, "GET", u, nil, `"results"`)
 	}
-	return false
+	return secretInconclusive
 }
 
-func verifyHTTP(ctx context.Context, method, url string, headers map[string]string, wantSubstr string) bool {
+func verifyHTTP(ctx context.Context, method, url string, headers map[string]string, wantSubstr string) secretVerdict {
 	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, method, url, nil)
 	if err != nil {
-		return false
+		return secretInconclusive
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := secretHTTPClient.Do(req)
 	if err != nil {
-		return false
+		return secretInconclusive
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
 	resp.Body.Close()
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return false
+	if readErr != nil {
+		return secretInconclusive
 	}
-	return strings.Contains(string(body), wantSubstr)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return secretInconclusive
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return secretInvalid
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if strings.Contains(string(body), wantSubstr) {
+			return secretConfirmed
+		}
+		return secretInvalid
+	}
+	return secretInconclusive
 }
 
 func isJSURL(u string) bool {
@@ -744,25 +813,34 @@ func (s *JSScanner) analyzeJSFile(ctx context.Context, targetID, jsURL string) e
 }
 
 func (s *JSScanner) analyzeJSContent(ctx context.Context, targetID, jsURL string, content []byte, client *http.Client) error {
-
 	hash := fmt.Sprintf("%x", sha256.Sum256(content))
+	bodyBytes := content
+	if len(bodyBytes) > monitorBodyCaptureCap {
+		bodyBytes = bodyBytes[:monitorBodyCaptureCap]
+	}
+	cappedBody := string(bodyBytes)
 	jsFileID := uuid.New().String()
 
-	_, err := s.db.Exec(`
-		INSERT INTO js_files (id, target_id, url, size, hash, analyzed, last_seen)
-		VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO js_files (id, target_id, url, size, hash, body, analyzed, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
 		ON CONFLICT(target_id, url) DO UPDATE SET
+			old_hash = CASE WHEN js_files.hash <> '' AND js_files.hash <> excluded.hash THEN js_files.hash ELSE js_files.old_hash END,
+			old_body = CASE WHEN js_files.hash <> '' AND js_files.hash <> excluded.hash THEN js_files.body ELSE js_files.old_body END,
 			size = excluded.size,
 			hash = excluded.hash,
+			body = excluded.body,
 			analyzed = 1,
 			last_seen = CURRENT_TIMESTAMP
-	`, jsFileID, targetID, jsURL, len(content), hash)
+	`, jsFileID, targetID, jsURL, len(content), hash, cappedBody)
 	if err != nil {
 		return err
 	}
 
 	var existingID string
-	_ = s.db.QueryRow("SELECT id FROM js_files WHERE target_id = ? AND url = ?", targetID, jsURL).Scan(&existingID)
+	if err := s.db.QueryRowContext(ctx, "SELECT id FROM js_files WHERE target_id = ? AND url = ?", targetID, jsURL).Scan(&existingID); err != nil && s.logger != nil {
+		s.logger.Warn("Failed to resolve js_files id after upsert", "target_id", targetID, "url", jsURL, "error", err)
+	}
 	if existingID != "" {
 		jsFileID = existingID
 	}
@@ -791,11 +869,12 @@ func (s *JSScanner) analyzeJSContent(ctx context.Context, targetID, jsURL string
 		f.ID = uuid.New().String()
 		f.TargetID = targetID
 		f.JSFileID = jsFileID
-		_ = s.storeFinding(f)
+		if err := s.storeFinding(f); err != nil && s.logger != nil {
+			s.logger.Warn("Failed to store JS finding", "target_id", targetID, "type", f.Type, "error", err)
+		}
 	}
 
 	// LIBRARY FINGERPRINT → KNOWN-CVE: flag outdated front-end libs with public
-	// CVEs. Version-based ⇒ surfaced as a CANDIDATE, never a confirmed finding.
 	for _, lib := range fingerprintVulnerableLibraries(string(content)) {
 		s.storeLibraryCVE(targetID, jsURL, lib)
 	}

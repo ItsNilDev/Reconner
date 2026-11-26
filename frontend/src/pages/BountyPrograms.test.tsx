@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import BountyPrograms from './BountyPrograms'
 
 function ok(data: unknown) {
@@ -59,5 +59,48 @@ describe('BountyPrograms favoriting', () => {
     const policySelect = screen.getByDisplayValue('Notify only')
     await user.selectOptions(policySelect, 'full_scan')
     await waitFor(() => expect(lastPolicy).toBe('full_scan'))
+  })
+})
+
+describe('BountyPrograms collapsible filters and detail patching', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('collapses secondary filters by default, shows active badge, and patches opened program without refetching list', async () => {
+    let listCalls = 0
+    let detailCalls = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/bounty/favorites')) return ok({})
+      if (url.includes('/bounty/status')) return ok([])
+      if (url.includes('/bounty/programs/prog-1')) {
+        detailCalls++
+        return ok({ ...program, in_scope_count: 9, assets: [] })
+      }
+      if (url.includes('/bounty/programs')) {
+        listCalls++
+        return ok({ programs: [program], total: 1, page: 1, limit: 30 })
+      }
+      return ok({})
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><BountyPrograms /></MemoryRouter>)
+    await screen.findByText('Acme Corp')
+
+    // Secondary filter is collapsed initially.
+    expect(screen.queryByPlaceholderText('Min assets')).not.toBeInTheDocument()
+
+    // Opening More filters reveals secondary inputs and tracks active count.
+    await user.click(screen.getByRole('button', { name: /More filters/ }))
+    const minAssets = screen.getByPlaceholderText('Min assets')
+    await user.type(minAssets, '3')
+    expect(screen.getByRole('button', { name: /More filters/ })).toHaveTextContent('1')
+
+    // Wait for debounced list reload from filter change, then open program detail.
+    await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2))
+    const callsBeforeOpen = listCalls
+    await user.click(screen.getByText('Acme Corp'))
+    await waitFor(() => expect(detailCalls).toBe(1))
+    expect(listCalls).toBe(callsBeforeOpen)
   })
 })

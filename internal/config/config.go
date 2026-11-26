@@ -409,6 +409,11 @@ type Config struct {
 	// it is never marshaled back into the file). Save() writes here.
 	path string
 
+	// mu serializes runtime config mutations and persists (e.g. System settings
+	// and scan-config PATCHes) so validation/rollback and JSON marshaling never
+	// race with concurrent updates or reads.
+	mu sync.RWMutex
+
 	// concurrencyMu guards the three two-tier concurrency limits. The API writes
 	// them from an HTTP goroutine (System -> Scanning PATCH) while the scheduler
 	// reads them on every admission decision. Without a lock, a PATCH can land
@@ -433,14 +438,38 @@ func (c *Config) SetConcurrencyLimits(global, deep, watch int) {
 	c.Limits.MaxConcurrentWatchScans = watch
 }
 
+// Lock acquires the config write lock for atomic multi-field updates paired
+// with SaveLocked.
+func (c *Config) Lock() { c.mu.Lock() }
+
+// Unlock releases the config write lock.
+func (c *Config) Unlock() { c.mu.Unlock() }
+
+// RLock acquires the config read lock.
+func (c *Config) RLock() { c.mu.RLock() }
+
+// RUnlock releases the config read lock.
+func (c *Config) RUnlock() { c.mu.RUnlock() }
+
 // Save marshals the config back to the file it was loaded from (0600), so
 // settings edited at runtime — e.g. API keys entered in the System page —
 // persist across restarts. No-op with an error if the path is unknown.
 func (c *Config) Save() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.SaveLocked()
+}
+
+// SaveLocked writes the config to disk while the caller already holds c.Lock()
+// (or c.RLock()). Callers mutating multiple fields should hold Lock, apply
+// changes, call SaveLocked, and roll back on error before releasing Lock.
+func (c *Config) SaveLocked() error {
 	if c.path == "" {
 		return fmt.Errorf("config path unknown; cannot save")
 	}
+	c.concurrencyMu.RLock()
 	data, err := json.MarshalIndent(c, "", "  ") // #nosec G117 -- deployment secrets must be persisted in the atomic mode-0600 config file
+	c.concurrencyMu.RUnlock()
 	if err != nil {
 		return err
 	}

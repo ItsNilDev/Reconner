@@ -56,7 +56,7 @@ type ScanDraft = {
   watchHTTPThreads: number; watchHTTPRateLimit: number; watchRoundsMinGap: number;
   watchRoundIntervalHours: number;
   watchSourceTimeoutMinutes: number; watchSources: string[];
-  watchRowsRetentionDays: number; watchScopeEventsRetentionDays: number;
+  watchRowsRetentionDays: number; watchScopeEventsRetentionDays: number; watchChangesRetentionDays: number;
   watchNotifyHostCap: number; watchFailLimit: number;
 }
 
@@ -93,6 +93,7 @@ const scanDraftFrom = (sc: ScanConfig): ScanDraft => ({
     : ['subfinder', 'assetfinder', 'chaos', 'findomain']),
   watchRowsRetentionDays: sc.watch_rows_retention_days || 30,
   watchScopeEventsRetentionDays: sc.watch_scope_events_retention_days || 180,
+  watchChangesRetentionDays: sc.watch_changes_retention_days || 180,
   watchNotifyHostCap: sc.watch_notify_host_cap || 20,
   watchFailLimit: sc.watch_fail_limit || 3,
 })
@@ -104,6 +105,7 @@ export default function System() {
   const [installing, setInstalling] = useState<Record<string, boolean>>({})
   const [stats, setStats] = useState<Record<string,number>>({})
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [templateLog, setTemplateLog] = useState<SystemLogLine[]>([])
   const [updatingTemplates, setUpdatingTemplates] = useState(false)
   const [apiKeys, setApiKeys] = useState<ApiKeyState[]>([])
@@ -117,6 +119,7 @@ export default function System() {
   const { info: updateInfo, checking: checkingUpdate, refresh: refreshUpdate, showDetails: showUpdateDetails } = useUpdateCenter()
   const templateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const load = async () => {
+    setLoadError('')
     try {
       const [t, cat, s, ks, sc] = await Promise.all([
         system.tools(),
@@ -130,8 +133,9 @@ export default function System() {
         setScanCfg(sc)
         setScanDraft(scanDraftFrom(sc))
       }
-    }
-    catch { /**/ } finally { setLoading(false) }
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Failed to load system status')
+    } finally { setLoading(false) }
   }
 
   const installTool = async (name: string) => {
@@ -192,6 +196,7 @@ export default function System() {
         watch_enumeration_sources: scanDraft.watchSources,
         watch_rows_retention_days: scanDraft.watchRowsRetentionDays,
         watch_scope_events_retention_days: scanDraft.watchScopeEventsRetentionDays,
+        watch_changes_retention_days: scanDraft.watchChangesRetentionDays,
         watch_notify_host_cap: scanDraft.watchNotifyHostCap,
         watch_fail_limit: scanDraft.watchFailLimit,
       })
@@ -274,6 +279,13 @@ export default function System() {
           <Button size="sm" variant="ghost" onClick={load}>↻ Refresh</Button>
         </div>
       </header>
+
+      {loadError && (
+        <div className="rounded-xl border border-severity-high/30 bg-severity-high/10 px-4 py-3 flex items-center justify-between gap-3 text-xs text-severity-high">
+          <span>Failed to load system data: {loadError}</span>
+          <Button size="sm" variant="secondary" onClick={load}>Retry</Button>
+        </div>
+      )}
 
       <div className="flex gap-1 overflow-x-auto no-scrollbar border-b border-border" role="tablist">
         {tabs.filter(t => !t.hidden).map(t => (
@@ -551,6 +563,13 @@ export default function System() {
                         onChange={e => setScanDraft(d => d && ({ ...d, watchScopeEventsRetentionDays: parseInt(e.target.value, 10) || 180 }))}
                         className="input font-mono text-xs w-full mt-1" />
                       <p className="text-[10px] text-text-muted mt-1">How long the landed-scope audit trail is kept.</p>
+                    </div>
+                    <div>
+                      <label htmlFor="watchChangesRetentionDays" className="text-xs font-medium">Watch changes history (days)</label>
+                      <input id="watchChangesRetentionDays" type="number" min={1} max={3650} value={scanDraft.watchChangesRetentionDays}
+                        onChange={e => setScanDraft(d => d && ({ ...d, watchChangesRetentionDays: numOr(e.target.value, 180, 1, 3650) }))}
+                        className="input font-mono text-xs w-full mt-1" />
+                      <p className="text-[10px] text-text-muted mt-1">How long watch-sourced change entries are kept (1–3650 days).</p>
                     </div>
                     <div>
                       <label className="text-xs font-medium">Hosts per alert</label>

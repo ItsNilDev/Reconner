@@ -31,6 +31,7 @@ const scanCfg = {
   watch_enumeration_sources: ['subfinder', 'assetfinder'],
   watch_rows_retention_days: 30,
   watch_scope_events_retention_days: 180,
+  watch_changes_retention_days: 180,
   watch_notify_host_cap: 20,
   watch_fail_limit: 3,
   watch_module_set: ['subdomain_enum', 'http_probe'],
@@ -139,5 +140,47 @@ describe('System scanning concurrency', () => {
     expect(patchBody!.max_concurrent_watch_scans).toBe(16)
     expect(patchBody!.max_concurrent_deep_scans).toBe(8)
     expect(patchBody!.max_concurrent_scans).toBe(32)
+  })
+
+  it('loads, clamps, and saves watch_changes_retention_days', async () => {
+    const user = userEvent.setup()
+    renderSystem()
+    const tab = await screen.findByRole('tab', { name: 'Toolchain' })
+    await user.click(tab)
+    await waitFor(() => expect(screen.getByText('Scanning configuration')).toBeInTheDocument())
+
+    const changesInput = screen.getByLabelText('Watch changes history (days)') as HTMLInputElement
+    expect(changesInput.value).toBe('180')
+
+    fireEvent.change(changesInput, { target: { value: '9999' } })
+    await user.click(screen.getByRole('button', { name: 'Save configuration' }))
+    await waitFor(() => expect(patchBody).not.toBeNull())
+    expect(patchBody!.watch_changes_retention_days).toBe(3650)
+  })
+
+  it('shows an error banner with Retry when initial system load fails', async () => {
+    let fail = true
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url === '/api/tools/status' && fail) {
+        return new Response(JSON.stringify({ error: 'backend unavailable' }), { status: 503 })
+      }
+      if (url.startsWith('/api/system/update-check')) {
+        return ok({ enabled: true, current: '5.1.1', latest: '5.1.1', channel: 'stable', update_available: false, checked_at: '' })
+      }
+      if (url === '/api/tools/status') return ok({ nuclei: true })
+      if (url === '/api/tools/catalog') return ok([])
+      if (url === '/api/system/stats') return ok({})
+      if (url === '/api/system/settings') return ok({ api_keys: [] })
+      if (url === '/api/system/scan-config') return ok(scanCfg)
+      return ok({})
+    }))
+    const user = userEvent.setup()
+    renderSystem()
+
+    await screen.findByText(/backend unavailable/)
+    fail = false
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(screen.queryByText(/backend unavailable/)).not.toBeInTheDocument())
   })
 })

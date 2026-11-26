@@ -315,8 +315,12 @@ func upsertFindingProjection(ctx context.Context, db *database.DB, candidateID s
 	case CandRejected:
 		// Keep a formerly projected row consistent, but do not create rejected
 		// noise in vuln_findings. The authoritative rejection remains in candidates.
-		_, _ = db.ExecContext(ctx, `UPDATE vuln_findings SET status='rejected', lifecycle=?, confidence=0
-			WHERE candidate_id=?`, lifecycle, candidateID)
+		// Operator triage decisions (confirmed / accepted_risk / fixed) are never
+		// overwritten by automated rejection.
+		if _, err := db.ExecContext(ctx, `UPDATE vuln_findings SET status='rejected', lifecycle=?, confidence=0
+			WHERE candidate_id=? AND COALESCE(triage,'') NOT IN ('confirmed','accepted_risk','fixed')`, lifecycle, candidateID); err != nil {
+			return fmt.Errorf("reject finding projection: %w", err)
+		}
 		return nil
 	}
 	if status == "" {
@@ -373,7 +377,9 @@ func upsertFindingProjection(ctx context.Context, db *database.DB, candidateID s
 	if err := db.QueryRowContext(ctx, `SELECT id FROM vuln_findings
 		WHERE target_id=? AND type=? AND url=? AND COALESCE(parameter,'')=?`,
 		c.TargetID, c.Type, c.URL, c.Parameter).Scan(&findingID); err == nil {
-		_, _ = db.ExecContext(ctx, `UPDATE candidates SET finding_id=? WHERE id=?`, findingID, candidateID)
+		if _, err := db.ExecContext(ctx, `UPDATE candidates SET finding_id=? WHERE id=?`, findingID, candidateID); err != nil {
+			return fmt.Errorf("link candidate finding_id: %w", err)
+		}
 	}
 	return nil
 }

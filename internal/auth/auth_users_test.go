@@ -142,6 +142,50 @@ func TestLastAdminCannotBeRemovedOrDemoted(t *testing.T) {
 	}
 }
 
+func TestDeleteUserReassignsOwnedTargets(t *testing.T) {
+	a := newTestAuth(t)
+	admins, err := a.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminID := admins[0].ID
+
+	member, err := a.CreateUser("former-analyst", "supersecret", RoleMember)
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	if _, err := a.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES
+		('member-t1', 'one.example.test', ?),
+		('member-t2', 'two.example.test', ?),
+		('admin-t1', 'admin.example.test', ?)`, member.ID, member.ID, adminID); err != nil {
+		t.Fatalf("insert targets: %v", err)
+	}
+
+	if err := a.DeleteUser(member.ID); err != nil {
+		t.Fatalf("delete member: %v", err)
+	}
+	if _, err := a.GetUser(member.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted user still exists: err=%v", err)
+	}
+
+	for _, tid := range []string{"member-t1", "member-t2"} {
+		var ownerID int64
+		if err := a.db.QueryRow(`SELECT owner_id FROM targets WHERE id = ?`, tid).Scan(&ownerID); err != nil {
+			t.Fatalf("query target %s: %v", tid, err)
+		}
+		if ownerID != 0 {
+			t.Fatalf("target %s owner_id = %d, want 0 after owner deletion", tid, ownerID)
+		}
+	}
+	var adminTargetOwner int64
+	if err := a.db.QueryRow(`SELECT owner_id FROM targets WHERE id = 'admin-t1'`).Scan(&adminTargetOwner); err != nil {
+		t.Fatalf("query admin target: %v", err)
+	}
+	if adminTargetOwner != adminID {
+		t.Fatalf("admin target owner_id = %d, want %d", adminTargetOwner, adminID)
+	}
+}
+
 func TestAdminPasswordResetInvalidatesOld(t *testing.T) {
 	a := newTestAuth(t)
 	u, _ := a.CreateUser("rot", "oldpassword", RoleMember)

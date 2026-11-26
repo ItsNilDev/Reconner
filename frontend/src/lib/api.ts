@@ -371,6 +371,45 @@ export const findings = {
     const q = params ? '?' + new URLSearchParams(params).toString() : ''
     return req<AllFinding[]>(`/findings${q}`)
   },
+  allPage: async (params?: {
+    status?: string
+    severity?: string
+    type?: string
+    source?: string
+    target_id?: string
+    q?: string
+    page?: number
+    limit?: number
+  }): Promise<PagedResult<AllFinding>> => {
+    const qs = new URLSearchParams()
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v))
+      }
+    }
+    const q = qs.toString()
+    const res = await fetch(`${BASE}/findings${q ? '?' + q : ''}`, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const text = await res.text()
+    if (!res.ok) {
+      let msg = text
+      try { msg = JSON.parse(text).error || text } catch { /**/ }
+      throw new APIError(res.status, msg)
+    }
+    const json = text ? JSON.parse(text) : {}
+    const arr: AllFinding[] = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : []
+    if (typeof json?.total === 'number') {
+      return {
+        data: arr,
+        total: json.total,
+        page: typeof json?.page === 'number' ? json.page : (params?.page ?? 1),
+        limit: typeof json?.limit === 'number' ? json.limit : (params?.limit ?? arr.length),
+      }
+    }
+    return { data: arr, total: arr.length, page: 1, limit: arr.length }
+  },
 }
 
 export interface PagedResult<T> {
@@ -435,6 +474,7 @@ export interface AllFinding {
   id: string; target_id: string; domain: string; type: string; severity: string
   url: string; parameter: string; payload: string; confidence: number; priority: number
   status: string; evidence: string; created_at: string
+  source?: string; source_tab?: string
 }
 
 export const tasks = {
@@ -476,6 +516,7 @@ export interface ScanConfig {
   watch_enumeration_sources: string[]
   watch_rows_retention_days: number
   watch_scope_events_retention_days: number
+  watch_changes_retention_days?: number
   watch_notify_host_cap: number
   watch_fail_limit: number
   watch_module_set: string[]

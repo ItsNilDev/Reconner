@@ -2,13 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { bounty, changes, targets as targetsApi, watchApi } from '../../lib/api'
 import type { ChangeEntry, Target, WatchRound } from '../../types'
-import { Badge, Button, CopyButton, Empty, SkeletonRows } from '../ui'
+import { Badge, Button, CopyButton, Drawer, Empty, SkeletonRows } from '../ui'
 import { cn, safeHref, timeAgo } from '../../lib/utils'
 import { ws } from '../../lib/websocket'
 import { notifyNotificationsChanged } from '../../lib/notifications'
 import {
-  CHANGE_FILTERS, changeBadgeVariant, changeHosts, isScopeEvent,
-  scopeEventSummary, type ChangeFilter,
+  CHANGE_TABS, changeBadgeVariant, changeHosts, isScopeEvent,
+  scopeEventSummary, type ChangeTabFilter,
 } from './changesModel'
 import InlineChangeDiff from './InlineChangeDiff'
 import ScopeEventView from './ScopeEventView'
@@ -27,11 +27,29 @@ const TIME_FILTERS = [
   { id: '12', label: '12h' },
   { id: '24', label: '24h' },
   { id: '168', label: '7d' },
-  { id: '720', label: '1mo' },
-  { id: '1440', label: '2mo' },
-  { id: '2160', label: '3mo' },
-  { id: '-1', label: 'Custom' },
+  { id: '720', label: '30d' },
+  { id: '2160', label: '90d' },
+  { id: '-1', label: 'Custom…' },
 ]
+
+type SourceFilter = '' | 'monitor' | 'watch' | 'watch_scope' | 'bounty' | 'alerts'
+
+const SOURCE_FILTERS: { id: SourceFilter; label: string }[] = [
+  { id: '', label: 'Any source' },
+  { id: 'monitor', label: 'Deep monitor' },
+  { id: 'watch', label: 'Watch round' },
+  { id: 'watch_scope', label: 'Watch scope' },
+  { id: 'bounty', label: 'Program scope' },
+  { id: 'alerts', label: 'System alerts' },
+]
+
+const SOURCE_FILTER_LABELS: Record<Exclude<SourceFilter, ''>, string> = {
+  monitor: 'Deep monitor',
+  watch: 'Watch round',
+  watch_scope: 'Watch scope',
+  bounty: 'Program scope',
+  alerts: 'System alerts',
+}
 
 const STATUS_CLASS_FILTERS = [
   { id: '2', label: '2xx' },
@@ -244,14 +262,15 @@ interface Props {
 export default function ChangeLog({ targetId, compact, initialEventId, initialQuery = '', onClearEventId }: Props) {
   const [hours, setHours] = useState('0')
   const [customSince, setCustomSince] = useState('')
-  const [categories, setCategories] = useState<Set<ChangeFilter>>(() => new Set<ChangeFilter>(['all']))
+  const [tabFilter, setTabFilter] = useState<ChangeTabFilter>('all')
+  const [filtersOpen, setFiltersOpen] = useState(false)
   const [statusOnly, setStatusOnly] = useState(false)
   const [statusClasses, setStatusClasses] = useState<Set<string>>(() => new Set<string>())
   const [statusCodes, setStatusCodes] = useState('')
   const debouncedCodes = useDebounced(statusCodes, 300)
   const [q, setQ] = useState(initialQuery)
   const debouncedQ = useDebounced(q, 300)
-  const [source, setSource] = useState('')
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('')
   const [severity, setSeverity] = useState('')
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedTaskId, setSelectedTaskId] = useState('')
@@ -296,10 +315,10 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   // buildParams, so reads and Mark all read agree even inside the debounce
   // window (A11, review findings #2 and #6).
   const isDefaultView = useCallback((searchText: string, codesText: string) =>
-    viewMode === 'signals' && categories.has('all') && !source && !severity && !selectedTaskId && !activeEventId &&
+    viewMode === 'signals' && tabFilter === 'all' && !sourceFilter && !severity && !selectedTaskId && !activeEventId &&
     !searchText.trim() && !statusOnly && statusClasses.size === 0 &&
     parseStatusCodes(codesText).length === 0,
-    [viewMode, categories, source, severity, selectedTaskId, statusOnly, statusClasses, activeEventId])
+    [viewMode, tabFilter, sourceFilter, severity, selectedTaskId, statusOnly, statusClasses, activeEventId])
 
   // Build query params from explicit text values. Reads pass the debounced
   // values, while writes (mark-all-read) pass the raw values so a click before
@@ -310,22 +329,25 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     if (hideSeen) p.hide_seen = '1'
     const since = sinceFor(hours, customSince)
     if (since) p.since = since
-    const cats = [...categories].filter(c => c !== 'all')
-    if (cats.length) p.category = cats.join(',')
+    const tabDef = CHANGE_TABS.find(t => t.id === tabFilter)
+    if (sourceFilter === 'alerts') {
+      p.category = 'alerts'
+    } else {
+      if (tabDef?.category) p.category = tabDef.category
+      if (sourceFilter) p.source = sourceFilter
+    }
     if (statusOnly) p.status_only = '1'
     if (statusClasses.size) p.status_class = [...statusClasses].join(',')
     const codes = parseStatusCodes(codesText)
     if (codes.length) p.status_code = codes.join(',')
     if (searchText.trim()) p.q = searchText.trim()
-    if (source) p.source = source
     if (severity) p.severity = severity
     if (selectedTaskId) p.task_id = selectedTaskId
     if (activeEventId) p.event_id = activeEventId
     const t = targetId || selectedTargetId
     if (t) p.target_id = t
     return p
-  }, [hours, customSince, categories, statusOnly, statusClasses, source, severity, selectedTaskId, targetId, selectedTargetId, activeEventId, hideSeen, isDefaultView])
-
+  }, [hours, customSince, tabFilter, statusOnly, statusClasses, sourceFilter, severity, selectedTaskId, targetId, selectedTargetId, activeEventId, hideSeen, isDefaultView])
   const params = useCallback((): Record<string, string> => buildParams(debouncedQ, debouncedCodes),
     [buildParams, debouncedQ, debouncedCodes])
 
@@ -463,15 +485,29 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     }
   }
 
-  const toggleCategory = (chip: ChangeFilter) => {
-    setCategories(prev => {
-      if (chip === 'all') return new Set<ChangeFilter>(['all'])
-      const next = new Set(prev)
-      next.delete('all')
-      if (next.has(chip)) next.delete(chip)
-      else next.add(chip)
-      return next.size ? next : new Set<ChangeFilter>(['all'])
-    })
+  const selectTab = (id: ChangeTabFilter) => {
+    setTabFilter(id)
+    if (id !== 'all' && sourceFilter === 'alerts') setSourceFilter('')
+  }
+
+  const handleSourceChange = (next: SourceFilter) => {
+    setSourceFilter(next)
+    if (next === 'alerts') setTabFilter('all')
+  }
+
+  const resetAdvancedFilters = () => {
+    setStatusOnly(false)
+    setStatusClasses(new Set<string>())
+    setStatusCodes('')
+    setSeverity('')
+    setSourceFilter('')
+    setSelectedTaskId('')
+  }
+
+  const selectDailySignals = () => {
+    setViewMode('signals')
+    setTabFilter('all')
+    resetAdvancedFilters()
   }
 
   const toggleStatusClass = (cls: string) => {
@@ -519,17 +555,15 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
 
   const cards = useMemo(() => groupIntoCards(rows), [rows])
   const detailDiffItem = detail?.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
-  const applyQuickFilter = (opts: { categories: ChangeFilter[]; source: string; statusOnly: boolean }) => {
-    setViewMode('all')
-    setCategories(new Set<ChangeFilter>(opts.categories))
-    setSource(opts.source)
-    setStatusOnly(opts.statusOnly)
-    setQ('')
-    setSeverity('')
-    setStatusClasses(new Set<string>())
-    setStatusCodes('')
-    setSelectedTaskId('')
-  }
+  const parsedStatusCodes = useMemo(() => parseStatusCodes(statusCodes), [statusCodes])
+  const advancedFilterCount =
+    (statusOnly ? 1 : 0) +
+    (statusClasses.size > 0 ? 1 : 0) +
+    (parsedStatusCodes.length > 0 ? 1 : 0) +
+    (severity ? 1 : 0) +
+    (sourceFilter ? 1 : 0)
+  const isSignalsActive = viewMode === 'signals' && tabFilter === 'all' && advancedFilterCount === 0 && !selectedTaskId
+  const selectedRound = rounds.find(r => r.id === selectedTaskId)
 
   return (
     <div className={cn('space-y-3', compact && 'space-y-2')}>
@@ -544,105 +578,16 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
           }}>Show all changes</button>
         </div>
       )}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <button type="button" onClick={() => setViewMode('signals')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'signals' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>Daily signals</button>
-        <button type="button" onClick={() => setViewMode('all')} className={cn('rounded-full border px-2.5 py-1 text-[11px]', viewMode === 'all' ? 'border-accent bg-accent/15 text-accent' : 'border-border text-text-muted')}>All history</button>
-        <span className="mx-1 text-[10px] text-text-muted">Quick filters</span>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['assets'], source: 'watch', statusOnly: false })}>New hosts</button>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['all'], source: '', statusOnly: true })}>Status flips</button>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['assets'], source: 'bounty', statusOnly: false })}>Scope changes</button>
-        <button type="button" className="rounded-full border border-border px-2 py-0.5 text-[10px] text-text-muted hover:text-text-primary" onClick={() => applyQuickFilter({ categories: ['all'], source: 'watch_scope', statusOnly: false })}>Watch scope</button>
-      </div>
-
-      {/* Time filter */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">Since</span>
-        {TIME_FILTERS.map(f => (
-          <button
-            key={f.id}
-            type="button"
-            onClick={() => setHours(f.id)}
-            className={cn(
-              'rounded-full border px-2.5 py-1 text-[11px] transition',
-              hours === f.id
-                ? 'border-accent bg-accent/15 text-accent'
-                : 'border-border text-text-muted hover:text-text-primary',
-            )}
-          >
-            {f.label}
+      {/* Row 1: Primary bar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="segmented-control" role="group" aria-label="Feed mode">
+          <button type="button" onClick={selectDailySignals} className={cn(isSignalsActive && 'active')}>
+            Daily signals
           </button>
-        ))}
-        {hours === '-1' && (
-          <input
-            className="input w-auto py-1 text-xs"
-            type="datetime-local"
-            value={customSince}
-            onChange={e => setCustomSince(e.target.value)}
-          />
-        )}
-      </div>
-
-      {/* Category filters. Multi-select; All resets the selection. */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {CHANGE_FILTERS.map(chip => (
-          <button
-            key={chip.id}
-            type="button"
-            onClick={() => toggleCategory(chip.id)}
-            className={cn(
-              'rounded-full border px-2.5 py-1 text-[11px] transition',
-              categories.has(chip.id)
-                ? 'border-accent bg-accent/15 text-accent'
-                : 'border-border text-text-muted hover:text-text-primary',
-            )}
-          >
-            {chip.label}
+          <button type="button" onClick={() => setViewMode('all')} className={cn(!isSignalsActive && 'active')}>
+            All history
           </button>
-        ))}
-      </div>
-
-      {/* Status filters. Status-only, class ranges and exact codes combine. */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">Status</span>
-        <button
-          type="button"
-          onClick={() => setStatusOnly(v => !v)}
-          className={cn(
-            'rounded-full border px-2.5 py-1 text-[11px] transition',
-            statusOnly
-              ? 'border-accent bg-accent/15 text-accent'
-              : 'border-border text-text-muted hover:text-text-primary',
-          )}
-        >
-          Status changes only
-        </button>
-        <span className="mx-1 text-[10px] text-text-muted">Class</span>
-        {STATUS_CLASS_FILTERS.map(f => (
-          <button
-            key={f.id}
-            type="button"
-            onClick={() => toggleStatusClass(f.id)}
-            className={cn(
-              'rounded-full border px-2.5 py-1 text-[11px] transition',
-              statusClasses.has(f.id)
-                ? 'border-accent bg-accent/15 text-accent'
-                : 'border-border text-text-muted hover:text-text-primary',
-            )}
-          >
-            {f.label}
-          </button>
-        ))}
-        <span className="mx-1 text-[10px] text-text-muted">Codes</span>
-        <input
-          className="input w-32 py-1 text-xs"
-          placeholder="200,403"
-          value={statusCodes}
-          onChange={e => setStatusCodes(e.target.value)}
-          title="Exact status codes, comma separated (100-599)"
-        />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 border-y border-white/[.06] py-2">
+        </div>
         <input
           className="input w-48 py-1 text-xs"
           placeholder="Search changes…"
@@ -650,32 +595,63 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
           onChange={e => setQ(e.target.value)}
           title="Search URL, target, change type, before and after values"
         />
-        <select className="input w-auto py-1 text-xs" value={source} onChange={e => setSource(e.target.value)}>
-          <option value="">All sources</option>
-          {([['monitor','Deep monitor'],['watch','Watch round'],['watch_scope','Watch scope'],['bounty','Program scope'],['notification','Bell']] as const).map(([v,label]) => <option key={v} value={v}>{label}</option>)}
+        <select
+          aria-label="Time range"
+          className="input w-auto py-1 text-xs"
+          value={hours}
+          onChange={e => setHours(e.target.value)}
+        >
+          {TIME_FILTERS.map(f => (
+            <option key={f.id} value={f.id}>{f.label}</option>
+          ))}
         </select>
-        <select className="input w-auto py-1 text-xs" value={severity} onChange={e => setSeverity(e.target.value)}>
-          <option value="">All severities</option>
-          {['critical', 'high', 'medium', 'low', 'info'].map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        {hours === '-1' && (
+          <input
+            aria-label="Custom start time"
+            className="input w-auto py-1 text-xs"
+            type="datetime-local"
+            value={customSince}
+            onChange={e => setCustomSince(e.target.value)}
+          />
+        )}
         {!targetId && (
-          <select className="input w-auto py-1 text-xs" value={selectedTargetId} onChange={e => setSelectedTargetId(e.target.value)}>
+          <select
+            aria-label="Target filter"
+            className="input w-auto py-1 text-xs"
+            value={selectedTargetId}
+            onChange={e => setSelectedTargetId(e.target.value)}
+          >
             <option value="">All targets</option>
             {targetList.map(t => (
               <option key={t.id} value={t.id}>{t.name || t.domain}</option>
             ))}
           </select>
         )}
-        <label className="flex items-center gap-1 text-[11px] text-text-muted">
-          <input type="checkbox" checked={hideSeen} onChange={e => setHideSeen(e.target.checked)} />
-          Hide seen
-        </label>
         <button
           type="button"
-          onClick={() => void markAllRead()}
-          className="text-[11px] text-accent hover:underline"
+          aria-pressed={hideSeen}
+          onClick={() => setHideSeen(v => !v)}
+          className={cn(
+            'rounded-lg border px-2.5 py-1 text-[11px] transition',
+            hideSeen
+              ? 'border-accent bg-accent/15 text-accent'
+              : 'border-border text-text-muted hover:text-text-primary',
+          )}
         >
-          Mark all read
+          Unread
+        </button>
+        <button
+          type="button"
+          aria-expanded={filtersOpen}
+          onClick={() => setFiltersOpen(v => !v)}
+          className={cn(
+            'rounded-lg border px-2.5 py-1 text-[11px] transition',
+            filtersOpen || advancedFilterCount > 0
+              ? 'border-accent bg-accent/15 text-accent'
+              : 'border-border text-text-muted hover:text-text-primary',
+          )}
+        >
+          {advancedFilterCount > 0 ? `Filters · ${advancedFilterCount}` : 'Filters'}
         </button>
         {refreshing && !loading && (
           <span className="ml-auto text-[10px] text-text-muted">Refreshing…</span>
@@ -693,6 +669,174 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         </button>
       </div>
 
+      {/* Row 2: 5 mutually-exclusive type pills + Mark all read */}
+      <div className="flex flex-wrap items-center gap-1.5 border-y border-white/[.06] py-2">
+        {CHANGE_TABS.map(tab => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => selectTab(tab.id)}
+            className={cn(
+              'rounded-full border px-2.5 py-1 text-[11px] transition',
+              tabFilter === tab.id && sourceFilter !== 'alerts'
+                ? 'border-accent bg-accent/15 text-accent'
+                : 'border-border text-text-muted hover:text-text-primary',
+            )}
+          >
+            {tab.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => void markAllRead()}
+          className="ml-auto text-[11px] text-accent hover:underline"
+        >
+          Mark all read
+        </button>
+      </div>
+
+      {/* Active advanced filter pills */}
+      {(advancedFilterCount > 0 || selectedTaskId) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {statusOnly && (
+            <button
+              type="button"
+              aria-label="Remove status changes only filter"
+              onClick={() => setStatusOnly(false)}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Status changes only <span aria-hidden="true">×</span>
+            </button>
+          )}
+          {statusClasses.size > 0 && (
+            <button
+              type="button"
+              aria-label="Remove status class filter"
+              onClick={() => setStatusClasses(new Set<string>())}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Class: {[...statusClasses].map(c => `${c}xx`).join(', ')} <span aria-hidden="true">×</span>
+            </button>
+          )}
+          {parsedStatusCodes.length > 0 && (
+            <button
+              type="button"
+              aria-label="Remove status codes filter"
+              onClick={() => setStatusCodes('')}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Codes: {parsedStatusCodes.join(', ')} <span aria-hidden="true">×</span>
+            </button>
+          )}
+          {severity && (
+            <button
+              type="button"
+              aria-label="Remove severity filter"
+              onClick={() => setSeverity('')}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Severity: {severity} <span aria-hidden="true">×</span>
+            </button>
+          )}
+          {sourceFilter && (
+            <button
+              type="button"
+              aria-label="Remove source filter"
+              onClick={() => setSourceFilter('')}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Source: {SOURCE_FILTER_LABELS[sourceFilter]} <span aria-hidden="true">×</span>
+            </button>
+          )}
+          {selectedTaskId && (
+            <button
+              type="button"
+              aria-label="Remove watch round filter"
+              onClick={() => setSelectedTaskId('')}
+              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
+            >
+              Round: {selectedRound ? (selectedRound.target_name || selectedRound.target_id) : selectedTaskId.slice(0, 12)} <span aria-hidden="true">×</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={resetAdvancedFilters}
+            className="text-[11px] text-text-muted hover:text-text-primary hover:underline"
+          >
+            Reset filters
+          </button>
+        </div>
+      )}
+
+      {/* Collapsible advanced filters panel */}
+      {filtersOpen && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5 rounded-xl border border-border bg-surface-2/60 p-3">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">HTTP status</span>
+            <button
+              type="button"
+              onClick={() => setStatusOnly(v => !v)}
+              className={cn(
+                'rounded-full border px-2.5 py-1 text-[11px] transition',
+                statusOnly
+                  ? 'border-accent bg-accent/15 text-accent'
+                  : 'border-border text-text-muted hover:text-text-primary',
+              )}
+            >
+              Status changes only
+            </button>
+            {STATUS_CLASS_FILTERS.map(f => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => toggleStatusClass(f.id)}
+                className={cn(
+                  'rounded-full border px-2.5 py-1 text-[11px] transition',
+                  statusClasses.has(f.id)
+                    ? 'border-accent bg-accent/15 text-accent'
+                    : 'border-border text-text-muted hover:text-text-primary',
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+            <span className="ml-1 text-[10px] text-text-muted">Codes</span>
+            <input
+              className="input w-28 py-1 text-xs"
+              placeholder="200,403"
+              value={statusCodes}
+              onChange={e => setStatusCodes(e.target.value)}
+              title="Exact status codes, comma separated (100-599)"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              aria-label="Severity"
+              className="input w-auto py-1 text-xs"
+              value={severity}
+              onChange={e => setSeverity(e.target.value)}
+            >
+              <option value="">Any severity</option>
+              {['critical', 'high', 'medium', 'low', 'info'].map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+            <select
+              aria-label="Source"
+              className="input w-auto py-1 text-xs"
+              value={sourceFilter}
+              onChange={e => handleSourceChange(e.target.value as SourceFilter)}
+            >
+              {SOURCE_FILTERS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+            </select>
+          </div>
+          <button
+            type="button"
+            onClick={resetAdvancedFilters}
+            className="ml-auto text-[11px] text-text-muted hover:text-text-primary hover:underline"
+          >
+            Reset filters
+          </button>
+        </div>
+      )}
       {/* Slim watch round strip. Status word stays visible, not just the dot. */}
       {rounds.length > 0 && (
         <div className="flex items-center gap-1.5 overflow-x-auto py-1.5">
@@ -836,29 +980,52 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         </div>
       )}
 
-      {/* Detail drawer */}
-      {detail && (
-        <div
-          className="fixed inset-0 z-50 flex justify-end bg-black/60"
-          onClick={() => setDetail(null)}
-        >
-          <div
-            className="h-full w-full max-w-lg overflow-y-auto border-l border-border bg-surface-1 p-5"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <h3 className="text-sm font-semibold">
-                  {detail.items[0] && isScopeEvent(detail.items[0])
-                    ? scopeEventSummary(detail.items[0], programNames[detail.items[0]?.program_id || ''])
-                    : fieldLabel(detail.items[0]?.change_type || '')}
-                </h3>
-                <p className="mt-1 break-all text-xs text-text-muted">{detail.url || detail.target_name}</p>
-              </div>
-              <Button size="sm" variant="ghost" onClick={() => setDetail(null)}>Close</Button>
-            </div>
-
-            <dl className="mt-4 grid grid-cols-2 gap-3 text-xs">
+      {/* Detail drawer (portaled into document.body) */}
+      <Drawer
+        open={!!detail}
+        onClose={() => setDetail(null)}
+        title={detail ? (
+          detail.items[0] && isScopeEvent(detail.items[0])
+            ? scopeEventSummary(detail.items[0], programNames[detail.items[0]?.program_id || ''])
+            : fieldLabel(detail.items[0]?.change_type || '')
+        ) : undefined}
+        subtitle={detail ? (detail.url || detail.target_name) : undefined}
+        footer={detail ? (
+          <div className="flex items-center gap-3">
+            {detail.target_id && (
+              <Link
+                to={`/targets/${detail.target_id}`}
+                className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-accent hover:bg-accent/20"
+              >
+                Open target →
+              </Link>
+            )}
+            {detailDiffItem && (
+              <button
+                type="button"
+                onClick={() => setDiffView({
+                  targetId: detail.target_id,
+                  url: detailDiffItem.url,
+                  kind: detailDiffItem.change_type === 'css_change' ? 'css' : 'js',
+                })}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs text-accent hover:border-accent/40 hover:bg-accent/10"
+              >
+                Diff
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void toggleCardSeen(detail)}
+              className="text-xs text-text-muted hover:text-text-primary"
+            >
+              {detail.seen ? 'Mark unread' : 'Mark read'}
+            </button>
+          </div>
+        ) : undefined}
+      >
+        {detail && (
+          <>
+            <dl className="grid grid-cols-2 gap-3 text-xs">
               <div>
                 <dt className="text-[10px] uppercase tracking-wide text-text-muted">Target</dt>
                 <dd className="truncate">{detail.target_name || detail.target_id}</dd>
@@ -914,40 +1081,9 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                 )
               })}
             </div>
-
-            <div className="mt-5 flex items-center gap-3">
-              {detail.target_id && (
-                <Link
-                  to={`/targets/${detail.target_id}`}
-                  className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-accent hover:bg-accent/20"
-                >
-                  Open target →
-                </Link>
-              )}
-              {detailDiffItem && (
-                <button
-                  type="button"
-                  onClick={() => setDiffView({
-                    targetId: detail.target_id,
-                    url: detailDiffItem.url,
-                    kind: detailDiffItem.change_type === 'css_change' ? 'css' : 'js',
-                  })}
-                  className="rounded-lg border border-border px-3 py-1.5 text-xs text-accent hover:border-accent/40 hover:bg-accent/10"
-                >
-                  Diff
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => void toggleCardSeen(detail)}
-                className="text-xs text-text-muted hover:text-text-primary"
-              >
-                {detail.seen ? 'Mark unread' : 'Mark read'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+          </>
+        )}
+      </Drawer>
 
       {diffView && (
         <ChangeDiffViewer

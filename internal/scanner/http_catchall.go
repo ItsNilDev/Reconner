@@ -288,21 +288,40 @@ func (s *HTTPScanner) runCatchallPass(ctx context.Context, targetID string, logF
 		WHERE target_id=? AND (url LIKE 'https://'||?||'/%' OR url LIKE 'https://'||?||':%'
 			OR url LIKE 'http://'||?||'/%' OR url LIKE 'http://'||?||':%' OR url='https://'||? OR url='http://'||?)`)
 	if err != nil {
+		_ = stmt.Close()
 		_ = tx.Rollback()
 		return err
 	}
 	marked := 0
 	for _, host := range markedHosts {
-		res, _ := stmt.ExecContext(ctx, targetID, host)
+		res, err := stmt.ExecContext(ctx, targetID, host)
+		if err != nil {
+			_ = stmt.Close()
+			_ = urlStmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("catchall mark subdomain %s: %w", host, err)
+		}
 		if affRows, aerr := res.RowsAffected(); aerr == nil && affRows > 0 {
 			marked++
 			// Drop the junk services so JS/params/DAST/nuclei never target
 			// them again. The subdomain row keeps the evidence of WHY.
-			_, _ = urlStmt.ExecContext(ctx, targetID, host, host, host, host, host, host)
+			if _, err := urlStmt.ExecContext(ctx, targetID, host, host, host, host, host, host); err != nil {
+				_ = stmt.Close()
+				_ = urlStmt.Close()
+				_ = tx.Rollback()
+				return fmt.Errorf("catchall delete http_services %s: %w", host, err)
+			}
 		}
 	}
-	_ = stmt.Close()
-	_ = urlStmt.Close()
+	if err := stmt.Close(); err != nil {
+		_ = urlStmt.Close()
+		_ = tx.Rollback()
+		return fmt.Errorf("catchall close subdomain stmt: %w", err)
+	}
+	if err := urlStmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("catchall close url stmt: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}

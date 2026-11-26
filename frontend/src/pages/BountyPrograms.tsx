@@ -70,6 +70,7 @@ export default function BountyPrograms() {
   const [bulkSkipExisting, setBulkSkipExisting] = useState(true)
   const [bulkBusy, setBulkBusy] = useState(false)
   const [bulkResults, setBulkResults] = useState<BulkCreateProjectResult[] | null>(null)
+  const [moreFiltersOpen, setMoreFiltersOpen] = useState(false)
 
   const query = useMemo(() => {
     const q: Record<string, string> = { page: String(page), limit: '30', sort: filters.sort }
@@ -122,7 +123,7 @@ export default function BountyPrograms() {
     try {
       const full = await bountyApi.get(p.id); setDetail(full)
       setSelected(new Set((full.assets || []).filter(a => a.active && a.in_scope && a.eligible_submission).map(a => a.id)))
-      load()
+      setPrograms(prev => prev.map(x => x.id === full.id ? { ...x, ...full } : x))
     } catch (e) { addToast('error', e instanceof Error ? e.message : 'Could not fetch current program scope'); setDetail(null) }
     finally { setDetailLoading(false) }
   }
@@ -315,6 +316,17 @@ export default function BountyPrograms() {
   const filtersActive = filters.search !== '' || filters.provider !== '' || filters.bounties !== '' || filters.wildcard !== '' ||
     filters.assetType !== '' || filters.minAssets !== '' || filters.maxAssets !== '' || filters.minReward !== '' || filters.programType !== '' ||
     filters.safeHarbor !== '' || filters.industry !== '' || filters.status !== 'live' || filters.sort !== 'newest'
+  const secondaryActiveCount = [
+    filters.wildcard !== '',
+    filters.assetType !== '',
+    filters.programType !== '',
+    filters.safeHarbor !== '',
+    filters.status !== 'live',
+    filters.minAssets !== '',
+    filters.maxAssets !== '',
+    filters.minReward !== '',
+    filters.industry.trim() !== '',
+  ].filter(Boolean).length
 
   return (
     <div className="space-y-5">
@@ -351,27 +363,48 @@ export default function BountyPrograms() {
       )}
 
       <div className="card p-3 sm:p-4 space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2.5">
           <Input placeholder="Search company, handle, industry…" value={filters.search} onChange={e => setFilters(f => ({ ...f, search: e.target.value }))} className="xl:col-span-2" />
           <Select value={filters.provider} onChange={v => setFilters(f => ({ ...f, provider: v }))} options={[['','All platforms'],['hackerone','HackerOne'],['bugcrowd','Bugcrowd'],['intigriti','Intigriti'],['yeswehack','YesWeHack']]} />
           <Select value={filters.sort} onChange={v => setFilters(f => ({ ...f, sort: v }))} options={[['newest','Newest programs'],['updated','Recently updated'],['assets_desc','Most in-scope assets'],['wildcards','Most wildcards'],['reward_desc','Highest max reward'],['name','Name A–Z']]} />
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2.5">
           <Select value={filters.bounties} onChange={v => setFilters(f => ({ ...f, bounties: v }))} options={[['','Bounty + VDP'],['true','Pays bounties'],['false','VDP / no bounty']]} />
-          <Select value={filters.wildcard} onChange={v => setFilters(f => ({ ...f, wildcard: v }))} options={[['','Any scope'],['true','Has wildcard'],['false','No wildcard']]} />
-          <Select value={filters.assetType} onChange={v => setFilters(f => ({ ...f, assetType: v }))} options={[['','Any asset type'],['wildcard','Wildcard'],['domain','Domain'],['url','URL / page'],['api','API'],['js','JavaScript'],['cidr','CIDR'],['ip','IP'],['android','Android'],['ios','iOS'],['app_store','App store'],['source_code','Source code'],['hardware','Hardware / IoT'],['ai_model','AI model']]} />
-          <Select value={filters.programType} onChange={v => setFilters(f => ({ ...f, programType: v }))} options={[['','Any program'],['bug_bounty','Bug bounty'],['vdp','VDP']]} />
-          <Select value={filters.safeHarbor} onChange={v => setFilters(f => ({ ...f, safeHarbor: v }))} options={[['','Any safe harbor'],['full','Full safe harbor'],['partial','Partial safe harbor'],['none','No declared safe harbor'],['declined','Declined']]} />
-          <Select value={filters.status} onChange={v => setFilters(f => ({ ...f, status: v }))} options={[['live','Live only'],['','Any status'],['unavailable','Unavailable']]} />
-          <Input type="number" min="0" placeholder="Min assets" value={filters.minAssets} onChange={e => setFilters(f => ({ ...f, minAssets: e.target.value }))} />
-          <Input type="number" min="0" placeholder="Max assets" value={filters.maxAssets} onChange={e => setFilters(f => ({ ...f, maxAssets: e.target.value }))} />
-          <Input type="number" min="0" placeholder="Min max reward ($)" value={filters.minReward} onChange={e => setFilters(f => ({ ...f, minReward: e.target.value }))} />
-          <Input placeholder="Exact industry" value={filters.industry} onChange={e => setFilters(f => ({ ...f, industry: e.target.value }))} />
         </div>
-        <div className="flex items-center gap-3">
-          {programs.length > 0 && <button className="text-[11px] text-accent hover:text-accent-hover" onClick={toggleSelectAllPage}>{allPageSelected ? 'Deselect page' : 'Select page'}</button>}
-          {filtersActive && <button className="text-[11px] text-accent hover:text-accent-hover" onClick={() => setFilters(initialFilters)}>Clear filters</button>}
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            type="button"
+            aria-expanded={moreFiltersOpen}
+            onClick={() => setMoreFiltersOpen(o => !o)}
+            className={cn(
+              'inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors',
+              moreFiltersOpen || secondaryActiveCount > 0
+                ? 'border-accent/50 bg-accent/10 text-accent'
+                : 'border-border text-text-secondary hover:text-text-primary hover:border-border-strong',
+            )}
+          >
+            <span>More filters</span>
+            {secondaryActiveCount > 0 && (
+              <span className="inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-accent text-[10px] font-semibold text-white tabular-nums">
+                {secondaryActiveCount}
+              </span>
+            )}
+            <span className="text-[10px] opacity-70">{moreFiltersOpen ? '▲' : '▼'}</span>
+          </button>
+          {filtersActive && <button type="button" className="text-[11px] text-accent hover:text-accent-hover" onClick={() => setFilters(initialFilters)}>Clear filters</button>}
+          {programs.length > 0 && <button type="button" className="text-[11px] text-accent hover:text-accent-hover ml-auto" onClick={toggleSelectAllPage}>{allPageSelected ? 'Deselect page' : 'Select page'}</button>}
         </div>
+        {moreFiltersOpen && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2.5 pt-2 border-t border-white/[.06]">
+            <Select value={filters.wildcard} onChange={v => setFilters(f => ({ ...f, wildcard: v }))} options={[['','Any scope'],['true','Has wildcard'],['false','No wildcard']]} />
+            <Select value={filters.assetType} onChange={v => setFilters(f => ({ ...f, assetType: v }))} options={[['','Any asset type'],['wildcard','Wildcard'],['domain','Domain'],['url','URL / page'],['api','API'],['js','JavaScript'],['cidr','CIDR'],['ip','IP'],['android','Android'],['ios','iOS'],['app_store','App store'],['source_code','Source code'],['hardware','Hardware / IoT'],['ai_model','AI model']]} />
+            <Select value={filters.programType} onChange={v => setFilters(f => ({ ...f, programType: v }))} options={[['','Any program'],['bug_bounty','Bug bounty'],['vdp','VDP']]} />
+            <Select value={filters.safeHarbor} onChange={v => setFilters(f => ({ ...f, safeHarbor: v }))} options={[['','Any safe harbor'],['full','Full safe harbor'],['partial','Partial safe harbor'],['none','No declared safe harbor'],['declined','Declined']]} />
+            <Select value={filters.status} onChange={v => setFilters(f => ({ ...f, status: v }))} options={[['live','Live only'],['','Any status'],['unavailable','Unavailable']]} />
+            <Input type="number" min="0" placeholder="Min assets" value={filters.minAssets} onChange={e => setFilters(f => ({ ...f, minAssets: e.target.value }))} />
+            <Input type="number" min="0" placeholder="Max assets" value={filters.maxAssets} onChange={e => setFilters(f => ({ ...f, maxAssets: e.target.value }))} />
+            <Input type="number" min="0" placeholder="Min max reward ($)" value={filters.minReward} onChange={e => setFilters(f => ({ ...f, minReward: e.target.value }))} />
+            <Input placeholder="Exact industry" value={filters.industry} onChange={e => setFilters(f => ({ ...f, industry: e.target.value }))} />
+          </div>
+        )}
       </div>
 
       {programSelected.size > 0 && (

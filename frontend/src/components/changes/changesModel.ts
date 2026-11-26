@@ -1,17 +1,14 @@
 import { diffWordsWithSpace } from 'diff'
 import type { ChangeCategory, ChangeEntry } from '../../types'
 
-export type ChangeFilter = ChangeCategory | 'all'
+export type ChangeTabFilter = 'all' | 'hosts' | 'scope' | 'http' | 'security_js'
 
-export const CHANGE_FILTERS: { id: ChangeFilter; label: string }[] = [
+export const CHANGE_TABS: { id: ChangeTabFilter; label: string; category?: string }[] = [
   { id: 'all', label: 'All' },
-  { id: 'security', label: 'Security' },
-  { id: 'scripts', label: 'Scripts' },
-  { id: 'http', label: 'HTTP' },
-  { id: 'tech', label: 'Tech' },
-  { id: 'headers', label: 'Headers' },
-  { id: 'assets', label: 'Assets & scope' },
-  { id: 'alerts', label: 'Alerts' },
+  { id: 'hosts', label: 'New hosts', category: 'hosts' },
+  { id: 'scope', label: 'Scope', category: 'scope' },
+  { id: 'http', label: 'HTTP', category: 'http,tech' },
+  { id: 'security_js', label: 'Security & JS', category: 'security,headers,scripts' },
 ]
 
 // Exact mirror of changeCategoryExpr in internal/api/changes_handlers.go.

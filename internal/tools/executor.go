@@ -51,7 +51,7 @@ type Executor struct {
 	logger      *logger.Logger
 	semaphore   chan struct{}
 	mu          sync.Mutex
-	activeProcs map[string]*exec.Cmd
+	activeProcs map[string]map[*exec.Cmd]struct{}
 	toolFree    bool
 }
 
@@ -77,7 +77,140 @@ func NewExecutor(cfg *config.Config, log *logger.Logger) *Executor {
 		cfg:         cfg,
 		logger:      log,
 		semaphore:   make(chan struct{}, maxExecutions),
-		activeProcs: make(map[string]*exec.Cmd),
+		activeProcs: make(map[string]map[*exec.Cmd]struct{}),
+	}
+}
+
+const (
+	maxToolStdoutLineBytes = 16 << 20 // 16 MiB
+	maxToolStderrLineBytes = 1 << 20  // 1 MiB
+)
+
+func (e *Executor) registerActiveProc(taskID string, cmd *exec.Cmd) {
+	e.mu.Lock()
+	procs := e.activeProcs[taskID]
+	if procs == nil {
+		procs = make(map[*exec.Cmd]struct{})
+		e.activeProcs[taskID] = procs
+	}
+	procs[cmd] = struct{}{}
+	e.mu.Unlock()
+}
+
+func (e *Executor) unregisterActiveProc(taskID string, cmd *exec.Cmd) {
+	e.mu.Lock()
+	if procs := e.activeProcs[taskID]; procs != nil {
+		delete(procs, cmd)
+		if len(procs) == 0 {
+			delete(e.activeProcs, taskID)
+		}
+	}
+	e.mu.Unlock()
+}
+
+// scanStreamLines reads newline-delimited lines from r using a 64 KiB reader.
+// Lines up to maxLineBytes are delivered via onLine (with trailing \r?\n
+// stripped, including a final line without a trailing newline). Any single
+// line exceeding maxLineBytes is drained to the next newline (or EOF), reported
+// via onOversized, and scanning continues on subsequent lines without stopping
+// or blocking the pipe writer.
+func scanStreamLines(r io.Reader, maxLineBytes int, onLine func(string), onOversized func(int)) error {
+	if maxLineBytes <= 0 {
+		maxLineBytes = 64 * 1024
+	}
+	br := bufio.NewReaderSize(r, 64*1024)
+	var buf []byte
+	oversized := false
+	droppedBytes := 0
+
+	trimEOL := func(b []byte) []byte {
+		if len(b) > 0 && b[len(b)-1] == '\n' {
+			b = b[:len(b)-1]
+		}
+		if len(b) > 0 && b[len(b)-1] == '\r' {
+			b = b[:len(b)-1]
+		}
+		return b
+	}
+
+	resetBuf := func() {
+		if cap(buf) > 256*1024 {
+			buf = nil
+		} else {
+			buf = buf[:0]
+		}
+	}
+
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if oversized {
+				droppedBytes += len(chunk)
+			} else if len(buf) == 0 && err == nil {
+				trimmed := trimEOL(chunk)
+				if len(trimmed) > maxLineBytes {
+					if onOversized != nil {
+						onOversized(len(chunk))
+					}
+					continue
+				}
+				if onLine != nil {
+					onLine(string(trimmed))
+				}
+				continue
+			} else {
+				if len(buf)+len(chunk) > maxLineBytes {
+					if err != bufio.ErrBufferFull {
+						candidate := append(buf, chunk...)
+						trimmed := trimEOL(candidate)
+						if len(trimmed) <= maxLineBytes {
+							if onLine != nil {
+								onLine(string(trimmed))
+							}
+							resetBuf()
+							if err == io.EOF {
+								return nil
+							}
+							if err != nil {
+								return err
+							}
+							continue
+						}
+					}
+					oversized = true
+					droppedBytes = len(buf) + len(chunk)
+					buf = nil
+				} else {
+					buf = append(buf, chunk...)
+				}
+			}
+		}
+
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+
+		if oversized {
+			if onOversized != nil {
+				onOversized(droppedBytes)
+			}
+			oversized = false
+			droppedBytes = 0
+			buf = nil
+		} else if len(buf) > 0 {
+			if onLine != nil {
+				onLine(string(trimEOL(buf)))
+			}
+			resetBuf()
+		}
+
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			return nil
+		}
+		return err
 	}
 }
 
@@ -167,28 +300,24 @@ func (e *Executor) RunWithCallback(ctx context.Context, taskID string, callback 
 		return fmt.Errorf("start %s: %w", name, err)
 	}
 
-	e.mu.Lock()
-	e.activeProcs[taskID] = cmd
-	e.mu.Unlock()
-
-	defer func() {
-		e.mu.Lock()
-		delete(e.activeProcs, taskID)
-		e.mu.Unlock()
-	}()
+	e.registerActiveProc(taskID, cmd)
+	defer e.unregisterActiveProc(taskID, cmd)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
+		if err := scanStreamLines(stdout, maxToolStdoutLineBytes, func(line string) {
 			if line != "" && callback != nil {
 				e.safeCallback(name, callback, line)
 			}
+		}, func(dropped int) {
+			if e.logger != nil {
+				e.logger.Warn("Dropped oversized tool stdout line", "tool", name, "bytes", dropped)
+			}
+		}); err != nil && e.logger != nil {
+			e.logger.Warn("Tool stdout stream read error", "tool", name, "error", err)
 		}
 	}()
 
@@ -199,14 +328,19 @@ func (e *Executor) RunWithCallback(ctx context.Context, taskID string, callback 
 	var errTail stderrTail
 	go func() {
 		defer wg.Done()
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			e.logger.Debug("Tool stderr", "tool", name, "line", line)
+		if err := scanStreamLines(stderr, maxToolStderrLineBytes, func(line string) {
+			if e.logger != nil {
+				e.logger.Debug("Tool stderr", "tool", name, "line", line)
+			}
 			errTail.add(line)
+		}, func(dropped int) {
+			if e.logger != nil {
+				e.logger.Warn("Dropped oversized tool stderr line", "tool", name, "bytes", dropped)
+			}
+		}); err != nil && e.logger != nil {
+			e.logger.Warn("Tool stderr stream read error", "tool", name, "error", err)
 		}
 	}()
-
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
 		if tail := errTail.string(); tail != "" {
@@ -301,17 +435,22 @@ func (e *Executor) Run(ctx context.Context, name string, args ...string) (*ExecR
 
 func (e *Executor) KillTask(taskID string) {
 	e.mu.Lock()
-	cmd := e.activeProcs[taskID]
+	var cmds []*exec.Cmd
+	for cmd := range e.activeProcs[taskID] {
+		cmds = append(cmds, cmd)
+	}
 	e.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		return
+	for _, cmd := range cmds {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		if cmd.Cancel != nil {
+			_ = cmd.Cancel()
+			continue
+		}
+		_ = cmd.Process.Kill()
 	}
-	if cmd.Cancel != nil {
-		_ = cmd.Cancel()
-		return
-	}
-	_ = cmd.Process.Kill()
 }
 
 func (e *Executor) IsToolAvailable(name string) bool {
@@ -404,36 +543,49 @@ func (e *Executor) RunWithInputCallback(ctx context.Context, input io.Reader, ta
 		return fmt.Errorf("start %s: %w", name, err)
 	}
 
-	e.mu.Lock()
-	e.activeProcs[taskID] = cmd
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		delete(e.activeProcs, taskID)
-		e.mu.Unlock()
-	}()
+	e.registerActiveProc(taskID, cmd)
+	defer e.unregisterActiveProc(taskID, cmd)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-		for sc.Scan() {
-			if line := sc.Text(); line != "" && callback != nil {
+		if err := scanStreamLines(stdout, maxToolStdoutLineBytes, func(line string) {
+			if line != "" && callback != nil {
 				e.safeCallback(name, callback, line)
 			}
+		}, func(dropped int) {
+			if e.logger != nil {
+				e.logger.Warn("Dropped oversized tool stdout line", "tool", name, "bytes", dropped)
+			}
+		}); err != nil && e.logger != nil {
+			e.logger.Warn("Tool stdout stream read error", "tool", name, "error", err)
 		}
 	}()
+	var errTail stderrTail
 	go func() {
 		defer wg.Done()
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
-			e.logger.Debug("Tool stderr", "tool", name, "line", sc.Text())
+		if err := scanStreamLines(stderr, maxToolStderrLineBytes, func(line string) {
+			if e.logger != nil {
+				e.logger.Debug("Tool stderr", "tool", name, "line", line)
+			}
+			errTail.add(line)
+		}, func(dropped int) {
+			if e.logger != nil {
+				e.logger.Warn("Dropped oversized tool stderr line", "tool", name, "bytes", dropped)
+			}
+		}); err != nil && e.logger != nil {
+			e.logger.Warn("Tool stderr stream read error", "tool", name, "error", err)
 		}
 	}()
 	wg.Wait()
-	return cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		if tail := errTail.string(); tail != "" {
+			return fmt.Errorf("%w: %s", err, tail)
+		}
+		return err
+	}
+	return nil
 }
 
 func (e *Executor) RunWithInput(ctx context.Context, input io.Reader, name string, args ...string) (*ExecResult, error) {

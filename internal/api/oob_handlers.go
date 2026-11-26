@@ -2,8 +2,12 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/recon-platform/internal/scanner"
@@ -60,6 +64,9 @@ func (h *Handler) RecordOOBHit(token, srcIP, method, ua, via string) bool {
 		FROM oob_probes WHERE token = ?`, token).
 		Scan(&targetID, &injURL, &param, &kind, &sink, &priorHits)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			h.logger.Error("Failed to look up OOB probe", "token", token, "error", err)
+		}
 		return false // unknown token — ignore stray traffic
 	}
 
@@ -68,17 +75,27 @@ func (h *Handler) RecordOOBHit(token, srcIP, method, ua, via string) bool {
 		"Out-of-band %s confirmed: the target server called back via %s. Injected via %s (sink: %s). Source IP: %s | method: %s | UA: %s",
 		vulnType, via, injURL, sink, srcIP, method, ua)
 
-	_, _ = h.db.Exec(`
-		UPDATE oob_probes
-		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
-		WHERE token = ?`, evidence, token)
-
-	_, _ = scanner.RecordDetectorObservation(context.Background(), h.db, scanner.DetectorObservation{
+	obs := scanner.DetectorObservation{
 		TargetID: targetID, Type: vulnType, Subtype: kind, Severity: "critical",
 		URL: injURL, Method: "CALLBACK", Parameter: param, Location: sink,
 		Payload: "oob token=" + token, Evidence: evidence, Source: "oast-callback",
 		DetectionMethod: via, Confidence: 100, Priority: 500, Verdict: scanner.VerifyVerified,
-	})
+	}
+	if _, err = scanner.RecordDetectorObservation(context.Background(), h.db, obs); err != nil && strings.Contains(strings.ToLower(err.Error()), "busy") {
+		time.Sleep(200 * time.Millisecond)
+		_, err = scanner.RecordDetectorObservation(context.Background(), h.db, obs)
+	}
+	if err != nil {
+		h.logger.Error("Failed to record OOB detector observation", "token", token, "kind", kind, "target", targetID, "src", srcIP, "via", via, "error", err)
+		return false
+	}
+
+	if _, err := h.db.Exec(`
+		UPDATE oob_probes
+		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
+		WHERE token = ?`, evidence, token); err != nil {
+		h.logger.Error("Failed to update OOB probe stats", "token", token, "kind", kind, "target", targetID, "error", err)
+	}
 
 	if priorHits == 0 && h.sched != nil {
 		h.sched.EmitVulnFinding(map[string]any{

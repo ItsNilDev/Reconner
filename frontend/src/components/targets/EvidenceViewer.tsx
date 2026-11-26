@@ -19,20 +19,24 @@ export const EvidenceViewer = ({ targetId, findingId, url, type, open, onClose }
   const [comparison, setComparison] = useState('')
   const [loading, setLoading] = useState(false)
   const [replaying, setReplaying] = useState(false)
+  const [replayError, setReplayError] = useState('')
 
   useEffect(() => {
     if (!open) return
     setLoading(true)
     targetsApi.evidence(targetId, findingId).then(setEv).catch(() => setEv([])).finally(() => setLoading(false))
-    setReplays([]); setComparison('')
+    setReplays([]); setComparison(''); setReplayError('')
   }, [open, targetId, findingId])
 
   const replay = async () => {
     setReplaying(true)
+    setReplayError('')
     try {
       const r = await targetsApi.replay(targetId, { method: 'GET', url, identity_id: 'all' })
       setReplays(r.results || []); setComparison(r.comparison || '')
-    } catch { /* ignore */ } finally { setReplaying(false) }
+    } catch (e) {
+      setReplayError(e instanceof Error ? e.message : 'Replay request failed')
+    } finally { setReplaying(false) }
   }
 
   return (
@@ -80,6 +84,11 @@ export const EvidenceViewer = ({ targetId, findingId, url, type, open, onClose }
               {replaying ? 'Replaying…' : 'Replay GET as unauth + all identities'}
             </button>
           </div>
+          {replayError && (
+            <div className="rounded-lg border border-severity-high/30 bg-severity-high/10 px-3 py-2 text-xs text-severity-high">
+              {replayError}
+            </div>
+          )}
           {comparison && <div className="text-xs text-text-muted">{comparison}</div>}
           {replays.length > 0 && (
             <div className="overflow-x-auto">

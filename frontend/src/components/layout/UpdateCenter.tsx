@@ -1,7 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { system, type UpdateInfo } from '../../lib/api'
 import { useUIStore } from '../../store/ui'
 import { cn } from '../../lib/utils'
+import { acquireScrollLock } from '../ui'
 
 const CHECK_INTERVAL = 6 * 60 * 60 * 1000
 const DISMISSED_KEY = 'reconner.dismissed-release'
@@ -62,9 +64,13 @@ export function UpdateCenterProvider({ children }: { children: React.ReactNode }
 
   useEffect(() => {
     if (!detailsOpen) return
+    const releaseLock = acquireScrollLock()
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setDetailsOpen(false) }
     document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      releaseLock()
+    }
   }, [detailsOpen])
 
   const refresh = useCallback(async () => { await load(true) }, [load])
@@ -95,7 +101,7 @@ export function UpdateCenterProvider({ children }: { children: React.ReactNode }
   return (
     <UpdateCenterContext.Provider value={value}>
       {children}
-      {detailsOpen && info && (
+      {detailsOpen && info && createPortal(
         <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center sm:p-4" role="dialog" aria-modal="true" aria-labelledby="release-title">
           <button className="absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={() => setDetailsOpen(false)} aria-label="Close release details" />
           <section className="relative w-full sm:max-w-2xl max-h-[92dvh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-border bg-surface-2 shadow-2xl animate-slide-up">
@@ -138,7 +144,8 @@ export function UpdateCenterProvider({ children }: { children: React.ReactNode }
               </footer>
             </div>
           </section>
-        </div>
+        </div>,
+        document.body,
       )}
     </UpdateCenterContext.Provider>
   )

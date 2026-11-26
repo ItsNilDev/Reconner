@@ -1,9 +1,12 @@
 package api
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/recon-platform/internal/scanner"
@@ -63,6 +66,9 @@ func (h *Handler) recordBlindHit(r *http.Request, token, pageURL, cookies, refer
 		FROM blind_xss_probes WHERE token = ?`, token).
 		Scan(&targetID, &injURL, &param, &sink, &priorHits)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			h.logger.Error("Failed to look up blind XSS probe", "token", token, "error", err)
+		}
 		return // unknown token — ignore stray traffic
 	}
 
@@ -76,20 +82,31 @@ func (h *Handler) recordBlindHit(r *http.Request, token, pageURL, cookies, refer
 		via, injURL, sink, orDash(pageURL), orDash(referer),
 		truncateStr(r.UserAgent(), 200), clientIP(r), cookieNote(cookies))
 
-	_, _ = h.db.Exec(`
-		UPDATE blind_xss_probes
-		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
-		WHERE token = ?`, evidence, token)
-
-	// A callback is runtime proof. Route it through the same audited lifecycle as
-	// every other detector; repeated hits are idempotent by candidate fingerprint.
-	_, _ = scanner.RecordDetectorObservation(r.Context(), h.db, scanner.DetectorObservation{
+	// A callback is runtime proof. Persist the audited finding FIRST so a busy
+	// SQLite write never loses the confirmed finding while still marking the
+	// probe as hit (which would suppress future alert emission).
+	obs := scanner.DetectorObservation{
 		TargetID: targetID, Type: "blind_xss", Subtype: "callback", Severity: "critical",
 		URL: injURL, Method: "CALLBACK", Parameter: param, Location: sink,
 		Payload: "blind-xss beacon token=" + token, Evidence: evidence,
 		Source: "blind-xss-callback", DetectionMethod: via,
 		Confidence: 100, Priority: 500, Verdict: scanner.VerifyVerified,
-	})
+	}
+	if _, err = scanner.RecordDetectorObservation(r.Context(), h.db, obs); err != nil && strings.Contains(strings.ToLower(err.Error()), "busy") {
+		time.Sleep(200 * time.Millisecond)
+		_, err = scanner.RecordDetectorObservation(r.Context(), h.db, obs)
+	}
+	if err != nil {
+		h.logger.Error("Failed to record blind XSS detector observation", "token", token, "target", targetID, "sink", sink, "error", err)
+		return
+	}
+
+	if _, err := h.db.Exec(`
+		UPDATE blind_xss_probes
+		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
+		WHERE token = ?`, evidence, token); err != nil {
+		h.logger.Error("Failed to update blind XSS probe stats", "token", token, "target", targetID, "error", err)
+	}
 
 	// Broadcast + Telegram alert through the scheduler's scoring path (first hit
 	// only, to avoid alert spam on repeated victim loads).

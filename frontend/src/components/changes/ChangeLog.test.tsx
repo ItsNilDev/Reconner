@@ -235,9 +235,9 @@ describe('ChangeLog default feed', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Daily signals' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('default_view=1'))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
     await vi.waitFor(() => {
-      expect(lastChangesUrl(fetchMock)).toContain('category=scripts')
+      expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts')
       expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
     })
   })
@@ -254,34 +254,49 @@ describe('ChangeLog default feed', () => {
 })
 
 describe('ChangeLog filter controls', () => {
-  it('multi-selects categories and All resets the selection', async () => {
+  it('switches mutually-exclusive type tabs and All clears category', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
-    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=scripts'))
+    fireEvent.click(screen.getByRole('button', { name: 'New hosts' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=hosts'))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Alerts' }))
-    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=scripts,alerts'))
+    fireEvent.click(screen.getByRole('button', { name: 'Scope' }))
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('category=scope')
+      expect(lastChangesUrl(fetchMock)).not.toContain('hosts')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'HTTP' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=http,tech'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts'))
 
     fireEvent.click(screen.getByRole('button', { name: 'All' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).not.toContain('category='))
   })
 
-  it('sends status-only, class, exact codes and search as query params', async () => {
+  it('sends status-only, class, exact codes, source alerts and search as query params', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
     fireEvent.click(screen.getByRole('button', { name: 'Status changes only' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_only=1'))
+    expect(screen.getByRole('button', { name: 'Filters · 1' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '4xx' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_class=4'))
+    expect(screen.getByRole('button', { name: 'Filters · 2' })).toBeInTheDocument()
 
     fireEvent.change(screen.getByPlaceholderText('200,403'), { target: { value: '200,403' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_code=200,403'))
+
+    fireEvent.change(screen.getByLabelText('Source'), { target: { value: 'alerts' } })
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=alerts'))
 
     fireEvent.change(screen.getByPlaceholderText('Search changes…'), { target: { value: 'Forbidden' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('q=Forbidden'))
@@ -292,6 +307,7 @@ describe('ChangeLog filter controls', () => {
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
     fireEvent.change(screen.getByPlaceholderText('200,403'), { target: { value: '20,2000,abc,403' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_code=403'))
     expect(lastChangesUrl(fetchMock)).not.toContain('status_code=20,')
@@ -305,17 +321,17 @@ describe('ChangeLog filter controls', () => {
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Scripts' }))
-    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=scripts'))
+    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts'))
 
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
     fireEvent.click(screen.getByRole('button', { name: 'Status changes only' }))
     fireEvent.click(screen.getByRole('button', { name: 'Mark all read' }))
     await vi.waitFor(() => {
-      expect(lastSeenAllUrl(fetchMock)).toContain('category=scripts')
+      expect(lastSeenAllUrl(fetchMock)).toContain('category=security,headers,scripts')
       expect(lastSeenAllUrl(fetchMock)).toContain('status_only=1')
     })
   })
-
   it('mark-all-read uses raw search text before the debounce settles', async () => {
     vi.useFakeTimers()
     const fetchMock = installFetch()
@@ -356,7 +372,7 @@ describe('ChangeLog scope event renderer', () => {
 
     // Legacy notification rows are hidden in the default view. All history
     // exposes them so the renderer can be exercised.
-    fireEvent.click(screen.getByRole('button', { name: 'Assets & scope' }))
+    fireEvent.click(screen.getByRole('button', { name: 'All history' }))
     const summary = 'api.legacy.test · Example Program · Host landed.'
     expect(await screen.findByText(summary)).toBeInTheDocument()
     expect(screen.getByText('Approved')).toBeInTheDocument()
@@ -370,5 +386,23 @@ describe('ChangeLog scope event renderer', () => {
     expect(screen.getAllByText('yes').length).toBeGreaterThanOrEqual(1)
     expect(document.body.textContent).not.toContain('"identifier"')
     expect(document.body.textContent).not.toContain('"in_scope"')
+  })
+
+  it('renders the detail Drawer as a portal into document.body and closes on Escape', async () => {
+    installFetch({ rows: [watchHost] })
+    const { container } = render(<MemoryRouter><ChangeLog /></MemoryRouter>)
+    expect(await screen.findByText('NEW HOST')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toBeInTheDocument()
+    // Portaled into document.body rather than trapped inside the page subtree.
+    expect(container.contains(dialog)).toBe(false)
+    expect(document.body.contains(dialog)).toBe(true)
+    expect(document.body.style.overflow).toBe('hidden')
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(document.body.style.overflow).toBe('')
   })
 })

@@ -174,3 +174,75 @@ func TestScanConfigConcurrencyPersistsAcrossReload(t *testing.T) {
 			reloaded.Limits.MaxConcurrentWatchScans)
 	}
 }
+
+func TestScanConfigValidationDoesNotMutateInMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("RECON_CONFIG", path)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DNSResolvers = []string{"1.1.1.1"}
+	cfg.SetConcurrencyLimits(4, 2, 2)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	h, _ := newIsoHandler(t)
+	h.cfg = cfg
+	h.sched = scheduler.New(h.db, nil, cfg, h.logger)
+
+	raw, err := json.Marshal(map[string]any{
+		"max_concurrent_scans":      12,
+		"dns_resolvers":             []string{"9.9.9.9"},
+		"watch_enumeration_sources": []string{"bogus"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/system/scan-config", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+	h.handleUpdateScanConfig(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bogus watch_enumeration_sources, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	gotG, gotD, gotW := h.cfg.ConcurrencyLimits()
+	if gotG != 4 || gotD != 2 || gotW != 2 {
+		t.Fatalf("invalid request mutated concurrency limits in memory: got %d/%d/%d want 4/2/2", gotG, gotD, gotW)
+	}
+	if len(h.cfg.DNSResolvers) != 1 || h.cfg.DNSResolvers[0] != "1.1.1.1" {
+		t.Fatalf("invalid request mutated dns_resolvers in memory: got %v want [1.1.1.1]", h.cfg.DNSResolvers)
+	}
+}
+
+func TestScanConfigSaveFailureRollsBackInMemory(t *testing.T) {
+	h, _ := newIsoHandler(t)
+	// Config with no backing path forces SaveLocked() to fail.
+	h.cfg = &config.Config{
+		DNSResolvers: []string{"1.1.1.1"},
+	}
+	h.cfg.SetConcurrencyLimits(3, 1, 1)
+
+	raw, err := json.Marshal(map[string]any{
+		"max_concurrent_scans": 10,
+		"dns_resolvers":        []string{"8.8.8.8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/system/scan-config", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+	h.handleUpdateScanConfig(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when Save fails, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	gotG, gotD, gotW := h.cfg.ConcurrencyLimits()
+	if gotG != 3 || gotD != 1 || gotW != 1 {
+		t.Fatalf("failed Save did not roll back concurrency limits: got %d/%d/%d want 3/1/1", gotG, gotD, gotW)
+	}
+	if len(h.cfg.DNSResolvers) != 1 || h.cfg.DNSResolvers[0] != "1.1.1.1" {
+		t.Fatalf("failed Save did not roll back dns_resolvers: got %v want [1.1.1.1]", h.cfg.DNSResolvers)
+	}
+}

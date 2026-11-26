@@ -381,8 +381,9 @@ func (a *Auth) AdminSetPassword(id int64, newPassword string) error {
 	return tx.Commit()
 }
 
-// DeleteUser removes an account (and its sessions cascade). Refuses to delete
-// the last active administrator.
+// DeleteUser removes an account (and its sessions cascade) after reassigning
+// any owned targets to legacy admin ownership (owner_id = 0). Refuses to
+// delete the last active administrator.
 func (a *Auth) DeleteUser(id int64) error {
 	cur, err := a.GetUser(id)
 	if err != nil {
@@ -397,8 +398,18 @@ func (a *Auth) DeleteUser(id int64) error {
 			return ErrLastAdmin
 		}
 	}
-	_, err = a.db.Exec("DELETE FROM users WHERE id = ?", id)
-	return err
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("UPDATE targets SET owner_id = 0 WHERE owner_id = ?", id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM users WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UsingDefaultPassword reports whether the admin account still has the shipped

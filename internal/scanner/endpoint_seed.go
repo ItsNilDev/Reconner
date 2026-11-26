@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"log/slog"
 	"net/url"
 	"strings"
 
@@ -137,11 +138,13 @@ func SeedEndpointURL(ctx context.Context, db *database.DB, targetID, rawURL stri
 	// 1) Register the endpoint URL as an http_service so crawl/JS/nuclei/dir seed
 	//    from it. source='seed' marks it as operator-provided (not probe-confirmed);
 	//    the consuming queries include 'seed'. A later real probe upgrades the row.
-	_, _ = db.ExecContext(ctx, `
+	if _, err := db.ExecContext(ctx, `
 		INSERT INTO http_services (id, target_id, url, source, status_code)
 		VALUES (?, ?, ?, 'seed', 0)
 		ON CONFLICT(target_id, url) DO NOTHING`,
-		uuid.New().String(), targetID, norm)
+		uuid.New().String(), targetID, norm); err != nil {
+		slog.Warn("Failed to seed endpoint http_service", "target_id", targetID, "url", norm, "error", err)
+	}
 
 	// 2) Register QUERY parameters (location='query'). The value is kept as a hint;
 	//    the reflection/injection engines replace it with their own probes.
@@ -157,7 +160,9 @@ func SeedEndpointURL(ctx context.Context, db *database.DB, targetID, rawURL stri
 			INSERT INTO parameters (id, target_id, url, parameter, value, source, method, content_type, location, is_reflected)
 			VALUES (?, ?, ?, ?, ?, 'endpoint-seed', 'GET', '', 'query', 0)
 			ON CONFLICT(target_id,url,parameter,method,location,content_type) DO UPDATE SET source='endpoint-seed'`,
-			uuid.New().String(), targetID, norm, name, val); err == nil {
+			uuid.New().String(), targetID, norm, name, val); err != nil {
+			slog.Warn("Failed to seed endpoint query parameter", "target_id", targetID, "url", norm, "parameter", name, "error", err)
+		} else {
 			seeded = true
 		}
 	}
@@ -172,7 +177,9 @@ func SeedEndpointURL(ctx context.Context, db *database.DB, targetID, rawURL stri
 			INSERT INTO parameters (id, target_id, url, parameter, value, source, method, content_type, location, is_reflected)
 			VALUES (?, ?, ?, ?, ?, 'endpoint-seed', 'GET', '', ?, 0)
 			ON CONFLICT(target_id,url,parameter,method,location,content_type) DO UPDATE SET source='endpoint-seed', location=excluded.location`,
-			uuid.New().String(), targetID, norm, pname, valsSeg[k], "path:"+itoa(idx)); err == nil {
+			uuid.New().String(), targetID, norm, pname, valsSeg[k], "path:"+itoa(idx)); err != nil {
+			slog.Warn("Failed to seed endpoint path parameter", "target_id", targetID, "url", norm, "parameter", pname, "error", err)
+		} else {
 			seeded = true
 		}
 	}
@@ -201,6 +208,7 @@ func seedPathSegmentsFromURLs(ctx context.Context, db *database.DB, targetID str
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
+		slog.Warn("Failed to begin path-segment seed transaction", "target_id", targetID, "error", err)
 		return 0
 	}
 	stmt, err := tx.PrepareContext(ctx, `
@@ -208,6 +216,7 @@ func seedPathSegmentsFromURLs(ctx context.Context, db *database.DB, targetID str
 		VALUES (?, ?, ?, ?, ?, 'crawl-path', 'GET', '', ?, 0)
 		ON CONFLICT(target_id,url,parameter,method,location,content_type) DO NOTHING`)
 	if err != nil {
+		slog.Warn("Failed to prepare path-segment seed statement", "target_id", targetID, "error", err)
 		_ = tx.Rollback()
 		return 0
 	}
@@ -224,6 +233,7 @@ func seedPathSegmentsFromURLs(ctx context.Context, db *database.DB, targetID str
 		for k, idx := range idxs {
 			res, err := stmt.ExecContext(ctx, uuid.New().String(), targetID, raw, "path"+itoa(idx), vals[k], "path:"+itoa(idx))
 			if err != nil {
+				slog.Warn("Failed to insert crawl path parameter", "target_id", targetID, "url", raw, "error", err)
 				continue
 			}
 			if n, _ := res.RowsAffected(); n > 0 {
@@ -231,7 +241,12 @@ func seedPathSegmentsFromURLs(ctx context.Context, db *database.DB, targetID str
 			}
 		}
 	}
-	_ = stmt.Close()
-	_ = tx.Commit()
+	if err := stmt.Close(); err != nil {
+		slog.Warn("Failed to close path-segment seed statement", "target_id", targetID, "error", err)
+	}
+	if err := tx.Commit(); err != nil {
+		slog.Warn("Failed to commit crawl path parameters", "target_id", targetID, "count", seeded, "error", err)
+		return 0
+	}
 	return seeded
 }

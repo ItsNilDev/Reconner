@@ -1309,3 +1309,75 @@ func TestListChangesContentChangeCategory(t *testing.T) {
 		t.Fatalf("got %+v, want single mc-content-1 with category http", env.Data)
 	}
 }
+
+func TestChangesCategoryHostsAndScope(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	for _, stmt := range []struct {
+		q    string
+		args []any
+	}{
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, []any{adminID}},
+		{`INSERT INTO bounty_programs (id, provider, external_id, handle, name) VALUES ('p1','intigriti','ext-1','p1','Program')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,metadata,detected_at)
+			VALUES ('wc-host','t1','r1','','new_subdomain','','sub.one.example','medium','{"hosts":["sub.one.example"]}','2026-06-01 00:00:01')`, nil},
+		{`INSERT INTO notifications (id,target_id,type,title,body,metadata,created_at)
+			VALUES ('n-host','t1','new_host','New host','deep.one.example','{"source":"monitor"}','2026-06-01 00:00:02')`, nil},
+		{`INSERT INTO bounty_scope_events (id,target_id,program_id,event_type,identifier,detected_at)
+			VALUES ('se-bounty','t1','p1','added','api.one.example','2026-06-01 00:00:03')`, nil},
+		{`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+			VALUES ('ws-scope','t1','p1','old.one.example','landed','a1','{}','2026-06-01 00:00:04')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http','t1','https://one.example','http_change','status=403 title=Forbidden','status=200 title=OK','high',403,200,'2026-06-01 00:00:05')`, nil},
+	} {
+		if _, err := h.db.Exec(stmt.q, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want map[string]bool
+	}{
+		{
+			name: "category=hosts returns watch new_subdomain and deep new_host only",
+			path: "/api/changes?category=hosts",
+			want: map[string]bool{"wc-host": true, "n-host": true},
+		},
+		{
+			name: "category=scope returns bounty and watch_scope only",
+			path: "/api/changes?category=scope",
+			want: map[string]bool{"se-bounty": true, "ws-scope": true},
+		},
+		{
+			name: "category=hosts,http combines virtual and standard categories with OR",
+			path: "/api/changes?category=hosts,http",
+			want: map[string]bool{"wc-host": true, "n-host": true, "mc-http": true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveChanges(t, h, sid, tc.path, nil, h.handleListChanges)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var env changesEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := idsOf(env.Data)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got ids %v (total=%d), want %v", got, env.Total, tc.want)
+			}
+			for id := range tc.want {
+				if !got[id] {
+					t.Fatalf("missing %q in %v", id, got)
+				}
+			}
+		})
+	}
+}

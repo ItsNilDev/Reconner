@@ -56,6 +56,65 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(({ label, error, c
 })
 Input.displayName = 'Input'
 
+let scrollLockCount = 0
+let savedBodyOverflow = ''
+let savedWorkspaceEl: HTMLElement | null = null
+let savedWorkspaceOverflow = ''
+
+// Ref-counted scroll lock covering both document.body and the main workspace
+// container so nested overlays (e.g. Drawer -> ChangeDiffViewer Modal) never
+// unlock scrolling prematurely when the inner layer closes.
+export function acquireScrollLock(): () => void {
+  if (scrollLockCount === 0) {
+    savedBodyOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    savedWorkspaceEl = document.querySelector<HTMLElement>('main.workspace')
+    if (savedWorkspaceEl) {
+      savedWorkspaceOverflow = savedWorkspaceEl.style.overflow
+      savedWorkspaceEl.style.overflow = 'hidden'
+    }
+  }
+  scrollLockCount++
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    scrollLockCount = Math.max(0, scrollLockCount - 1)
+    if (scrollLockCount === 0) {
+      document.body.style.overflow = savedBodyOverflow
+      if (savedWorkspaceEl) {
+        savedWorkspaceEl.style.overflow = savedWorkspaceOverflow
+        savedWorkspaceEl = null
+      }
+    }
+  }
+}
+
+const escapeStack: Array<() => void> = []
+let escapeListenerAttached = false
+
+function handleGlobalEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  const top = escapeStack[escapeStack.length - 1]
+  if (top) top()
+}
+
+function registerEscapeClose(onClose: () => void): () => void {
+  escapeStack.push(onClose)
+  if (!escapeListenerAttached) {
+    document.addEventListener('keydown', handleGlobalEscape)
+    escapeListenerAttached = true
+  }
+  return () => {
+    const idx = escapeStack.lastIndexOf(onClose)
+    if (idx !== -1) escapeStack.splice(idx, 1)
+    if (escapeStack.length === 0 && escapeListenerAttached) {
+      document.removeEventListener('keydown', handleGlobalEscape)
+      escapeListenerAttached = false
+    }
+  }
+}
+
 export const Modal = ({ open, onClose, title, children, footer, width='md', bodyClassName }: {
   open: boolean
   onClose: () => void
@@ -68,18 +127,18 @@ export const Modal = ({ open, onClose, title, children, footer, width='md', body
   const w = { sm:'max-w-sm', md:'max-w-md', lg:'max-w-2xl', xl:'max-w-4xl' }
   const titleID = useId()
   const bodyRef = useRef<HTMLDivElement>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
   useEffect(() => {
     if (!open) return
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    bodyRef.current?.scrollTo({ top: 0 })
-    document.addEventListener('keydown', closeOnEscape)
+    const releaseLock = acquireScrollLock()
+    const unregisterEscape = registerEscapeClose(() => onCloseRef.current())
+    if (bodyRef.current) bodyRef.current.scrollTop = 0
     return () => {
-      document.removeEventListener('keydown', closeOnEscape)
-      document.body.style.overflow = previousOverflow
+      unregisterEscape()
+      releaseLock()
     }
-  }, [open, onClose])
+  }, [open])
   if (!open) return null
   return createPortal(
     <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center overflow-hidden p-2 sm:p-4">
@@ -90,6 +149,71 @@ export const Modal = ({ open, onClose, title, children, footer, width='md', body
         <div ref={bodyRef} data-modal-scroll-region className={cn('min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-5', bodyClassName)}>{children}</div>
         {footer && <div className="shrink-0 border-t border-border bg-surface-2 px-4 py-3 sm:px-5">{footer}</div>}
       </div>
+    </div>,
+    document.body,
+  )
+}
+
+export const Drawer = ({ open, onClose, title, subtitle, children, footer, width = 'md' }: {
+  open: boolean
+  onClose: () => void
+  title?: React.ReactNode
+  subtitle?: React.ReactNode
+  children: React.ReactNode
+  footer?: React.ReactNode
+  width?: 'md' | 'lg'
+}) => {
+  const titleID = useId()
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  useEffect(() => {
+    if (!open) return
+    const releaseLock = acquireScrollLock()
+    const unregisterEscape = registerEscapeClose(() => onCloseRef.current())
+    if (bodyRef.current) bodyRef.current.scrollTop = 0
+    return () => {
+      unregisterEscape()
+      releaseLock()
+    }
+  }, [open])
+  if (!open) return null
+  return createPortal(
+    <div className="fixed inset-0 z-[100] flex justify-end overflow-hidden">
+      <button
+        type="button"
+        aria-label="Close panel"
+        tabIndex={-1}
+        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <aside
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? titleID : undefined}
+        className={cn(
+          'relative flex h-dvh w-full flex-col border-l border-border bg-surface-1 shadow-2xl',
+          width === 'lg' ? 'max-w-2xl' : 'max-w-lg',
+        )}
+      >
+        {(title || subtitle) && (
+          <header className="flex shrink-0 items-start justify-between gap-3 border-b border-border px-5 py-4">
+            <div className="min-w-0">
+              {title && <h3 id={titleID} className="text-sm font-semibold">{title}</h3>}
+              {subtitle && <div className="mt-1 break-all text-xs text-text-muted">{subtitle}</div>}
+            </div>
+            <Button size="sm" variant="ghost" onClick={onClose} className="shrink-0">Close</Button>
+          </header>
+        )}
+        <div ref={bodyRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
+          {children}
+        </div>
+        {footer && (
+          <footer className="shrink-0 border-t border-border p-4">
+            {footer}
+          </footer>
+        )}
+      </aside>
     </div>,
     document.body,
   )

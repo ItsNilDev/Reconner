@@ -206,7 +206,6 @@ func (h *Handler) Router() http.Handler {
 	api.HandleFunc("/targets/{id}/vuln-findings", h.requireAuth(h.handleListVulnFindings)).Methods("GET")
 	// Global findings aggregation (top-level Findings page) across all the caller's targets.
 	api.HandleFunc("/findings", h.requireAuth(h.handleListAllFindings)).Methods("GET")
-	api.HandleFunc("/targets/{id}/monitoring-changes", h.requireAuth(h.handleListMonitoringChanges)).Methods("GET")
 	api.HandleFunc("/changes", h.requireAuth(h.handleListChanges)).Methods("GET")
 	api.HandleFunc("/changes/seen", h.requireAuth(h.handleSetChangesSeen)).Methods("POST")
 	api.HandleFunc("/changes/seen-all", h.requireAuth(h.handleMarkAllChangesSeen)).Methods("POST")

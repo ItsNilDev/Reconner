@@ -110,7 +110,13 @@ function mockApi(opts?: { changes?: ChangeEntry[]; rounds?: WatchRound[] }) {
       const cats = cat ? cat.split(',').filter(c => c && c !== 'all') : []
       const hideSeen = u.searchParams.get('hide_seen') === '1'
       const defaultView = u.searchParams.get('default_view') === '1'
-      let filtered = cats.length ? rows.filter(r => cats.includes(r.category)) : rows
+      let filtered = cats.length
+        ? rows.filter(r => cats.some(c => {
+          if (c === 'hosts') return r.change_type === 'new_subdomain' || r.change_type === 'new_host'
+          if (c === 'scope') return r.source === 'bounty' || r.source === 'watch_scope'
+          return r.category === c
+        }))
+        : rows
       if (defaultView) filtered = filtered.filter(matchesDefaultView)
       return envelope(hideSeen ? filtered.filter(r => !r.seen) : filtered)
     }
@@ -142,7 +148,7 @@ describe('global Changes page', () => {
     expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument()
   })
 
-  it('filters the feed by category chips with multi-select', async () => {
+  it('filters the feed with mutually-exclusive type tabs', async () => {
     const user = userEvent.setup()
     mockApi()
     render(<MemoryRouter><Changes /></MemoryRouter>)
@@ -151,14 +157,19 @@ describe('global Changes page', () => {
     await user.click(screen.getByRole('button', { name: 'HTTP' }))
     await waitFor(() => expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument())
     expect(screen.getByText('STATUS CODE')).toBeInTheDocument()
+    expect(screen.queryByText('NEW HOST')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Scripts' }))
+    await user.click(screen.getByRole('button', { name: 'Security & JS' }))
     await waitFor(() => expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument())
-    expect(screen.getByText('STATUS CODE')).toBeInTheDocument()
+    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'HTTP' }))
-    await waitFor(() => expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument())
-    expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'New hosts' }))
+    await waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+    expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Scope' }))
+    await waitFor(() => expect(screen.getByText('api.beta.test · Example Program · Scope modified.')).toBeInTheDocument())
+    expect(screen.queryByText('NEW HOST')).not.toBeInTheDocument()
   })
 
   it('filters by round when a round chip is clicked', async () => {
@@ -188,7 +199,7 @@ describe('global Changes page', () => {
       String(input).includes('/api/changes/seen-all'))).toBe(true)
     )
 
-    await user.click(screen.getByLabelText('Hide seen'))
+    await user.click(screen.getByRole('button', { name: 'Unread' }))
     expect(await screen.findByText('All changes are marked as seen.')).toBeInTheDocument()
   })
 

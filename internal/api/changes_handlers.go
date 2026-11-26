@@ -248,7 +248,8 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		filterArgs = append(filterArgs, eventID)
 	}
 
-	// category accepts a comma list. "all" is dropped; all,http means http.
+	// category accepts a comma list of standard categories plus the virtual
+	// categories "hosts" and "scope". "all" is dropped; all,http means http.
 	// Unknown tokens are ignored. A non-empty value with no valid category
 	// (for example ",,," or "garbage") matches nothing instead of silently
 	// returning every category.
@@ -260,6 +261,8 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		cats := make([]string, 0, 4)
 		seenCat := map[string]bool{}
 		hasAll := false
+		hasHosts := false
+		hasScope := false
 		for _, c := range strings.Split(v, ",") {
 			c = strings.TrimSpace(c)
 			if c == "" {
@@ -269,18 +272,36 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 				hasAll = true
 				continue
 			}
+			if c == "hosts" {
+				hasHosts = true
+				continue
+			}
+			if c == "scope" {
+				hasScope = true
+				continue
+			}
 			if validCategories[c] && !seenCat[c] {
 				seenCat[c] = true
 				cats = append(cats, c)
 			}
 		}
+		predicates := make([]string, 0, 3)
 		if len(cats) > 0 {
 			ph := make([]string, len(cats))
 			for i, c := range cats {
 				ph[i] = "?"
 				filterArgs = append(filterArgs, c)
 			}
-			filters = append(filters, `x.category IN (`+strings.Join(ph, ",")+`)`)
+			predicates = append(predicates, `x.category IN (`+strings.Join(ph, ",")+`)`)
+		}
+		if hasHosts {
+			predicates = append(predicates, `x.change_type IN ('new_subdomain','new_host')`)
+		}
+		if hasScope {
+			predicates = append(predicates, `x.source IN ('bounty','watch_scope')`)
+		}
+		if len(predicates) > 0 {
+			filters = append(filters, `(`+strings.Join(predicates, ` OR `)+`)`)
 		} else if !hasAll {
 			filters = append(filters, `1=0`)
 		}

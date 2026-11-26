@@ -624,12 +624,17 @@ func (c *HeadlessCrawler) storeStates(ctx context.Context, targetID, pageURL str
 			continue
 		}
 		fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
-		_, _ = c.db.ExecContext(ctx, `INSERT INTO browser_states
+		if _, err := c.db.ExecContext(ctx, `INSERT INTO browser_states
 			(id,target_id,url,fingerprint,parent_fingerprint,sequence,source)
 			VALUES(?,?,?,?,?,?,'headless')
 			ON CONFLICT(target_id,fingerprint) DO UPDATE SET
 				url=excluded.url,parent_fingerprint=excluded.parent_fingerprint,sequence=excluded.sequence`,
-			uuid.NewString(), targetID, pageURL, fingerprint, parent, sequence)
+			uuid.NewString(), targetID, pageURL, fingerprint, parent, sequence); err != nil {
+			if c.logger != nil {
+				c.logger.Warn("Failed to store headless browser state", "target_id", targetID, "url", pageURL, "error", err)
+			}
+			continue
+		}
 		parent = fingerprint
 	}
 }
@@ -698,6 +703,9 @@ func (c *HeadlessCrawler) storeParams(ctx context.Context, targetID string, para
 	stored := 0
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
+		if c.logger != nil {
+			c.logger.Warn("Failed to begin headless parameter transaction", "target_id", targetID, "error", err)
+		}
 		return 0
 	}
 	for _, p := range params {
@@ -729,11 +737,18 @@ func (c *HeadlessCrawler) storeParams(ctx context.Context, targetID string, para
 			ON CONFLICT(target_id,url,parameter,method,location,content_type) DO UPDATE SET
 				value=CASE WHEN excluded.value<>'' THEN excluded.value ELSE parameters.value END,
 				source=CASE WHEN parameters.source='' THEN excluded.source ELSE parameters.source END`,
-			uuid.New().String(), targetID, p.URL, p.Param, p.Value, p.Source, method, contentType, location); err == nil {
+			uuid.New().String(), targetID, p.URL, p.Param, p.Value, p.Source, method, contentType, location); err != nil {
+			if c.logger != nil {
+				c.logger.Warn("Failed to store headless parameter", "target_id", targetID, "url", p.URL, "parameter", p.Param, "error", err)
+			}
+		} else {
 			stored++
 		}
 	}
-	if tx.Commit() != nil {
+	if err := tx.Commit(); err != nil {
+		if c.logger != nil {
+			c.logger.Warn("Failed to commit headless parameters", "target_id", targetID, "count", stored, "error", err)
+		}
 		return 0
 	}
 	return stored

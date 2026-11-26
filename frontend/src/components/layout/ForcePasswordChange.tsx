@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { auth as authApi } from '../../lib/api'
 import { useAuthStore } from '../../store/auth'
-import { Button, Input } from '../ui'
+import { acquireScrollLock, Button, Input } from '../ui'
 
 // Blocking modal shown when the admin still has the shipped default password
 // (must_change_password from /auth/me). It cannot be dismissed — the operator
@@ -15,8 +16,14 @@ export const ForcePasswordChange = () => {
   const [confirm, setConfirm] = useState('')
   const [err, setErr] = useState('')
   const [saving, setSaving] = useState(false)
+  const open = Boolean(user?.must_change_password)
 
-  if (!user?.must_change_password) return null
+  useEffect(() => {
+    if (!open) return
+    return acquireScrollLock()
+  }, [open])
+
+  if (!open) return null
 
   const submit = async () => {
     setErr('')
@@ -33,7 +40,7 @@ export const ForcePasswordChange = () => {
     }
   }
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" />
       <div className="relative bg-surface-2 border border-border rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
@@ -57,6 +64,7 @@ export const ForcePasswordChange = () => {
           <Button variant="primary" loading={saving} onClick={submit}>Set password</Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

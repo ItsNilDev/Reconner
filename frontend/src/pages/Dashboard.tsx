@@ -151,7 +151,7 @@ const KIND_CHIP: Record<string, string> = {
 }
 
 const TASK_STATUS_DOT: Record<string, string> = {
-  running: 'dot-running', completed: 'dot-online', failed: 'dot-error',
+  running: 'dot-running', completed: 'dot-online', finished: 'dot-online', failed: 'dot-error',
   paused: 'dot-offline', pending: 'dot-offline', queued: 'dot-offline', cancelled: 'dot-offline',
 }
 
@@ -206,16 +206,44 @@ export default function Dashboard() {
   const [charts, setCharts] = useState<DashboardCharts | null>(null)
   const [topSort, setTopSort] = useState<'findings' | 'subdomains' | 'alive_hosts'>('findings')
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [chartsError, setChartsError] = useState('')
   const load = async () => {
+    setError('')
+    setChartsError('')
     try {
-      const [s, c] = await Promise.all([dashboard.stats(), dashboard.charts().catch(() => ({}))])
-      setStats(s); setCharts(c)
-    } catch { /**/ } finally { setLoading(false) }
+      const [s, cRes] = await Promise.all([
+        dashboard.stats(),
+        dashboard.charts().then(
+          data => ({ data, err: '' }),
+          e => ({ data: null as DashboardCharts | null, err: e instanceof Error ? e.message : 'Could not load charts' }),
+        ),
+      ])
+      setStats(s)
+      if (cRes.err) {
+        setChartsError(cRes.err)
+      } else {
+        setCharts(cRes.data)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load dashboard statistics')
+    } finally { setLoading(false) }
   }
   useEffect(() => { load(); const i = setInterval(load, 30000); return () => clearInterval(i) }, [])
   if (loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-10 h-10"/></div>
-  if (!stats) return null
+  if (!stats) {
+    return (
+      <div className="card p-6 max-w-lg mx-auto mt-10 space-y-3 text-center">
+        <p className="text-sm font-semibold text-severity-high">Failed to load dashboard</p>
+        <p className="text-xs text-text-muted">{error || 'Unable to load dashboard statistics.'}</p>
+        <div className="pt-1">
+          <button onClick={() => { setLoading(true); load() }} className="btn-secondary text-xs px-4 py-2">Retry</button>
+        </div>
+      </div>
+    )
+  }
 
+  const chartsUnavailable = !!chartsError && !charts
   const sev = charts?.severity_breakdown || []
   const totalVulns = sev.reduce((s, d) => s + d.count, 0)
   const critHigh = sev.filter(d => d.severity === 'critical' || d.severity === 'high').reduce((s, d) => s + d.count, 0)
@@ -234,7 +262,7 @@ export default function Dashboard() {
           <div className="mt-5 flex items-center gap-4 text-[11px] text-text-muted">
             <span className="inline-flex items-center gap-2"><span className="dot-online" /> Platform ready</span>
             <span>{stats.running_tasks} active scan{stats.running_tasks === 1 ? '' : 's'}</span>
-            <span>{critHigh} urgent</span>
+            <span>{chartsUnavailable ? '—' : critHigh} urgent</span>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2 lg:min-w-[340px]">
@@ -246,12 +274,25 @@ export default function Dashboard() {
       </div>
       </section>
 
+      {error && (
+        <div className="rounded-xl border border-severity-high/30 bg-severity-high/10 px-4 py-3 flex items-center justify-between gap-3 text-xs text-severity-high">
+          <span>Refresh failed: {error}</span>
+          <button onClick={load} className="btn-ghost text-xs py-1 px-2 shrink-0">Retry</button>
+        </div>
+      )}
+      {chartsError && (
+        <div className="rounded-xl border border-severity-medium/30 bg-severity-medium/10 px-4 py-3 flex items-center justify-between gap-3 text-xs text-severity-medium">
+          <span>Finding charts could not be loaded ({chartsError}). Finding summaries may be incomplete.</span>
+          <button onClick={load} className="text-accent hover:underline shrink-0">Retry</button>
+        </div>
+      )}
+
       {/* Hero KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <SplitStat label="Projects" deep={stats.deep_targets} watch={stats.watch_targets} hint="Defined scopes" icon={Icons.targets} />
         <SplitStat label="Live services" deep={stats.deep_alive_hosts} watch={stats.watch_alive_hosts} tone="text-severity-low" hint="Reachable now" icon={Icons.network} />
-        <Stat label="Verified findings" value={totalVulns} tone={totalVulns > 0 ? 'text-severity-high' : undefined} hint="Evidence attached" icon={VerifiedIcon} />
-        <Stat label="Urgent" value={critHigh} tone={critHigh > 0 ? 'text-severity-critical' : undefined} hint="Critical + high" icon={AlertIcon} />
+        <Stat label="Verified findings" value={chartsUnavailable ? '—' : totalVulns} tone={!chartsUnavailable && totalVulns > 0 ? 'text-severity-high' : undefined} hint="Evidence attached" icon={VerifiedIcon} />
+        <Stat label="Urgent" value={chartsUnavailable ? '—' : critHigh} tone={!chartsUnavailable && critHigh > 0 ? 'text-severity-critical' : undefined} hint="Critical + high" icon={AlertIcon} />
       </div>
 
       {/* Charts row */}

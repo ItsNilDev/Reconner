@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,6 +109,132 @@ func TestToolNameValidatorAllowsCuratedBareNames(t *testing.T) {
 	for _, name := range []string{"httpx", "python3", "nuclei-templates", "tool_v2.1", "c++"} {
 		if err := validateToolName(name); err != nil {
 			t.Fatalf("validateToolName(%q): %v", name, err)
+		}
+	}
+}
+
+func TestRunWithCallbackHandlesLargeStdoutLineAndContinues(t *testing.T) {
+	t.Parallel()
+	exec := NewExecutor(&config.Config{}, logger.New("error"))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var lines []string
+	err := exec.RunWithCallback(ctx, "large-stdout", func(l string) {
+		lines = append(lines, l)
+	}, "sh", "-c", `head -c 2097152 /dev/zero | tr '\0' 'a'; printf '\nafter-large\n'`)
+	if err != nil {
+		t.Fatalf("RunWithCallback failed on 2MB stdout line: %v", err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2 (2MB line + trailing normal line)", len(lines))
+	}
+	if len(lines[0]) != 2*1024*1024 {
+		t.Fatalf("first line length = %d, want %d", len(lines[0]), 2*1024*1024)
+	}
+	if lines[1] != "after-large" {
+		t.Fatalf("second line = %q, want %q", lines[1], "after-large")
+	}
+}
+
+func TestScanStreamLinesDrainsOversizedLineAndContinues(t *testing.T) {
+	t.Parallel()
+	input := "before\n" + strings.Repeat("X", 200) + "\nafter\r\nfinal-no-eol"
+	var got []string
+	var dropped []int
+	err := scanStreamLines(strings.NewReader(input), 64, func(line string) {
+		got = append(got, line)
+	}, func(n int) {
+		dropped = append(dropped, n)
+	})
+	if err != nil {
+		t.Fatalf("scanStreamLines error: %v", err)
+	}
+	if len(dropped) != 1 || dropped[0] <= 64 {
+		t.Fatalf("dropped = %v, want 1 oversized drop > 64 bytes", dropped)
+	}
+	want := []string{"before", "after", "final-no-eol"}
+	if len(got) != len(want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("line[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunWithCallbackDrainsLargeStderrWithoutHanging(t *testing.T) {
+	t.Parallel()
+	exec := NewExecutor(&config.Config{}, logger.New("error"))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var lines []string
+	// Emit >64 KiB on a single stderr line plus a normal stdout line.
+	err := exec.RunWithCallback(ctx, "large-stderr", func(l string) {
+		lines = append(lines, l)
+	}, "sh", "-c", `(head -c 131072 /dev/zero | tr '\0' 'e'; printf '\n') 1>&2; printf 'ok-stdout\n'`)
+	if err != nil {
+		t.Fatalf("RunWithCallback failed on >64KB stderr line: %v", err)
+	}
+	if len(lines) != 1 || lines[0] != "ok-stdout" {
+		t.Fatalf("stdout lines = %q, want [ok-stdout]", lines)
+	}
+}
+
+func TestKillTaskTerminatesAllConcurrentProcessesSharingKey(t *testing.T) {
+	t.Parallel()
+	exec := NewExecutor(&config.Config{
+		Limits: config.ResourceLimits{MaxToolExecutions: 4},
+	}, logger.New("error"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const key = "shared-target"
+	ready := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := exec.RunWithCallback(ctx, key, func(line string) {
+				if line == "started" {
+					ready <- struct{}{}
+				}
+			}, "sh", "-c", "echo started; exec sleep 30")
+			errs <- err
+		}()
+	}
+
+	for range 2 {
+		select {
+		case <-ready:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent processes to start")
+		}
+	}
+
+	exec.KillTask(key)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("KillTask did not terminate both concurrent processes sharing key")
+	}
+
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Fatal("expected killed process to return an error")
 		}
 	}
 }

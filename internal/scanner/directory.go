@@ -1057,21 +1057,32 @@ func (s *DirScanner) RunOpenRedirectDiscovery(ctx context.Context, targetID stri
 					found.Add(1)
 				}
 				desc := fmt.Sprintf("%s -> %s", res.testURL, res.finalLoc)
-				_, _ = s.db.Exec(`
-					INSERT INTO open_redirect_findings (id, target_id, url, redirect_to, parameter, verified, status, provenance)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-					ON CONFLICT(target_id, url) DO UPDATE SET
-						redirect_to = excluded.redirect_to,
-						verified = excluded.verified,
-						status = excluded.status,
-						provenance = excluded.provenance
-				`, id, targetID, ip.URL, desc, ip.Param, verified, status, res.chain)
+				if err := upsertOpenRedirectFinding(s.db, id, targetID, ip.URL, desc, ip.Param, verified, status, res.chain); err != nil {
+					logFn("warn", "open_redirect", fmt.Sprintf("Failed to store open redirect finding for %s: %v", ip.URL, err))
+					if s.logger != nil {
+						s.logger.Warn("Failed to store open redirect finding", "target_id", targetID, "url", ip.URL, "error", err)
+					}
+				}
 			}
 		}(item)
 	}
 	wg.Wait()
 	logFn("info", "open_redirect", fmt.Sprintf("Open redirect scan done. Found %d verified redirects.", found.Load()))
 	return nil
+}
+
+func upsertOpenRedirectFinding(db *database.DB, id, targetID, rawURL, desc, param string, verified int, status, chain string) error {
+	_, err := db.Exec(`
+		INSERT INTO open_redirect_findings (id, target_id, url, redirect_to, parameter, verified, status, provenance)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(target_id, url) DO UPDATE SET
+			parameter = CASE WHEN excluded.verified >= open_redirect_findings.verified THEN excluded.parameter ELSE open_redirect_findings.parameter END,
+			redirect_to = CASE WHEN excluded.verified >= open_redirect_findings.verified THEN excluded.redirect_to ELSE open_redirect_findings.redirect_to END,
+			provenance = CASE WHEN excluded.verified >= open_redirect_findings.verified THEN excluded.provenance ELSE open_redirect_findings.provenance END,
+			verified = MAX(open_redirect_findings.verified, excluded.verified),
+			status = CASE WHEN open_redirect_findings.verified = 1 OR excluded.verified = 1 THEN 'finding' ELSE excluded.status END
+	`, id, targetID, rawURL, desc, param, verified, status, chain)
+	return err
 }
 
 // looksLikeHTML reports whether a body is an HTML document — used to reject the

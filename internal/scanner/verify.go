@@ -426,7 +426,9 @@ func (s *VerifyScanner) markNucleiVerification(targetID, sourceResultID, detecti
 	}
 	base := `UPDATE nuclei_findings SET verification=?, confidence=?, verified_at=` + verifiedAt + ` WHERE target_id=?`
 	if sourceResultID != "" {
-		_, _ = s.db.Exec(base+` AND id=?`, verification, confidence, targetID, sourceResultID)
+		if _, err := s.db.Exec(base+` AND id=?`, verification, confidence, targetID, sourceResultID); err != nil && s.logger != nil {
+			s.logger.Warn("Failed to update nuclei finding verification", "target_id", targetID, "id", sourceResultID, "error", err)
+		}
 		return
 	}
 	// A legacy candidate has no exact source id. Narrow by its template before
@@ -434,16 +436,32 @@ func (s *VerifyScanner) markNucleiVerification(targetID, sourceResultID, detecti
 	// matched the same URL (review finding #9).
 	if strings.HasPrefix(detectionMethod, "template:") {
 		templateID := strings.TrimPrefix(detectionMethod, "template:")
-		res, _ := s.db.Exec(base+` AND template_id=? AND matched_url=?`, verification, confidence, targetID, templateID, matchedURL)
-		if n, _ := res.RowsAffected(); n > 0 {
+		res, err := s.db.Exec(base+` AND template_id=? AND matched_url=?`, verification, confidence, targetID, templateID, matchedURL)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("Failed to update nuclei finding verification by template", "target_id", targetID, "template_id", templateID, "error", err)
+			}
+			return
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			return
 		}
 	}
-	_, _ = s.db.Exec(base+` AND matched_url=? AND verification='unverified'`, verification, confidence, targetID, matchedURL)
+	if _, err := s.db.Exec(base+` AND matched_url=? AND verification='unverified'`, verification, confidence, targetID, matchedURL); err != nil && s.logger != nil {
+		s.logger.Warn("Failed to update nuclei finding verification by URL", "target_id", targetID, "url", matchedURL, "error", err)
+	}
+}
+
+func isProtectedTriage(triage string) bool {
+	switch strings.ToLower(strings.TrimSpace(triage)) {
+	case "confirmed", "accepted_risk", "fixed":
+		return true
+	default:
+		return false
+	}
 }
 
 // contextPayloadFor pulls the example payload out of the verifier evidence line
-// so the finding carries an exact executable payload.
 func contextPayloadFor(evidence string) string {
 	for _, prefix := range []string{"Executable payload: ", "Executable payload example: "} {
 		if i := strings.Index(evidence, prefix); i >= 0 {
@@ -553,28 +571,28 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT vf.id, vf.type, vf.severity, vf.url, vf.parameter, vf.payload,
 		       COALESCE(p.method,'GET'), COALESCE(vf.confidence,0), COALESCE(vf.status,'finding'),
-		       COALESCE(vf.lifecycle,'LEGACY'), COALESCE(vf.candidate_id,'')
+		       COALESCE(vf.lifecycle,'LEGACY'), COALESCE(vf.candidate_id,''), COALESCE(vf.triage,'')
 		FROM vuln_findings vf
 		LEFT JOIN parameters p ON p.target_id = vf.target_id AND p.url = vf.url AND p.parameter = vf.parameter
 		WHERE vf.target_id = ?
 	`, targetID)
 	if err != nil {
 		// method join is best-effort; fall back to a plain select
-		rows, err = s.db.QueryContext(ctx, `SELECT id, type, severity, url, parameter, payload, 'GET', COALESCE(confidence,0), COALESCE(status,'finding'), COALESCE(lifecycle,'LEGACY'), COALESCE(candidate_id,'') FROM vuln_findings WHERE target_id = ?`, targetID)
+		rows, err = s.db.QueryContext(ctx, `SELECT id, type, severity, url, parameter, payload, 'GET', COALESCE(confidence,0), COALESCE(status,'finding'), COALESCE(lifecycle,'LEGACY'), COALESCE(candidate_id,''), COALESCE(triage,'') FROM vuln_findings WHERE target_id = ?`, targetID)
 		if err != nil {
 			return err
 		}
 	}
 	type finding struct {
 		id, typ, sev, url, param, payload, method string
-		lifecycle, candidateID                    string
+		lifecycle, candidateID, triage            string
 		existingConf                              int
 		existingStatus                            string
 	}
 	var findings []finding
 	for rows.Next() {
 		var f finding
-		if err := rows.Scan(&f.id, &f.typ, &f.sev, &f.url, &f.param, &f.payload, &f.method, &f.existingConf, &f.existingStatus, &f.lifecycle, &f.candidateID); err == nil {
+		if err := rows.Scan(&f.id, &f.typ, &f.sev, &f.url, &f.param, &f.payload, &f.method, &f.existingConf, &f.existingStatus, &f.lifecycle, &f.candidateID, &f.triage); err == nil {
 			findings = append(findings, f)
 		}
 	}
@@ -590,6 +608,7 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 		if ctx.Err() != nil {
 			break
 		}
+		protected := isProtectedTriage(f.triage)
 		// Start from the known baseline for the type, but NEVER downgrade a
 		// confidence a module already computed for this finding (e.g. a
 		// magic-byte-confirmed backup at 95, an OOB-confirmed blind bug at 100).
@@ -603,7 +622,15 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 			canonicalPending = true
 		}
 		if canonicalRejected {
-			_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence=0, priority=0, status='rejected' WHERE id=?`, f.id)
+			if protected {
+				continue
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE vuln_findings SET confidence=0, priority=0, status='rejected' WHERE id=?`, f.id); err != nil {
+				logFn("warn", "verify", fmt.Sprintf("Failed to mark rejected finding %s: %v", f.id, err))
+				if s.logger != nil {
+					s.logger.Warn("Failed to mark rejected finding", "target_id", targetID, "finding_id", f.id, "error", err)
+				}
+			}
 			continue
 		}
 		conf := baseConfidence[f.typ]
@@ -621,18 +648,24 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 		}
 
 		replayed := false
+		replayInconclusive := false
 
 		// Re-verify replayable classes by replaying the payload — this is an
 		// active check, so it is authoritative (may raise to 99 or lower to 45).
+		// Transient network/timeout/rate-limit/5xx/WAF failures are inconclusive
+		// and never downgrade an already-recorded finding.
 		if check, ok := reVerifiable[f.typ]; ok && f.payload != "" && f.param != "" {
 			ip := insertionPoint{URL: f.url, Param: f.param, Method: f.method}
-			body, _ := sendInjected(ctx, verifyClient, ip, f.payload, auth)
-			replayed = true
-			if body != "" && check(body) {
+			body, statusCode, _ := sendInjectedFull(ctx, verifyClient, ip, f.payload, auth)
+			if statusCode != 0 && body != "" && check(body) {
+				replayed = true
 				conf = 99
 				reproduced++
+			} else if statusCode == 0 || statusCode == http.StatusTooManyRequests || statusCode >= 500 || looksLikeWAFBlock(statusCode, body) {
+				replayInconclusive = true
 			} else {
-				conf = 45 // did not reproduce → likely transient FP
+				replayed = true
+				conf = 45 // clean response did not reproduce → likely transient FP
 				downgraded++
 			}
 		}
@@ -646,8 +679,17 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 		if IsFinding(conf) && !canonicalPending {
 			status = StatusFinding
 		}
+		if replayInconclusive && f.existingStatus == StatusFinding && !canonicalPending {
+			status = StatusFinding
+		}
 		if replayed && conf == 45 {
 			status = StatusCandidate
+		}
+		if protected && f.existingStatus == StatusFinding {
+			status = StatusFinding
+			if conf < f.existingConf {
+				conf = f.existingConf
+			}
 		}
 
 		priority := severityWeight[strings.ToLower(f.sev)] * conf / 100
@@ -656,18 +698,26 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 		if promoted {
 			// A durable promotion timestamp lets the Telegram sweep find a
 			// candidate that became a finding after its creation window (B7).
-			_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence = ?, priority = ?, status = ?, verified_at = CURRENT_TIMESTAMP WHERE id = ?`, conf, priority, status, f.id)
-			if s.broadcast != nil {
+			if _, err := s.db.ExecContext(ctx, `UPDATE vuln_findings SET confidence = ?, priority = ?, status = ?, verified_at = CURRENT_TIMESTAMP WHERE id = ?`, conf, priority, status, f.id); err != nil {
+				logFn("warn", "verify", fmt.Sprintf("Failed to promote finding %s: %v", f.id, err))
+				if s.logger != nil {
+					s.logger.Warn("Failed to promote finding", "target_id", targetID, "finding_id", f.id, "error", err)
+				}
+			} else if s.broadcast != nil {
 				s.broadcast("new_vuln_finding", map[string]any{
 					"target_id": targetID, "type": f.typ, "url": f.url,
 					"parameter": f.param, "finding_id": f.id,
 				})
 			}
 		} else {
-			_, _ = s.db.Exec(`UPDATE vuln_findings SET confidence = ?, priority = ?, status = ? WHERE id = ?`, conf, priority, status, f.id)
+			if _, err := s.db.ExecContext(ctx, `UPDATE vuln_findings SET confidence = ?, priority = ?, status = ? WHERE id = ?`, conf, priority, status, f.id); err != nil {
+				logFn("warn", "verify", fmt.Sprintf("Failed to update finding %s: %v", f.id, err))
+				if s.logger != nil {
+					s.logger.Warn("Failed to update finding", "target_id", targetID, "finding_id", f.id, "error", err)
+				}
+			}
 		}
 	}
-
 	logFn("info", "verify", fmt.Sprintf("Verification done. %d findings re-confirmed, %d downgraded, %d scored.",
 		reproduced, downgraded, len(findings)))
 

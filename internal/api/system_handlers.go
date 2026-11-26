@@ -62,10 +62,12 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		Set    bool   `json:"set"`
 		Masked string `json:"masked"`
 	}
+	h.cfg.RLock()
 	out := make([]keyState, 0)
 	for _, f := range h.apiKeyFields() {
 		out = append(out, keyState{Name: f.Name, Label: f.Label, Hint: f.Hint, Set: *f.Ptr != "", Masked: maskKey(*f.Ptr)})
 	}
+	h.cfg.RUnlock()
 	h.writeSuccess(w, map[string]any{"api_keys": out})
 }
 
@@ -78,18 +80,32 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	changed := false
-	for _, f := range h.apiKeyFields() {
-		if v, ok := body[f.Name]; ok && v != nil {
-			*f.Ptr = strings.TrimSpace(*v)
-			changed = true
+	var saveErr error
+	func() {
+		h.cfg.Lock()
+		defer h.cfg.Unlock()
+		fields := h.apiKeyFields()
+		prev := make([]string, len(fields))
+		changed := false
+		for i, f := range fields {
+			prev[i] = *f.Ptr
+			if v, ok := body[f.Name]; ok && v != nil {
+				*f.Ptr = strings.TrimSpace(*v)
+				changed = true
+			}
 		}
-	}
-	if changed {
-		if err := h.cfg.Save(); err != nil {
-			h.writeError(w, http.StatusInternalServerError, "saved in memory but could not persist to config.json: "+err.Error())
-			return
+		if changed {
+			if err := h.cfg.SaveLocked(); err != nil {
+				for i, f := range fields {
+					*f.Ptr = prev[i]
+				}
+				saveErr = err
+			}
 		}
+	}()
+	if saveErr != nil {
+		h.writeError(w, http.StatusInternalServerError, "could not persist to config.json: "+saveErr.Error())
+		return
 	}
 	h.handleGetSettings(w, r)
 }
@@ -155,15 +171,16 @@ func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 	if h.sched != nil {
 		envTotal, envDeep, envWatch = h.sched.HealthyEnvelope()
 	}
+	h.cfg.RLock()
 	cfgGlobal, cfgDeep, cfgWatch := h.cfg.ConcurrencyLimits()
-	h.writeSuccess(w, scanConfigPayload{
-		DNSResolvers:                  h.cfg.DNSResolvers,
+	payload := scanConfigPayload{
+		DNSResolvers:                  append([]string(nil), h.cfg.DNSResolvers...),
 		SubdomainRecursionDepth:       h.cfg.SubdomainRecursionDepth,
 		SubdomainRecursionEnabled:     h.cfg.SubdomainRecursionEnabled,
 		HTTPCatchallDetection:         h.cfg.HTTPCatchallDetection,
-		NucleiExcludeTemplateIDs:      h.cfg.NucleiExcludeTemplateIDs,
-		NucleiExtraTemplateRepos:      h.cfg.NucleiExtraTemplateRepos,
-		MonitorModules:                h.cfg.MonitorModules,
+		NucleiExcludeTemplateIDs:      append([]string(nil), h.cfg.NucleiExcludeTemplateIDs...),
+		NucleiExtraTemplateRepos:      append([]string(nil), h.cfg.NucleiExtraTemplateRepos...),
+		MonitorModules:                append([]string(nil), h.cfg.MonitorModules...),
 		MaxConcurrentScans:            cfgGlobal,
 		MaxConcurrentDeepScans:        cfgDeep,
 		MaxConcurrentWatchScans:       cfgWatch,
@@ -175,7 +192,7 @@ func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 		WatchRoundsMinGap:             h.cfg.WatchRoundsMinGap,
 		WatchRoundIntervalHours:       h.cfg.WatchRoundIntervalHours,
 		WatchSourceTimeoutMinutes:     h.cfg.WatchSourceTimeoutMinutes,
-		WatchEnumerationSources:       h.cfg.WatchEnumerationSources,
+		WatchEnumerationSources:       append([]string(nil), h.cfg.WatchEnumerationSources...),
 		WatchRowsRetentionDays:        h.cfg.WatchRowsRetentionDays,
 		WatchScopeEventsRetentionDays: h.cfg.WatchScopeEventsRetentionDays,
 		WatchChangesRetentionDays:     effectiveWatchChangesRetentionDays(h.cfg.WatchChangesRetentionDays),
@@ -184,7 +201,9 @@ func (h *Handler) handleGetScanConfig(w http.ResponseWriter, _ *http.Request) {
 		WatchModuleSet:                []string{"subdomain_enum", "http_probe"},
 		DefaultDNSResolvers:           config.DefaultDNSResolvers,
 		DefaultNucleiRepos:            scanner.DefaultNucleiExtraRepos(),
-	})
+	}
+	h.cfg.RUnlock()
+	h.writeSuccess(w, payload)
 }
 
 // handleUpdateScanConfig persists edits to the scan tunables. Any provided field
@@ -233,49 +252,6 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		}
 		return out
 	}
-	if body.DNSResolvers != nil {
-		h.cfg.DNSResolvers = clean(*body.DNSResolvers)
-	}
-	if body.SubdomainRecursionDepth != nil {
-		d := *body.SubdomainRecursionDepth
-		if d < 1 {
-			d = 1
-		}
-		if d > 10 {
-			d = 10 // a hard ceiling: deeper than this is an explicit code change, not a UI slip
-		}
-		h.cfg.SubdomainRecursionDepth = d
-	}
-	if body.SubdomainRecursionEnabled != nil {
-		// No clamping — a bool is a bool. Omitted ⇒ unchanged, like the other knobs.
-		h.cfg.SubdomainRecursionEnabled = *body.SubdomainRecursionEnabled
-	}
-	if body.HTTPCatchallDetection != nil {
-		// Opt-in-by-default HTTP catch-all grouping; omitted ⇒ unchanged.
-		h.cfg.HTTPCatchallDetection = *body.HTTPCatchallDetection
-	}
-	if body.NucleiExcludeTemplateIDs != nil {
-		h.cfg.NucleiExcludeTemplateIDs = clean(*body.NucleiExcludeTemplateIDs)
-	}
-	if body.NucleiExtraTemplateRepos != nil {
-		// Only accept http(s) git URLs — never a local path or arbitrary scheme,
-		// since these get cloned and their YAML runs on this box.
-		var repos []string
-		for _, u := range clean(*body.NucleiExtraTemplateRepos) {
-			if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
-				repos = append(repos, u)
-			}
-		}
-		h.cfg.NucleiExtraTemplateRepos = repos
-	}
-	if body.MonitorModules != nil {
-		// Trimmed/deduped here; NAME validation happens in the scheduler
-		// (monitorWatchModules validates against AllModules and logs unknown
-		// tokens), so the API/UI never needs to know the module catalog.
-		h.cfg.MonitorModules = clean(*body.MonitorModules)
-	}
-	// Watch-tier knobs. Every clamp has a floor, because a zero would silently
-	// break the watch tier (no discovery budget, no HTTP probe, no rounds).
 	clamp := func(v, lo, hi int) int {
 		if v < lo {
 			return lo
@@ -285,51 +261,10 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		}
 		return v
 	}
-	// The three two-tier knobs are authoritative operator settings. Do NOT clamp
-	// the total to NumCPU here: that silently discarded the saved value on small
-	// boxes. Admission honors these numbers inside a visible hardware envelope
-	// and brakes them under live pressure (see scheduler.admissionCaps).
-	cfgG, cfgD, cfgW := h.cfg.ConcurrencyLimits()
-	if body.MaxConcurrentScans != nil {
-		cfgG = clamp(*body.MaxConcurrentScans, 1, 32)
-	}
-	if body.MaxConcurrentDeepScans != nil {
-		cfgD = clamp(*body.MaxConcurrentDeepScans, 1, 8)
-	}
-	if body.MaxConcurrentWatchScans != nil {
-		cfgW = clamp(*body.MaxConcurrentWatchScans, 0, 16)
-	}
-	h.cfg.SetConcurrencyLimits(cfgG, cfgD, cfgW)
-	if body.WatchHTTPThreads != nil {
-		h.cfg.Limits.WatchHTTPThreads = clamp(*body.WatchHTTPThreads, 1, 40)
-	}
-	if body.WatchHTTPRateLimit != nil {
-		h.cfg.Limits.WatchHTTPRateLimit = clamp(*body.WatchHTTPRateLimit, 1, 150)
-	}
-	if body.WatchRoundsMinGap != nil {
-		h.cfg.WatchRoundsMinGap = clamp(*body.WatchRoundsMinGap, 5, 1440)
-	}
-	if body.WatchRoundIntervalHours != nil {
-		h.cfg.WatchRoundIntervalHours = clamp(*body.WatchRoundIntervalHours, 1, 168)
-	}
-	if body.WatchSourceTimeoutMinutes != nil {
-		h.cfg.WatchSourceTimeoutMinutes = clamp(*body.WatchSourceTimeoutMinutes, 1, 30)
-	}
-	if body.WatchRowsRetentionDays != nil {
-		h.cfg.WatchRowsRetentionDays = clamp(*body.WatchRowsRetentionDays, 1, 365)
-	}
-	if body.WatchScopeEventsRetentionDays != nil {
-		h.cfg.WatchScopeEventsRetentionDays = clamp(*body.WatchScopeEventsRetentionDays, 1, 3650)
-	}
-	if body.WatchChangesRetentionDays != nil {
-		h.cfg.WatchChangesRetentionDays = clamp(*body.WatchChangesRetentionDays, 1, 3650)
-	}
-	if body.WatchNotifyHostCap != nil {
-		h.cfg.WatchNotifyHostCap = clamp(*body.WatchNotifyHostCap, 1, 100)
-	}
-	if body.WatchFailLimit != nil {
-		h.cfg.WatchFailLimit = clamp(*body.WatchFailLimit, 1, 10)
-	}
+
+	// Validate ALL inputs before mutating h.cfg so an invalid request can never
+	// leave partial edits in memory.
+	var pickedWatchSources []string
 	if body.WatchEnumerationSources != nil {
 		// Unknown source ids are dropped with a log line; an EMPTY list is
 		// rejected because a watch round with no source can never work.
@@ -337,23 +272,173 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		for _, id := range scanner.WatchEnumerationSourceIDs() {
 			known[id] = true
 		}
-		var picked []string
 		for _, id := range clean(*body.WatchEnumerationSources) {
 			id = strings.ToLower(id)
 			if !known[id] {
 				h.logger.Warn("Unknown watch enumeration source ignored", "source", id)
 				continue
 			}
-			picked = append(picked, id)
+			pickedWatchSources = append(pickedWatchSources, id)
 		}
-		if len(picked) == 0 {
+		if len(pickedWatchSources) == 0 {
 			h.writeError(w, http.StatusBadRequest, "select at least one watch discovery source")
 			return
 		}
-		h.cfg.WatchEnumerationSources = picked
 	}
-	if err := h.cfg.Save(); err != nil {
-		h.writeError(w, http.StatusInternalServerError, "saved in memory but could not persist to config.json: "+err.Error())
+
+	var cleanedDNS []string
+	if body.DNSResolvers != nil {
+		cleanedDNS = clean(*body.DNSResolvers)
+	}
+	var cleanedExclude []string
+	if body.NucleiExcludeTemplateIDs != nil {
+		cleanedExclude = clean(*body.NucleiExcludeTemplateIDs)
+	}
+	var cleanedRepos []string
+	if body.NucleiExtraTemplateRepos != nil {
+		// Only accept http(s) git URLs — never a local path or arbitrary scheme,
+		// since these get cloned and their YAML runs on this box.
+		for _, u := range clean(*body.NucleiExtraTemplateRepos) {
+			if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
+				cleanedRepos = append(cleanedRepos, u)
+			}
+		}
+	}
+	var cleanedMonitorModules []string
+	if body.MonitorModules != nil {
+		// Trimmed/deduped here; NAME validation happens in the scheduler
+		// (monitorWatchModules validates against AllModules and logs unknown
+		// tokens), so the API/UI never needs to know the module catalog.
+		cleanedMonitorModules = clean(*body.MonitorModules)
+	}
+
+	var saveErr error
+	func() {
+		h.cfg.Lock()
+		defer h.cfg.Unlock()
+
+		// Snapshot every mutable field so a failed Save() leaves in-memory
+		// config unchanged instead of diverging from config.json.
+		prevDNS := h.cfg.DNSResolvers
+		prevRecDepth := h.cfg.SubdomainRecursionDepth
+		prevRecEnabled := h.cfg.SubdomainRecursionEnabled
+		prevCatchall := h.cfg.HTTPCatchallDetection
+		prevExclude := h.cfg.NucleiExcludeTemplateIDs
+		prevRepos := h.cfg.NucleiExtraTemplateRepos
+		prevMonitor := h.cfg.MonitorModules
+		prevG, prevD, prevW := h.cfg.ConcurrencyLimits()
+		prevWatchHTTPThreads := h.cfg.Limits.WatchHTTPThreads
+		prevWatchHTTPRateLimit := h.cfg.Limits.WatchHTTPRateLimit
+		prevWatchRoundsMinGap := h.cfg.WatchRoundsMinGap
+		prevWatchRoundIntervalHours := h.cfg.WatchRoundIntervalHours
+		prevWatchSourceTimeoutMinutes := h.cfg.WatchSourceTimeoutMinutes
+		prevWatchSources := h.cfg.WatchEnumerationSources
+		prevWatchRowsRet := h.cfg.WatchRowsRetentionDays
+		prevWatchScopeRet := h.cfg.WatchScopeEventsRetentionDays
+		prevWatchChangesRet := h.cfg.WatchChangesRetentionDays
+		prevWatchNotifyCap := h.cfg.WatchNotifyHostCap
+		prevWatchFailLimit := h.cfg.WatchFailLimit
+
+		if body.DNSResolvers != nil {
+			h.cfg.DNSResolvers = cleanedDNS
+		}
+		if body.SubdomainRecursionDepth != nil {
+			// Hard ceiling of 10: deeper than this is an explicit code change, not a UI slip.
+			h.cfg.SubdomainRecursionDepth = clamp(*body.SubdomainRecursionDepth, 1, 10)
+		}
+		if body.SubdomainRecursionEnabled != nil {
+			// No clamping — a bool is a bool. Omitted ⇒ unchanged, like the other knobs.
+			h.cfg.SubdomainRecursionEnabled = *body.SubdomainRecursionEnabled
+		}
+		if body.HTTPCatchallDetection != nil {
+			// Opt-in-by-default HTTP catch-all grouping; omitted ⇒ unchanged.
+			h.cfg.HTTPCatchallDetection = *body.HTTPCatchallDetection
+		}
+		if body.NucleiExcludeTemplateIDs != nil {
+			h.cfg.NucleiExcludeTemplateIDs = cleanedExclude
+		}
+		if body.NucleiExtraTemplateRepos != nil {
+			h.cfg.NucleiExtraTemplateRepos = cleanedRepos
+		}
+		if body.MonitorModules != nil {
+			h.cfg.MonitorModules = cleanedMonitorModules
+		}
+		// The three two-tier knobs are authoritative operator settings. Do NOT clamp
+		// the total to NumCPU here: that silently discarded the saved value on small
+		// boxes. Admission honors these numbers inside a visible hardware envelope
+		// and brakes them under live pressure (see scheduler.admissionCaps).
+		cfgG, cfgD, cfgW := prevG, prevD, prevW
+		if body.MaxConcurrentScans != nil {
+			cfgG = clamp(*body.MaxConcurrentScans, 1, 32)
+		}
+		if body.MaxConcurrentDeepScans != nil {
+			cfgD = clamp(*body.MaxConcurrentDeepScans, 1, 8)
+		}
+		if body.MaxConcurrentWatchScans != nil {
+			cfgW = clamp(*body.MaxConcurrentWatchScans, 0, 16)
+		}
+		h.cfg.SetConcurrencyLimits(cfgG, cfgD, cfgW)
+		// Watch-tier knobs. Every clamp has a floor, because a zero would silently
+		// break the watch tier (no discovery budget, no HTTP probe, no rounds).
+		if body.WatchHTTPThreads != nil {
+			h.cfg.Limits.WatchHTTPThreads = clamp(*body.WatchHTTPThreads, 1, 40)
+		}
+		if body.WatchHTTPRateLimit != nil {
+			h.cfg.Limits.WatchHTTPRateLimit = clamp(*body.WatchHTTPRateLimit, 1, 150)
+		}
+		if body.WatchRoundsMinGap != nil {
+			h.cfg.WatchRoundsMinGap = clamp(*body.WatchRoundsMinGap, 5, 1440)
+		}
+		if body.WatchRoundIntervalHours != nil {
+			h.cfg.WatchRoundIntervalHours = clamp(*body.WatchRoundIntervalHours, 1, 168)
+		}
+		if body.WatchSourceTimeoutMinutes != nil {
+			h.cfg.WatchSourceTimeoutMinutes = clamp(*body.WatchSourceTimeoutMinutes, 1, 30)
+		}
+		if body.WatchRowsRetentionDays != nil {
+			h.cfg.WatchRowsRetentionDays = clamp(*body.WatchRowsRetentionDays, 1, 365)
+		}
+		if body.WatchScopeEventsRetentionDays != nil {
+			h.cfg.WatchScopeEventsRetentionDays = clamp(*body.WatchScopeEventsRetentionDays, 1, 3650)
+		}
+		if body.WatchChangesRetentionDays != nil {
+			h.cfg.WatchChangesRetentionDays = clamp(*body.WatchChangesRetentionDays, 1, 3650)
+		}
+		if body.WatchNotifyHostCap != nil {
+			h.cfg.WatchNotifyHostCap = clamp(*body.WatchNotifyHostCap, 1, 100)
+		}
+		if body.WatchFailLimit != nil {
+			h.cfg.WatchFailLimit = clamp(*body.WatchFailLimit, 1, 10)
+		}
+		if body.WatchEnumerationSources != nil {
+			h.cfg.WatchEnumerationSources = pickedWatchSources
+		}
+
+		if err := h.cfg.SaveLocked(); err != nil {
+			h.cfg.DNSResolvers = prevDNS
+			h.cfg.SubdomainRecursionDepth = prevRecDepth
+			h.cfg.SubdomainRecursionEnabled = prevRecEnabled
+			h.cfg.HTTPCatchallDetection = prevCatchall
+			h.cfg.NucleiExcludeTemplateIDs = prevExclude
+			h.cfg.NucleiExtraTemplateRepos = prevRepos
+			h.cfg.MonitorModules = prevMonitor
+			h.cfg.SetConcurrencyLimits(prevG, prevD, prevW)
+			h.cfg.Limits.WatchHTTPThreads = prevWatchHTTPThreads
+			h.cfg.Limits.WatchHTTPRateLimit = prevWatchHTTPRateLimit
+			h.cfg.WatchRoundsMinGap = prevWatchRoundsMinGap
+			h.cfg.WatchRoundIntervalHours = prevWatchRoundIntervalHours
+			h.cfg.WatchSourceTimeoutMinutes = prevWatchSourceTimeoutMinutes
+			h.cfg.WatchEnumerationSources = prevWatchSources
+			h.cfg.WatchRowsRetentionDays = prevWatchRowsRet
+			h.cfg.WatchScopeEventsRetentionDays = prevWatchScopeRet
+			h.cfg.WatchChangesRetentionDays = prevWatchChangesRet
+			h.cfg.WatchNotifyHostCap = prevWatchNotifyCap
+			h.cfg.WatchFailLimit = prevWatchFailLimit
+			saveErr = err
+		}
+	}()
+	if saveErr != nil {
+		h.writeError(w, http.StatusInternalServerError, "could not persist to config.json: "+saveErr.Error())
 		return
 	}
 	h.handleGetScanConfig(w, r)
