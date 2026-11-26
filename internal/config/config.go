@@ -461,8 +461,8 @@ func (c *Config) Save() error {
 }
 
 // SaveLocked writes the config to disk while the caller already holds c.Lock()
-// (or c.RLock()). Callers mutating multiple fields should hold Lock, apply
-// changes, call SaveLocked, and roll back on error before releasing Lock.
+// (or c.RLock()). Callers mutating multiple fields should hold Lock and prefer
+// SaveCandidateLocked so concurrent readers never observe uncommitted values.
 func (c *Config) SaveLocked() error {
 	if c.path == "" {
 		return fmt.Errorf("config path unknown; cannot save")
@@ -473,7 +473,37 @@ func (c *Config) SaveLocked() error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(c.path)
+	return writeConfigFileAtomic(c.path, data)
+}
+
+// SaveCandidateLocked marshals a candidate config state under concurrencyMu,
+// immediately rolls back in-memory state before performing slow disk I/O so
+// concurrent readers (such as ConcurrencyLimits) never observe uncommitted
+// values, and commits apply() only after the atomic file rename succeeds.
+// Caller MUST hold c.Lock().
+func (c *Config) SaveCandidateLocked(apply func(), rollback func()) error {
+	if c.path == "" {
+		return fmt.Errorf("config path unknown; cannot save")
+	}
+	c.concurrencyMu.Lock()
+	apply()
+	data, err := json.MarshalIndent(c, "", "  ") // #nosec G117 -- deployment secrets must be persisted in the atomic mode-0600 config file
+	rollback()
+	c.concurrencyMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := writeConfigFileAtomic(c.path, data); err != nil {
+		return err
+	}
+	c.concurrencyMu.Lock()
+	apply()
+	c.concurrencyMu.Unlock()
+	return nil
+}
+
+func writeConfigFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return err
 	}
@@ -498,7 +528,7 @@ func (c *Config) SaveLocked() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, c.path); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	// fsync the containing directory as well as the file. Without this, a power
@@ -778,17 +808,25 @@ func (c *Config) BeginLegacySecretRotation() (oldSecret string, needed bool, err
 }
 
 func (c *Config) FinishLegacySecretRotation() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.PreviousSessionSecret = ""
 	c.SecretRotationPending = false
-	return c.Save()
+	return c.SaveLocked()
 }
 
 // WatchRoundIntervalMinutes returns the normal cadence between finished
 // watch rounds, in minutes. The 12-hour fallback keeps the documented contract
 // for configs written before WatchRoundIntervalHours existed.
 func (c *Config) WatchRoundIntervalMinutes() int {
-	if c != nil && c.WatchRoundIntervalHours > 0 {
-		return c.WatchRoundIntervalHours * 60
+	if c == nil {
+		return 12 * 60
+	}
+	c.mu.RLock()
+	hours := c.WatchRoundIntervalHours
+	c.mu.RUnlock()
+	if hours > 0 {
+		return hours * 60
 	}
 	return 12 * 60
 }
@@ -860,6 +898,8 @@ var DefaultDNSResolvers = []string{
 // default set when none are configured. Each entry is normalized to host:port
 // (UDP/53 assumed when no port is given).
 func (c *Config) DNSResolverList() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	src := c.DNSResolvers
 	if len(src) == 0 {
 		src = DefaultDNSResolvers

@@ -59,6 +59,123 @@ func TestVerifyReplayNetworkErrorPreservesConfirmedFinding(t *testing.T) {
 	}
 }
 
+func TestVerifyReplayInconclusivePreservesStatusAndDoesNotPromoteCandidates(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "429_rate_limit", statusCode: http.StatusTooManyRequests, body: "Too Many Requests"},
+		{name: "503_server_error", statusCode: http.StatusServiceUnavailable, body: "Service Unavailable"},
+		{name: "403_waf_block", statusCode: http.StatusForbidden, body: "Access Denied - Sucuri Website Firewall"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, tid := testDB(t)
+			defer db.Close()
+
+			if _, err := db.Exec(`
+				INSERT INTO vuln_findings (id, target_id, type, severity, url, parameter, payload, evidence, confidence, priority, status, lifecycle, triage)
+				VALUES
+					('vf-lfi-confirmed', ?, 'lfi',  'high', 'https://example.test/a?file=x', 'file', '../../etc/passwd', 'root:x:0:0:', 95, 76, 'finding',   'LEGACY', ''),
+					('vf-lfi-downgraded',?, 'lfi',  'high', 'https://example.test/b?path=x', 'path', '../../etc/passwd', 'old',         45, 33, 'candidate', 'LEGACY', ''),
+					('vf-ssti-downgraded',?,'ssti', 'high', 'https://example.test/c?tpl=x',  'tpl',  '{{7*7}}',          'old',         45, 33, 'candidate', 'LEGACY', '')
+			`, tid, tid, tid); err != nil {
+				t.Fatalf("seed vuln_findings: %v", err)
+			}
+
+			origClient := verifyClient
+			verifyClient = &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: tc.statusCode,
+						Body:       io.NopCloser(strings.NewReader(tc.body)),
+					}, nil
+				}),
+			}
+			t.Cleanup(func() { verifyClient = origClient })
+
+			var broadcasts []map[string]any
+			vs := NewVerifyScanner(db, nil, &config.Config{EnableSQLmap: false, NucleiVerify: false}, logger.New("error"), func(event string, data any) {
+				if event == "new_vuln_finding" {
+					if m, ok := data.(map[string]any); ok {
+						broadcasts = append(broadcasts, m)
+					}
+				}
+			})
+			if err := vs.Run(context.Background(), tid, func(string, string, string) {}); err != nil {
+				t.Fatalf("VerifyScanner.Run: %v", err)
+			}
+
+			assertRow := func(id, wantStatus string, wantConf int) {
+				t.Helper()
+				var status string
+				var conf int
+				if err := db.QueryRow(`SELECT status, confidence FROM vuln_findings WHERE id=?`, id).Scan(&status, &conf); err != nil {
+					t.Fatalf("query %s: %v", id, err)
+				}
+				if status != wantStatus || conf != wantConf {
+					t.Fatalf("%s: status=%q conf=%d, want status=%q conf=%d", id, status, conf, wantStatus, wantConf)
+				}
+			}
+
+			assertRow("vf-lfi-confirmed", StatusFinding, 95)
+			assertRow("vf-lfi-downgraded", StatusCandidate, 45)
+			assertRow("vf-ssti-downgraded", StatusCandidate, 45)
+			if len(broadcasts) != 0 {
+				t.Fatalf("inconclusive replay must not emit new_vuln_finding broadcasts, got %+v", broadcasts)
+			}
+		})
+	}
+}
+
+func TestVerifyReplayCleanNonReproductionDowngradesUntriagedOnly(t *testing.T) {
+	db, tid := testDB(t)
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		INSERT INTO vuln_findings (id, target_id, type, severity, url, parameter, payload, evidence, confidence, priority, status, lifecycle, triage)
+		VALUES
+			('vf-untriaged', ?, 'lfi', 'high', 'https://example.test/u?file=x', 'file', '../../etc/passwd', 'root:x:0:0:', 95, 76, 'finding', 'LEGACY', ''),
+			('vf-triaged',   ?, 'lfi', 'high', 'https://example.test/t?file=x', 'file', '../../etc/passwd', 'root:x:0:0:', 95, 76, 'finding', 'LEGACY', ' Confirmed ')
+	`, tid, tid); err != nil {
+		t.Fatalf("seed vuln_findings: %v", err)
+	}
+
+	origClient := verifyClient
+	verifyClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("<html>clean normal response</html>")),
+			}, nil
+		}),
+	}
+	t.Cleanup(func() { verifyClient = origClient })
+
+	vs := NewVerifyScanner(db, nil, &config.Config{EnableSQLmap: false, NucleiVerify: false}, logger.New("error"), nil)
+	if err := vs.Run(context.Background(), tid, func(string, string, string) {}); err != nil {
+		t.Fatalf("VerifyScanner.Run: %v", err)
+	}
+
+	var status string
+	var conf int
+	if err := db.QueryRow(`SELECT status, confidence FROM vuln_findings WHERE id='vf-untriaged'`).Scan(&status, &conf); err != nil {
+		t.Fatalf("query vf-untriaged: %v", err)
+	}
+	if status != StatusCandidate || conf != 45 {
+		t.Fatalf("untriaged non-reproducing finding: status=%q conf=%d, want status=%q conf=45", status, conf, StatusCandidate)
+	}
+
+	if err := db.QueryRow(`SELECT status, confidence FROM vuln_findings WHERE id='vf-triaged'`).Scan(&status, &conf); err != nil {
+		t.Fatalf("query vf-triaged: %v", err)
+	}
+	if status != StatusFinding || conf != 95 {
+		t.Fatalf("operator-triaged finding was downgraded: status=%q conf=%d, want status=%q conf=95", status, conf, StatusFinding)
+	}
+}
+
 func TestAnalyzeJSContentSyncsHashAndBodyAndRotatesOld(t *testing.T) {
 	db, tid := testDB(t)
 	defer db.Close()
@@ -104,6 +221,20 @@ func TestAnalyzeJSContentSyncsHashAndBodyAndRotatesOld(t *testing.T) {
 	if oldHash2 != hash1 || oldBody2 != string(v1) {
 		t.Fatalf("old snapshot not rotated: old_hash=%q (want %q), old_body=%q (want %q)", oldHash2, hash1, oldBody2, string(v1))
 	}
+
+	// Re-analyzing identical v2 content must preserve old_hash/old_body (no self-overwrite).
+	if err := js.analyzeJSContent(context.Background(), tid, jsURL, v2, nil); err != nil {
+		t.Fatalf("analyzeJSContent v2 unchanged rescan: %v", err)
+	}
+	var hash3, body3, oldHash3, oldBody3 string
+	if err := db.QueryRow(`SELECT hash, body, old_hash, old_body FROM js_files WHERE target_id=? AND url=?`, tid, jsURL).
+		Scan(&hash3, &body3, &oldHash3, &oldBody3); err != nil {
+		t.Fatalf("query v2 rescan: %v", err)
+	}
+	if hash3 != hash2 || body3 != body2 || oldHash3 != hash1 || oldBody3 != string(v1) {
+		t.Fatalf("unchanged rescan clobbered snapshot: hash=%q (want %q) old_hash=%q (want %q) old_body=%q (want %q)",
+			hash3, hash2, oldHash3, hash1, oldBody3, string(v1))
+	}
 }
 
 func TestVerifySecretsTriStateHandling(t *testing.T) {
@@ -118,14 +249,17 @@ func TestVerifySecretsTriStateHandling(t *testing.T) {
 	if _, err := db.Exec(`
 		INSERT INTO js_findings (id, target_id, js_file_id, type, value, severity, verified)
 		VALUES
-			('jf-429', ?, ?, 'github_token', 'ghp_rate_limited_token', 'high', 0),
-			('jf-500', ?, ?, 'stripe_key', 'sk_live_server_error_token', 'critical', 0),
-			('jf-401', ?, ?, 'sendgrid', 'SG.invalid_auth_token_123456', 'high', 0),
-			('jf-ok',  ?, ?, 'slack_token', 'xoxb-valid-live-token-12345', 'high', 0)
-	`, tid, jsFileID, tid, jsFileID, tid, jsFileID, tid, jsFileID); err != nil {
+			('jf-429',  ?, ?, 'github_token', 'ghp_rate_limited_token',      'high',     0),
+			('jf-500',  ?, ?, 'stripe_key',   'sk_live_server_error_token',  'critical', 0),
+			('jf-401',  ?, ?, 'sendgrid',     'SG.invalid_auth_token_123456','high',     0),
+			('jf-aws',  ?, ?, 'aws_key',      'AKIAIOSFODNN7EXAMPLE',        'high',     0),
+			('jf-ok-1', ?, ?, 'slack_token',  'xoxb-valid-live-token-12345', 'high',     0),
+			('jf-ok-2', ?, ?, 'slack_token',  'xoxb-second-live-token-67890','high',     0)
+	`, tid, jsFileID, tid, jsFileID, tid, jsFileID, tid, jsFileID, tid, jsFileID, tid, jsFileID); err != nil {
 		t.Fatalf("seed js_findings: %v", err)
 	}
 
+	slackHits := 0
 	origClient := secretHTTPClient
 	secretHTTPClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -137,6 +271,7 @@ func TestVerifySecretsTriStateHandling(t *testing.T) {
 			case strings.Contains(req.URL.Host, "api.sendgrid.com"):
 				return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader("unauthorized"))}, nil
 			case strings.Contains(req.URL.Host, "slack.com"):
+				slackHits++
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true,"team":"acme"}`))}, nil
 			default:
 				return nil, errors.New("unexpected provider host: " + req.URL.Host)
@@ -171,18 +306,60 @@ func TestVerifySecretsTriStateHandling(t *testing.T) {
 	checkJSFinding("jf-429", "high", 0)
 	checkJSFinding("jf-500", "critical", 0)
 	checkJSFinding("jf-401", "info", 0)
-	checkJSFinding("jf-ok", "critical", 1)
+	checkJSFinding("jf-aws", "high", 0)
+	checkJSFinding("jf-ok-1", "critical", 1)
+	checkJSFinding("jf-ok-2", "critical", 1)
 
-	var vfID, vfURL, vfStatus string
-	if err := db.QueryRow(`SELECT id, url, status FROM vuln_findings WHERE target_id=? AND type='verified_secret_slack_token'`, tid).
-		Scan(&vfID, &vfURL, &vfStatus); err != nil {
-		t.Fatalf("expected verified secret projection in vuln_findings: %v", err)
+	rows, err := db.Query(`SELECT id, url, parameter, provenance, status FROM vuln_findings WHERE target_id=? AND type='verified_secret_slack_token' ORDER BY provenance`, tid)
+	if err != nil {
+		t.Fatalf("query projected verified secrets: %v", err)
 	}
-	if vfURL != jsURL || vfStatus != StatusFinding {
-		t.Fatalf("vuln_findings projection mismatch: url=%q status=%q, want url=%q status=%q", vfURL, vfStatus, jsURL, StatusFinding)
+	defer rows.Close()
+	type vfRow struct{ id, url, param, prov, status string }
+	var gotRows []vfRow
+	for rows.Next() {
+		var r vfRow
+		if err := rows.Scan(&r.id, &r.url, &r.param, &r.prov, &r.status); err != nil {
+			t.Fatalf("scan projected secret: %v", err)
+		}
+		gotRows = append(gotRows, r)
 	}
-	if len(broadcasts) != 1 || broadcasts[0]["url"] != jsURL || broadcasts[0]["finding_id"] != vfID {
-		t.Fatalf("broadcast mismatch: got %+v, want url=%q finding_id=%q", broadcasts, jsURL, vfID)
+	if len(gotRows) != 2 {
+		t.Fatalf("expected 2 distinct vuln_findings rows for same-type secrets in one bundle, got %d: %+v", len(gotRows), gotRows)
+	}
+	wantPairs := []struct{ param, prov string }{
+		{"slack_token:jf-ok-1", "js_findings:jf-ok-1"},
+		{"slack_token:jf-ok-2", "js_findings:jf-ok-2"},
+	}
+	broadcastIDs := map[string]bool{}
+	for _, b := range broadcasts {
+		if b["url"] != jsURL {
+			t.Fatalf("broadcast url=%q, want %q", b["url"], jsURL)
+		}
+		if id, ok := b["finding_id"].(string); ok && id != "" {
+			broadcastIDs[id] = true
+		}
+	}
+	for i, w := range wantPairs {
+		r := gotRows[i]
+		if r.url != jsURL || r.status != StatusFinding || r.param != w.param || r.prov != w.prov {
+			t.Fatalf("row[%d] = %+v, want url=%q status=%q param=%q prov=%q", i, r, jsURL, StatusFinding, w.param, w.prov)
+		}
+		if !broadcastIDs[r.id] {
+			t.Fatalf("missing broadcast for finding_id=%q in %+v", r.id, broadcasts)
+		}
+	}
+	if len(broadcasts) != 2 || slackHits != 2 {
+		t.Fatalf("first run: broadcasts=%d slackHits=%d, want 2 and 2", len(broadcasts), slackHits)
+	}
+
+	// Second run must be idempotent: already-verified secrets are not re-hit or re-broadcast.
+	js.verifySecrets(context.Background(), tid, func(string, string, string) {})
+	if slackHits != 2 {
+		t.Fatalf("second run re-hit already-verified slack secrets: slackHits=%d, want 2", slackHits)
+	}
+	if len(broadcasts) != 2 {
+		t.Fatalf("second run emitted duplicate broadcasts: got %d, want 2", len(broadcasts))
 	}
 }
 
@@ -220,9 +397,9 @@ func TestOperatorTriagedFindingSurvivesCandidateRejection(t *testing.T) {
 	db, tid := testDB(t)
 	defer db.Close()
 
-	for _, triage := range []string{"confirmed", "accepted_risk", "fixed"} {
-		t.Run(triage, func(t *testing.T) {
-			urlStr := "https://example.test/item?t=" + triage
+	for _, triage := range []string{"confirmed", " Confirmed ", "accepted_risk", "fixed"} {
+		t.Run(strings.TrimSpace(triage), func(t *testing.T) {
+			urlStr := "https://example.test/item?t=" + strings.ReplaceAll(triage, " ", "_")
 			candID, err := RecordCandidateResult(context.Background(), db, VulnerabilityCandidate{
 				TargetID: tid, Type: "xss", Subtype: "reflected", URL: urlStr,
 				Method: "GET", Parameter: "t", Location: "query", DetectionSource: "test",

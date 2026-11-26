@@ -1054,7 +1054,6 @@ func (s *DirScanner) RunOpenRedirectDiscovery(ctx context.Context, targetID stri
 				if res.class == redirectExternal {
 					verified = 1
 					status = StatusFinding
-					found.Add(1)
 				}
 				desc := fmt.Sprintf("%s -> %s", res.testURL, res.finalLoc)
 				if err := upsertOpenRedirectFinding(s.db, id, targetID, ip.URL, desc, ip.Param, verified, status, res.chain); err != nil {
@@ -1062,6 +1061,8 @@ func (s *DirScanner) RunOpenRedirectDiscovery(ctx context.Context, targetID stri
 					if s.logger != nil {
 						s.logger.Warn("Failed to store open redirect finding", "target_id", targetID, "url", ip.URL, "error", err)
 					}
+				} else if verified == 1 {
+					found.Add(1)
 				}
 			}
 		}(item)

@@ -139,29 +139,121 @@ func TestRunWithCallbackHandlesLargeStdoutLineAndContinues(t *testing.T) {
 
 func TestScanStreamLinesDrainsOversizedLineAndContinues(t *testing.T) {
 	t.Parallel()
-	input := "before\n" + strings.Repeat("X", 200) + "\nafter\r\nfinal-no-eol"
-	var got []string
-	var dropped []int
-	err := scanStreamLines(strings.NewReader(input), 64, func(line string) {
-		got = append(got, line)
-	}, func(n int) {
-		dropped = append(dropped, n)
-	})
-	if err != nil {
-		t.Fatalf("scanStreamLines error: %v", err)
-	}
-	if len(dropped) != 1 || dropped[0] <= 64 {
-		t.Fatalf("dropped = %v, want 1 oversized drop > 64 bytes", dropped)
-	}
-	want := []string{"before", "after", "final-no-eol"}
-	if len(got) != len(want) {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("line[%d] = %q, want %q", i, got[i], want[i])
+
+	t.Run("small_oversized_and_resumes", func(t *testing.T) {
+		t.Parallel()
+		input := "before\n" + strings.Repeat("X", 200) + "\nafter\r\nfinal-no-eol"
+		var got []string
+		var dropped []int
+		err := scanStreamLines(strings.NewReader(input), 64, func(line string) {
+			got = append(got, line)
+		}, func(n int) {
+			dropped = append(dropped, n)
+		})
+		if err != nil {
+			t.Fatalf("scanStreamLines error: %v", err)
 		}
-	}
+		if len(dropped) != 1 || dropped[0] != 201 {
+			t.Fatalf("dropped = %v, want [201]", dropped)
+		}
+		want := []string{"before", "after", "final-no-eol"}
+		if len(got) != len(want) {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("line[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("multi_chunk_oversized_over_64k_resumes", func(t *testing.T) {
+		t.Parallel()
+		const oversizedLen = 200 * 1024
+		input := "head\n" + strings.Repeat("A", oversizedLen) + "\ntail\n"
+		var got []string
+		var dropped []int
+		err := scanStreamLines(strings.NewReader(input), 128*1024, func(line string) {
+			got = append(got, line)
+		}, func(n int) {
+			dropped = append(dropped, n)
+		})
+		if err != nil {
+			t.Fatalf("scanStreamLines error: %v", err)
+		}
+		if len(dropped) != 1 || dropped[0] != oversizedLen+1 {
+			t.Fatalf("dropped = %v, want [%d]", dropped, oversizedLen+1)
+		}
+		if len(got) != 2 || got[0] != "head" || got[1] != "tail" {
+			t.Fatalf("got %q, want [head tail]", got)
+		}
+	})
+
+	t.Run("oversized_over_64k_eof_no_newline", func(t *testing.T) {
+		t.Parallel()
+		const oversizedLen = 200 * 1024
+		input := "first\n" + strings.Repeat("B", oversizedLen)
+		var got []string
+		var dropped []int
+		err := scanStreamLines(strings.NewReader(input), 128*1024, func(line string) {
+			got = append(got, line)
+		}, func(n int) {
+			dropped = append(dropped, n)
+		})
+		if err != nil {
+			t.Fatalf("scanStreamLines error: %v", err)
+		}
+		if len(dropped) != 1 || dropped[0] != oversizedLen {
+			t.Fatalf("dropped = %v, want [%d]", dropped, oversizedLen)
+		}
+		if len(got) != 1 || got[0] != "first" {
+			t.Fatalf("got %q, want [first]", got)
+		}
+	})
+
+	t.Run("exact_boundary_64k_crlf", func(t *testing.T) {
+		t.Parallel()
+		payload := strings.Repeat("C", 64*1024)
+		input := payload + "\r\nafter\n"
+		var got []string
+		var dropped []int
+		err := scanStreamLines(strings.NewReader(input), 64*1024, func(line string) {
+			got = append(got, line)
+		}, func(n int) {
+			dropped = append(dropped, n)
+		})
+		if err != nil {
+			t.Fatalf("scanStreamLines error: %v", err)
+		}
+		if len(dropped) != 0 {
+			t.Fatalf("dropped = %v, want none", dropped)
+		}
+		if len(got) != 2 || got[0] != payload || got[1] != "after" {
+			t.Fatalf("got %d lines, want exact 64KiB payload and after", len(got))
+		}
+	})
+
+	t.Run("exact_boundary_65535_crlf", func(t *testing.T) {
+		t.Parallel()
+		payload := strings.Repeat("D", 65535)
+		input := payload + "\r\nafter\n"
+		var got []string
+		var dropped []int
+		err := scanStreamLines(strings.NewReader(input), 65535, func(line string) {
+			got = append(got, line)
+		}, func(n int) {
+			dropped = append(dropped, n)
+		})
+		if err != nil {
+			t.Fatalf("scanStreamLines error: %v", err)
+		}
+		if len(dropped) != 0 {
+			t.Fatalf("dropped = %v, want none", dropped)
+		}
+		if len(got) != 2 || got[0] != payload || got[1] != "after" {
+			t.Fatalf("got %d lines, want exact 65535-byte payload and after", len(got))
+		}
+	})
 }
 
 func TestRunWithCallbackDrainsLargeStderrWithoutHanging(t *testing.T) {

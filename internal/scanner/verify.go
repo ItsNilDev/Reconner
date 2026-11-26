@@ -663,6 +663,9 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 				reproduced++
 			} else if statusCode == 0 || statusCode == http.StatusTooManyRequests || statusCode >= 500 || looksLikeWAFBlock(statusCode, body) {
 				replayInconclusive = true
+				if f.existingConf > 0 {
+					conf = f.existingConf
+				}
 			} else {
 				replayed = true
 				conf = 45 // clean response did not reproduce → likely transient FP
@@ -676,10 +679,15 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 		// (403-bypass, CORS, host-header, CRLF, prototype-pollution, jwt-no-exp…)
 		// to Candidates while a replay-confirmed bug stays a Finding.
 		status := StatusCandidate
-		if IsFinding(conf) && !canonicalPending {
-			status = StatusFinding
-		}
-		if replayInconclusive && f.existingStatus == StatusFinding && !canonicalPending {
+		if replayInconclusive {
+			if f.existingStatus == StatusFinding {
+				if !canonicalPending {
+					status = StatusFinding
+				}
+			} else if f.existingStatus != "" {
+				status = f.existingStatus
+			}
+		} else if IsFinding(conf) && !canonicalPending {
 			status = StatusFinding
 		}
 		if replayed && conf == 45 {
@@ -694,7 +702,7 @@ func (s *VerifyScanner) Run(ctx context.Context, targetID string, logFn LogFunc)
 
 		priority := severityWeight[strings.ToLower(f.sev)] * conf / 100
 
-		promoted := f.existingStatus != StatusFinding && status == StatusFinding
+		promoted := !replayInconclusive && f.existingStatus != StatusFinding && status == StatusFinding
 		if promoted {
 			// A durable promotion timestamp lets the Telegram sweep find a
 			// candidate that became a finding after its creation window (B7).

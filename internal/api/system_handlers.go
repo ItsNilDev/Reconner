@@ -86,21 +86,29 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		defer h.cfg.Unlock()
 		fields := h.apiKeyFields()
 		prev := make([]string, len(fields))
+		next := make([]string, len(fields))
 		changed := false
 		for i, f := range fields {
 			prev[i] = *f.Ptr
+			next[i] = *f.Ptr
 			if v, ok := body[f.Name]; ok && v != nil {
-				*f.Ptr = strings.TrimSpace(*v)
+				next[i] = strings.TrimSpace(*v)
 				changed = true
 			}
 		}
 		if changed {
-			if err := h.cfg.SaveLocked(); err != nil {
-				for i, f := range fields {
-					*f.Ptr = prev[i]
-				}
-				saveErr = err
-			}
+			saveErr = h.cfg.SaveCandidateLocked(
+				func() {
+					for i, f := range fields {
+						*f.Ptr = next[i]
+					}
+				},
+				func() {
+					for i, f := range fields {
+						*f.Ptr = prev[i]
+					}
+				},
+			)
 		}
 	}()
 	if saveErr != nil {
@@ -317,8 +325,9 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		h.cfg.Lock()
 		defer h.cfg.Unlock()
 
-		// Snapshot every mutable field so a failed Save() leaves in-memory
-		// config unchanged instead of diverging from config.json.
+		// Snapshot every mutable field so SaveCandidateLocked can marshal the
+		// candidate state, roll back before slow disk I/O, and commit only
+		// after config.json is atomically persisted.
 		prevDNS := h.cfg.DNSResolvers
 		prevRecDepth := h.cfg.SubdomainRecursionDepth
 		prevRecEnabled := h.cfg.SubdomainRecursionEnabled
@@ -339,30 +348,6 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		prevWatchNotifyCap := h.cfg.WatchNotifyHostCap
 		prevWatchFailLimit := h.cfg.WatchFailLimit
 
-		if body.DNSResolvers != nil {
-			h.cfg.DNSResolvers = cleanedDNS
-		}
-		if body.SubdomainRecursionDepth != nil {
-			// Hard ceiling of 10: deeper than this is an explicit code change, not a UI slip.
-			h.cfg.SubdomainRecursionDepth = clamp(*body.SubdomainRecursionDepth, 1, 10)
-		}
-		if body.SubdomainRecursionEnabled != nil {
-			// No clamping — a bool is a bool. Omitted ⇒ unchanged, like the other knobs.
-			h.cfg.SubdomainRecursionEnabled = *body.SubdomainRecursionEnabled
-		}
-		if body.HTTPCatchallDetection != nil {
-			// Opt-in-by-default HTTP catch-all grouping; omitted ⇒ unchanged.
-			h.cfg.HTTPCatchallDetection = *body.HTTPCatchallDetection
-		}
-		if body.NucleiExcludeTemplateIDs != nil {
-			h.cfg.NucleiExcludeTemplateIDs = cleanedExclude
-		}
-		if body.NucleiExtraTemplateRepos != nil {
-			h.cfg.NucleiExtraTemplateRepos = cleanedRepos
-		}
-		if body.MonitorModules != nil {
-			h.cfg.MonitorModules = cleanedMonitorModules
-		}
 		// The three two-tier knobs are authoritative operator settings. Do NOT clamp
 		// the total to NumCPU here: that silently discarded the saved value on small
 		// boxes. Admission honors these numbers inside a visible hardware envelope
@@ -377,44 +362,74 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		if body.MaxConcurrentWatchScans != nil {
 			cfgW = clamp(*body.MaxConcurrentWatchScans, 0, 16)
 		}
-		h.cfg.SetConcurrencyLimits(cfgG, cfgD, cfgW)
-		// Watch-tier knobs. Every clamp has a floor, because a zero would silently
-		// break the watch tier (no discovery budget, no HTTP probe, no rounds).
-		if body.WatchHTTPThreads != nil {
-			h.cfg.Limits.WatchHTTPThreads = clamp(*body.WatchHTTPThreads, 1, 40)
-		}
-		if body.WatchHTTPRateLimit != nil {
-			h.cfg.Limits.WatchHTTPRateLimit = clamp(*body.WatchHTTPRateLimit, 1, 150)
-		}
-		if body.WatchRoundsMinGap != nil {
-			h.cfg.WatchRoundsMinGap = clamp(*body.WatchRoundsMinGap, 5, 1440)
-		}
-		if body.WatchRoundIntervalHours != nil {
-			h.cfg.WatchRoundIntervalHours = clamp(*body.WatchRoundIntervalHours, 1, 168)
-		}
-		if body.WatchSourceTimeoutMinutes != nil {
-			h.cfg.WatchSourceTimeoutMinutes = clamp(*body.WatchSourceTimeoutMinutes, 1, 30)
-		}
-		if body.WatchRowsRetentionDays != nil {
-			h.cfg.WatchRowsRetentionDays = clamp(*body.WatchRowsRetentionDays, 1, 365)
-		}
-		if body.WatchScopeEventsRetentionDays != nil {
-			h.cfg.WatchScopeEventsRetentionDays = clamp(*body.WatchScopeEventsRetentionDays, 1, 3650)
-		}
-		if body.WatchChangesRetentionDays != nil {
-			h.cfg.WatchChangesRetentionDays = clamp(*body.WatchChangesRetentionDays, 1, 3650)
-		}
-		if body.WatchNotifyHostCap != nil {
-			h.cfg.WatchNotifyHostCap = clamp(*body.WatchNotifyHostCap, 1, 100)
-		}
-		if body.WatchFailLimit != nil {
-			h.cfg.WatchFailLimit = clamp(*body.WatchFailLimit, 1, 10)
-		}
-		if body.WatchEnumerationSources != nil {
-			h.cfg.WatchEnumerationSources = pickedWatchSources
-		}
 
-		if err := h.cfg.SaveLocked(); err != nil {
+		apply := func() {
+			if body.DNSResolvers != nil {
+				h.cfg.DNSResolvers = cleanedDNS
+			}
+			if body.SubdomainRecursionDepth != nil {
+				// Hard ceiling of 10: deeper than this is an explicit code change, not a UI slip.
+				h.cfg.SubdomainRecursionDepth = clamp(*body.SubdomainRecursionDepth, 1, 10)
+			}
+			if body.SubdomainRecursionEnabled != nil {
+				// No clamping — a bool is a bool. Omitted ⇒ unchanged, like the other knobs.
+				h.cfg.SubdomainRecursionEnabled = *body.SubdomainRecursionEnabled
+			}
+			if body.HTTPCatchallDetection != nil {
+				// Opt-in-by-default HTTP catch-all grouping; omitted ⇒ unchanged.
+				h.cfg.HTTPCatchallDetection = *body.HTTPCatchallDetection
+			}
+			if body.NucleiExcludeTemplateIDs != nil {
+				h.cfg.NucleiExcludeTemplateIDs = cleanedExclude
+			}
+			if body.NucleiExtraTemplateRepos != nil {
+				h.cfg.NucleiExtraTemplateRepos = cleanedRepos
+			}
+			if body.MonitorModules != nil {
+				h.cfg.MonitorModules = cleanedMonitorModules
+			}
+			// SaveCandidateLocked already holds concurrencyMu; write the three
+			// caps directly instead of calling SetConcurrencyLimits (which would deadlock).
+			h.cfg.Limits.MaxConcurrentScans = cfgG
+			h.cfg.Limits.MaxConcurrentDeepScans = cfgD
+			h.cfg.Limits.MaxConcurrentWatchScans = cfgW
+			// Watch-tier knobs. Every clamp has a floor, because a zero would silently
+			// break the watch tier (no discovery budget, no HTTP probe, no rounds).
+			if body.WatchHTTPThreads != nil {
+				h.cfg.Limits.WatchHTTPThreads = clamp(*body.WatchHTTPThreads, 1, 40)
+			}
+			if body.WatchHTTPRateLimit != nil {
+				h.cfg.Limits.WatchHTTPRateLimit = clamp(*body.WatchHTTPRateLimit, 1, 150)
+			}
+			if body.WatchRoundsMinGap != nil {
+				h.cfg.WatchRoundsMinGap = clamp(*body.WatchRoundsMinGap, 5, 1440)
+			}
+			if body.WatchRoundIntervalHours != nil {
+				h.cfg.WatchRoundIntervalHours = clamp(*body.WatchRoundIntervalHours, 1, 168)
+			}
+			if body.WatchSourceTimeoutMinutes != nil {
+				h.cfg.WatchSourceTimeoutMinutes = clamp(*body.WatchSourceTimeoutMinutes, 1, 30)
+			}
+			if body.WatchRowsRetentionDays != nil {
+				h.cfg.WatchRowsRetentionDays = clamp(*body.WatchRowsRetentionDays, 1, 365)
+			}
+			if body.WatchScopeEventsRetentionDays != nil {
+				h.cfg.WatchScopeEventsRetentionDays = clamp(*body.WatchScopeEventsRetentionDays, 1, 3650)
+			}
+			if body.WatchChangesRetentionDays != nil {
+				h.cfg.WatchChangesRetentionDays = clamp(*body.WatchChangesRetentionDays, 1, 3650)
+			}
+			if body.WatchNotifyHostCap != nil {
+				h.cfg.WatchNotifyHostCap = clamp(*body.WatchNotifyHostCap, 1, 100)
+			}
+			if body.WatchFailLimit != nil {
+				h.cfg.WatchFailLimit = clamp(*body.WatchFailLimit, 1, 10)
+			}
+			if body.WatchEnumerationSources != nil {
+				h.cfg.WatchEnumerationSources = pickedWatchSources
+			}
+		}
+		rollback := func() {
 			h.cfg.DNSResolvers = prevDNS
 			h.cfg.SubdomainRecursionDepth = prevRecDepth
 			h.cfg.SubdomainRecursionEnabled = prevRecEnabled
@@ -422,7 +437,9 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 			h.cfg.NucleiExcludeTemplateIDs = prevExclude
 			h.cfg.NucleiExtraTemplateRepos = prevRepos
 			h.cfg.MonitorModules = prevMonitor
-			h.cfg.SetConcurrencyLimits(prevG, prevD, prevW)
+			h.cfg.Limits.MaxConcurrentScans = prevG
+			h.cfg.Limits.MaxConcurrentDeepScans = prevD
+			h.cfg.Limits.MaxConcurrentWatchScans = prevW
 			h.cfg.Limits.WatchHTTPThreads = prevWatchHTTPThreads
 			h.cfg.Limits.WatchHTTPRateLimit = prevWatchHTTPRateLimit
 			h.cfg.WatchRoundsMinGap = prevWatchRoundsMinGap
@@ -434,8 +451,9 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 			h.cfg.WatchChangesRetentionDays = prevWatchChangesRet
 			h.cfg.WatchNotifyHostCap = prevWatchNotifyCap
 			h.cfg.WatchFailLimit = prevWatchFailLimit
-			saveErr = err
 		}
+
+		saveErr = h.cfg.SaveCandidateLocked(apply, rollback)
 	}()
 	if saveErr != nil {
 		h.writeError(w, http.StatusInternalServerError, "could not persist to config.json: "+saveErr.Error())

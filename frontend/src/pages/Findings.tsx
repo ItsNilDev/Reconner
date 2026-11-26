@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { findings as findingsApi, targets as targetsApi, type AllFinding } from '../lib/api'
 import { useUIStore } from '../store/ui'
@@ -46,9 +46,12 @@ export default function Findings() {
   const { addToast } = useUIStore()
   const [rows, setRows] = useState<AllFinding[]>([])
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
+  const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
+  const querySeqRef = useRef(0)
+  const rowsRef = useRef<AllFinding[]>([])
+  const totalRef = useRef(0)
   const [status, setStatus] = useState<'finding' | 'candidate'>('finding')
   const [sevFilter, setSevFilter] = useState<Sev | null>(null)
   const [sourceFilter, setSourceFilter] = useState('')
@@ -81,10 +84,15 @@ export default function Findings() {
   }, [])
 
   useEffect(() => {
-    let cancelled = false
-    setLoading(true); setErr(''); setExpanded(null)
+    const seq = ++querySeqRef.current
+    setLoading(true)
+    setLoadingMore(false)
+    setHasMore(false)
+    setErr('')
+    setExpanded(null)
     findingsApi.allPage({
       status,
+      severity: sevFilter || undefined,
       source: sourceFilter || undefined,
       target_id: targetFilter || undefined,
       q: debouncedQ || undefined,
@@ -92,52 +100,71 @@ export default function Findings() {
       limit: PAGE_LIMIT,
     })
       .then(res => {
-        if (cancelled) return
-        setRows(res.data || [])
+        if (seq !== querySeqRef.current) return
+        const items = res.data || []
+        rowsRef.current = items
+        totalRef.current = res.total
+        setRows(items)
         setTotal(res.total)
-        setPage(res.page || 1)
+        setHasMore(items.length >= PAGE_LIMIT && items.length < res.total)
       })
-      .catch(e => { if (!cancelled) setErr(e?.message || 'Failed to load findings') })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [status, sourceFilter, targetFilter, debouncedQ])
+      .catch(e => { if (seq === querySeqRef.current) setErr(e?.message || 'Failed to load findings') })
+      .finally(() => { if (seq === querySeqRef.current) setLoading(false) })
+    return () => { querySeqRef.current++ }
+  }, [status, sevFilter, sourceFilter, targetFilter, debouncedQ])
 
   const loadMore = async () => {
-    if (loadingMore || rows.length >= total) return
+    if (loadingMore || !hasMore) return
+    const seq = querySeqRef.current
     setLoadingMore(true)
     try {
-      const nextPage = page + 1
       const res = await findingsApi.allPage({
         status,
+        severity: sevFilter || undefined,
         source: sourceFilter || undefined,
         target_id: targetFilter || undefined,
         q: debouncedQ || undefined,
-        page: nextPage,
+        offset: rowsRef.current.length,
         limit: PAGE_LIMIT,
       })
-      setRows(prev => {
-        const seen = new Set(prev.map(rowKey))
-        const extra = (res.data || []).filter(item => !seen.has(rowKey(item)))
-        return [...prev, ...extra]
-      })
+      if (seq !== querySeqRef.current) return
+      const fetched = res.data || []
+      const prev = rowsRef.current
+      const seen = new Set(prev.map(rowKey))
+      const extra = fetched.filter(item => !seen.has(rowKey(item)))
+      const nextRows = [...prev, ...extra]
+      rowsRef.current = nextRows
+      totalRef.current = res.total
+      setRows(nextRows)
       setTotal(res.total)
-      setPage(res.page || nextPage)
+      setHasMore(fetched.length >= PAGE_LIMIT && extra.length > 0 && nextRows.length < res.total)
     } catch (e) {
+      if (seq !== querySeqRef.current) return
       addToast('error', e instanceof Error ? e.message : 'Failed to load more findings')
     } finally {
-      setLoadingMore(false)
+      if (seq === querySeqRef.current) setLoadingMore(false)
     }
   }
 
   const handleTriage = async (f: AllFinding, decision: 'confirmed' | 'false_positive') => {
     const key = rowKey(f)
+    const seq = querySeqRef.current
     setTriageBusy(prev => ({ ...prev, [key]: decision }))
     try {
       await findingsApi.setTriage(f.target_id, f.id, decision)
       if (decision === 'false_positive') {
-        setRows(prev => prev.filter(r => rowKey(r) !== key))
-        setTotal(t => Math.max(0, t - 1))
-        if (expanded === key) setExpanded(null)
+        if (seq === querySeqRef.current) {
+          const prev = rowsRef.current
+          const nextRows = prev.filter(r => rowKey(r) !== key)
+          const removed = prev.length - nextRows.length
+          const nextTotal = Math.max(0, totalRef.current - removed)
+          rowsRef.current = nextRows
+          totalRef.current = nextTotal
+          setRows(nextRows)
+          setTotal(nextTotal)
+          if (nextRows.length >= nextTotal) setHasMore(false)
+          if (expanded === key) setExpanded(null)
+        }
         addToast('info', 'Marked as false positive')
       } else {
         setConfirmedIds(prev => { const next = new Set(prev); next.add(key); return next })
@@ -171,7 +198,7 @@ export default function Findings() {
     () => sevFilter ? rows.filter(f => f.severity?.toLowerCase() === sevFilter) : rows,
     [rows, sevFilter])
 
-  const hasFilters = Boolean(search || sourceFilter || targetFilter)
+  const hasFilters = Boolean(search || sourceFilter || targetFilter || sevFilter)
 
   return (
     <div className="space-y-5">
@@ -223,7 +250,7 @@ export default function Findings() {
         {hasFilters && (
           <button
             type="button"
-            onClick={() => { setSearch(''); setSourceFilter(''); setTargetFilter('') }}
+            onClick={() => { setSearch(''); setSourceFilter(''); setTargetFilter(''); setSevFilter(null) }}
             className="text-xs text-accent hover:underline px-1.5 shrink-0"
           >
             Clear
@@ -235,14 +262,14 @@ export default function Findings() {
       <div className="flex gap-2 flex-wrap">
         <button onClick={() => setSevFilter(null)}
           className={cn('px-3 py-2 rounded-lg border text-xs font-medium', !sevFilter ? 'border-accent text-accent' : 'border-border text-text-muted')}>
-          All <span className="tabular-nums">{rows.length}</span>
+          All {!sevFilter && <span className="tabular-nums">{total}</span>}
         </button>
         {SEVS.map(s => (
           <button key={s} onClick={() => setSevFilter(sevFilter === s ? null : s)}
-            disabled={!counts[s]}
+            disabled={!sevFilter && !hasMore && !counts[s]}
             className={cn('px-3 py-2 rounded-lg border text-xs font-medium capitalize disabled:opacity-40',
               sevFilter === s ? 'border-accent' : 'border-border', sevText[s])}>
-            {s} <span className="tabular-nums">{counts[s] || 0}</span>
+            {s}{!sevFilter ? <> <span className="tabular-nums">{counts[s] || 0}</span></> : sevFilter === s ? <> <span className="tabular-nums">{total}</span></> : null}
           </button>
         ))}
       </div>
@@ -259,7 +286,7 @@ export default function Findings() {
             </p>
             <p className="text-text-muted text-xs">
               {hasFilters
-                ? 'Try clearing or widening your search, source, or target filter.'
+                ? 'Try clearing or widening your search, severity, source, or target filter.'
                 : 'Findings appear here as scans confirm them. Start a scan from a target to populate this view.'}
             </p>
           </div>
@@ -389,17 +416,19 @@ export default function Findings() {
                 </tbody>
               </table>
             </div>
-            {rows.length < total && (
+            {(hasMore || shown.length < total) && (
               <div className="border-t border-border p-3 flex items-center justify-center gap-3">
-                <span className="text-xs text-text-muted tabular-nums">Showing {rows.length} of {total}</span>
-                <button
-                  type="button"
-                  onClick={loadMore}
-                  disabled={loadingMore}
-                  className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
-                >
-                  {loadingMore ? 'Loading…' : 'Load more'}
-                </button>
+                <span className="text-xs text-text-muted tabular-nums">Showing {shown.length} of {total}</span>
+                {hasMore && (
+                  <button
+                    type="button"
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
+                  >
+                    {loadingMore ? 'Loading…' : 'Load more'}
+                  </button>
+                )}
               </div>
             )}
           </>

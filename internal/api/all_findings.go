@@ -63,7 +63,12 @@ const unifiedFindingsCTE = `WITH unified AS (
 		SUBSTR(COALESCE(n.description,''), 1, 2000) AS evidence,
 		COALESCE(n.created_at,'') AS created_at
 	FROM nuclei_findings n
-	WHERE COALESCE(n.verification,'') = 'verified'
+	WHERE COALESCE(n.verification,'unverified') != 'rejected'
+		AND NOT EXISTS (
+			SELECT 1 FROM vuln_findings vf
+			JOIN candidates c ON c.id = vf.candidate_id
+			WHERE vf.target_id = n.target_id AND c.source_result_id = n.id
+		)
 
 	UNION ALL
 
@@ -81,6 +86,10 @@ const unifiedFindingsCTE = `WITH unified AS (
 		SUBSTR(COALESCE(b.file_type,''), 1, 2000) AS evidence,
 		COALESCE(b.created_at,'') AS created_at
 	FROM backup_findings b
+	WHERE NOT EXISTS (
+		SELECT 1 FROM vuln_findings vf
+		WHERE vf.target_id = b.target_id AND vf.type = 'exposed_backup' AND vf.url = b.url
+	)
 
 	UNION ALL
 
@@ -118,6 +127,10 @@ const unifiedFindingsCTE = `WITH unified AS (
 		COALESCE(j.created_at,'') AS created_at
 	FROM js_findings j
 	WHERE COALESCE(j.verified,0) = 1
+		AND NOT EXISTS (
+			SELECT 1 FROM vuln_findings vf
+			WHERE vf.target_id = j.target_id AND vf.provenance = 'js_findings:' || j.id
+		)
 )`
 
 func escapeFindingsLike(s string) string {
@@ -129,7 +142,8 @@ func escapeFindingsLike(s string) string {
 // stores and all of the caller's targets.
 // Query params: status (finding|candidate|all, default finding), severity,
 // type, source (native|nuclei|backup|open_redirect|js_secret), target_id,
-// q (search domain/url/type/parameter), page (default 1), limit (default 200, max 500).
+// q (search domain/url/type/parameter), page (default 1), limit (default 200, max 500),
+// offset (optional non-negative integer overriding (page - 1) * limit).
 func (h *Handler) handleListAllFindings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
@@ -148,6 +162,11 @@ func (h *Handler) handleListAllFindings(w http.ResponseWriter, r *http.Request) 
 		limit = 500
 	}
 	offset := (page - 1) * limit
+	if rawOffset := strings.TrimSpace(q.Get("offset")); rawOffset != "" {
+		if parsed, err := strconv.Atoi(rawOffset); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
 
 	fromWhere := ` FROM unified u JOIN targets t ON t.id = u.target_id WHERE 1=1`
 	args := []any{}
@@ -194,9 +213,8 @@ func (h *Handler) handleListAllFindings(w http.ResponseWriter, r *http.Request) 
 		SELECT u.id, u.target_id, COALESCE(t.domain,''), u.type, u.severity,
 			u.url, u.parameter, u.payload, u.confidence, u.priority, u.status,
 			u.source, u.source_tab, u.evidence, u.created_at` + fromWhere + `
-		ORDER BY u.priority DESC,
-			CASE LOWER(u.severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
-			u.created_at DESC, u.id DESC
+		ORDER BY CASE LOWER(u.severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+			u.priority DESC, u.created_at DESC, u.source DESC, u.id DESC
 		LIMIT ? OFFSET ?`
 	selectArgs := append(append([]any{}, args...), limit, offset)
 

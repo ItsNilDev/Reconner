@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -59,12 +60,16 @@ func (h *Handler) recordBlindHit(r *http.Request, token, pageURL, cookies, refer
 	if token == "" {
 		return
 	}
+	// Detach persistence from the victim's browser request so a fast disconnect
+	// (common with beacon Image() loads) never aborts recording a confirmed hit.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+
 	var targetID, injURL, param, sink string
-	var priorHits int
-	err := h.db.QueryRow(`
-		SELECT target_id, url, parameter, sink, hit_count
+	err := h.db.QueryRowContext(ctx, `
+		SELECT target_id, url, parameter, sink
 		FROM blind_xss_probes WHERE token = ?`, token).
-		Scan(&targetID, &injURL, &param, &sink, &priorHits)
+		Scan(&targetID, &injURL, &param, &sink)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			h.logger.Error("Failed to look up blind XSS probe", "token", token, "error", err)
@@ -92,25 +97,43 @@ func (h *Handler) recordBlindHit(r *http.Request, token, pageURL, cookies, refer
 		Source: "blind-xss-callback", DetectionMethod: via,
 		Confidence: 100, Priority: 500, Verdict: scanner.VerifyVerified,
 	}
-	if _, err = scanner.RecordDetectorObservation(r.Context(), h.db, obs); err != nil && strings.Contains(strings.ToLower(err.Error()), "busy") {
-		time.Sleep(200 * time.Millisecond)
-		_, err = scanner.RecordDetectorObservation(r.Context(), h.db, obs)
+	if _, err = scanner.RecordDetectorObservation(ctx, h.db, obs); isSQLiteBusy(err) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			_, err = scanner.RecordDetectorObservation(ctx, h.db, obs)
+		case <-ctx.Done():
+		}
 	}
 	if err != nil {
 		h.logger.Error("Failed to record blind XSS detector observation", "token", token, "target", targetID, "sink", sink, "error", err)
 		return
 	}
 
-	if _, err := h.db.Exec(`
+	var newHits int
+	updateErr := h.db.QueryRowContext(ctx, `
 		UPDATE blind_xss_probes
 		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
-		WHERE token = ?`, evidence, token); err != nil {
-		h.logger.Error("Failed to update blind XSS probe stats", "token", token, "target", targetID, "error", err)
+		WHERE token = ?
+		RETURNING hit_count`, evidence, token).Scan(&newHits)
+	if isSQLiteBusy(updateErr) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			updateErr = h.db.QueryRowContext(ctx, `
+				UPDATE blind_xss_probes
+				SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
+				WHERE token = ?
+				RETURNING hit_count`, evidence, token).Scan(&newHits)
+		case <-ctx.Done():
+		}
+	}
+	if updateErr != nil {
+		h.logger.Error("Failed to update blind XSS probe stats", "token", token, "target", targetID, "error", updateErr)
 	}
 
 	// Broadcast + Telegram alert through the scheduler's scoring path (first hit
-	// only, to avoid alert spam on repeated victim loads).
-	if priorHits == 0 && h.sched != nil {
+	// only, claimed atomically via RETURNING hit_count to avoid duplicate alerts
+	// under concurrent callbacks).
+	if updateErr == nil && newHits == 1 && h.sched != nil {
 		h.sched.EmitVulnFinding(map[string]any{
 			"target_id": targetID, "type": "blind_xss", "url": injURL, "parameter": param,
 		})

@@ -35,7 +35,7 @@ export const EvidenceViewer = ({ targetId, findingId, url, type, open, onClose }
       const r = await targetsApi.replay(targetId, { method: 'GET', url, identity_id: 'all' })
       setReplays(r.results || []); setComparison(r.comparison || '')
     } catch (e) {
-      setReplayError(e instanceof Error ? e.message : 'Replay request failed')
+      setReplayError(e instanceof Error && e.message.trim() ? e.message : 'Replay request failed')
     } finally { setReplaying(false) }
   }
 

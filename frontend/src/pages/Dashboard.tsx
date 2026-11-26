@@ -210,7 +210,6 @@ export default function Dashboard() {
   const [chartsError, setChartsError] = useState('')
   const load = async () => {
     setError('')
-    setChartsError('')
     try {
       const [s, cRes] = await Promise.all([
         dashboard.stats(),
@@ -223,6 +222,7 @@ export default function Dashboard() {
       if (cRes.err) {
         setChartsError(cRes.err)
       } else {
+        setChartsError('')
         setCharts(cRes.data)
       }
     } catch (e) {
@@ -243,7 +243,7 @@ export default function Dashboard() {
     )
   }
 
-  const chartsUnavailable = !!chartsError && !charts
+  const chartsUnavailable = !charts
   const sev = charts?.severity_breakdown || []
   const totalVulns = sev.reduce((s, d) => s + d.count, 0)
   const critHigh = sev.filter(d => d.severity === 'critical' || d.severity === 'high').reduce((s, d) => s + d.count, 0)

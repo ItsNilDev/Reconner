@@ -385,24 +385,32 @@ func (a *Auth) AdminSetPassword(id int64, newPassword string) error {
 // any owned targets to legacy admin ownership (owner_id = 0). Refuses to
 // delete the last active administrator.
 func (a *Auth) DeleteUser(id int64) error {
-	cur, err := a.GetUser(id)
+	tx, err := a.db.Begin()
 	if err != nil {
 		return err
 	}
-	if cur.Role == RoleAdmin && !cur.Disabled {
-		others, err := a.activeAdminCount(id)
-		if err != nil {
+	defer tx.Rollback()
+
+	var role string
+	var disabled int
+	err = tx.QueryRow("SELECT role, disabled FROM users WHERE id = ?", id).Scan(&role, &disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if role == RoleAdmin && disabled == 0 {
+		var others int
+		if err := tx.QueryRow(
+			"SELECT COUNT(*) FROM users WHERE role = ? AND disabled = 0 AND id != ?", RoleAdmin, id,
+		).Scan(&others); err != nil {
 			return err
 		}
 		if others == 0 {
 			return ErrLastAdmin
 		}
 	}
-	tx, err := a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	if _, err = tx.Exec("UPDATE targets SET owner_id = 0 WHERE owner_id = ?", id); err != nil {
 		return err
 	}

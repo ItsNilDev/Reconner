@@ -487,7 +487,8 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
 
   const selectTab = (id: ChangeTabFilter) => {
     setTabFilter(id)
-    if (id !== 'all' && sourceFilter === 'alerts') setSourceFilter('')
+    if (sourceFilter === 'alerts') setSourceFilter('')
+    if (id !== 'all') setViewMode('all')
   }
 
   const handleSourceChange = (next: SourceFilter) => {
@@ -507,6 +508,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   const selectDailySignals = () => {
     setViewMode('signals')
     setTabFilter('all')
+    setQ('')
     resetAdvancedFilters()
   }
 
@@ -562,7 +564,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     (parsedStatusCodes.length > 0 ? 1 : 0) +
     (severity ? 1 : 0) +
     (sourceFilter ? 1 : 0)
-  const isSignalsActive = viewMode === 'signals' && tabFilter === 'all' && advancedFilterCount === 0 && !selectedTaskId
+  const isSignalsActive = isDefaultView(q, statusCodes)
   const selectedRound = rounds.find(r => r.id === selectedTaskId)
 
   return (

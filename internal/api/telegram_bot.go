@@ -1541,14 +1541,27 @@ func (b *TelegramBot) enqueueValidFindingsSince(targetID string, since time.Time
 		{`SELECT id,type,severity,url,COALESCE(parameter,''),'promoted' FROM vuln_findings
 			WHERE target_id=? AND COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'
 			  AND verified_at>=? AND first_verified_notified=0`, []any{targetID, sinceSQL}},
-		{`SELECT id,template_name,severity,matched_url,'',COALESCE(verification,'unverified') FROM nuclei_findings
-			WHERE target_id=? AND verification='verified' AND verified_at>=?`, []any{targetID, sinceSQL}},
+		{`SELECT n.id,n.template_name,n.severity,n.matched_url,'',COALESCE(n.verification,'unverified') FROM nuclei_findings n
+			WHERE n.target_id=? AND n.verification='verified' AND n.verified_at>=?
+			  AND NOT EXISTS (
+			    SELECT 1 FROM vuln_findings vf
+			    JOIN candidates c ON c.id = vf.candidate_id
+			    WHERE vf.target_id = n.target_id AND c.source_result_id = n.id
+			  )`, []any{targetID, sinceSQL}},
 		{`SELECT id,'open_redirect','medium',url,COALESCE(parameter,''),'verified' FROM open_redirect_findings
 			WHERE target_id=? AND verified=1 AND COALESCE(status,'finding')='finding' AND created_at>=?`, []any{targetID, sinceSQL}},
-		{`SELECT id,'backup_exposure','high',url,'','content-validated' FROM backup_findings
-			WHERE target_id=? AND created_at>=?`, []any{targetID, sinceSQL}},
-		{`SELECT id,type,severity,COALESCE((SELECT url FROM js_files WHERE id=js_findings.js_file_id),''),'','verified' FROM js_findings
-			WHERE target_id=? AND verified=1 AND created_at>=?`, []any{targetID, sinceSQL}},
+		{`SELECT b.id,'backup_exposure','high',b.url,'','content-validated' FROM backup_findings b
+			WHERE b.target_id=? AND b.created_at>=?
+			  AND NOT EXISTS (
+			    SELECT 1 FROM vuln_findings vf
+			    WHERE vf.target_id = b.target_id AND vf.type = 'exposed_backup' AND vf.url = b.url
+			  )`, []any{targetID, sinceSQL}},
+		{`SELECT j.id,j.type,j.severity,COALESCE((SELECT url FROM js_files WHERE id=j.js_file_id),''),'','verified' FROM js_findings j
+			WHERE j.target_id=? AND j.verified=1 AND j.created_at>=?
+			  AND NOT EXISTS (
+			    SELECT 1 FROM vuln_findings vf
+			    WHERE vf.target_id = j.target_id AND vf.provenance = 'js_findings:' || j.id
+			  )`, []any{targetID, sinceSQL}},
 	}
 	for _, q := range queries {
 		rows, err := b.h.db.Query(q.query, q.args...)

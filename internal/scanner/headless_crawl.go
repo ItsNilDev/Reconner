@@ -620,6 +620,9 @@ func (c *HeadlessCrawler) Run(ctx context.Context, targetID string, logFn LogFun
 func (c *HeadlessCrawler) storeStates(ctx context.Context, targetID, pageURL string, states []string) {
 	parent := ""
 	for sequence, state := range states {
+		if ctx.Err() != nil {
+			break
+		}
 		if strings.TrimSpace(state) == "" {
 			continue
 		}
@@ -709,6 +712,9 @@ func (c *HeadlessCrawler) storeParams(ctx context.Context, targetID string, para
 		return 0
 	}
 	for _, p := range params {
+		if ctx.Err() != nil {
+			break
+		}
 		// Single-endpoint mode: only keep insertion points under the seed URL.
 		if !urlInEndpointScope(ctx, p.URL) {
 			continue
@@ -744,6 +750,10 @@ func (c *HeadlessCrawler) storeParams(ctx context.Context, targetID string, para
 		} else {
 			stored++
 		}
+	}
+	if ctx.Err() != nil {
+		_ = tx.Rollback()
+		return 0
 	}
 	if err := tx.Commit(); err != nil {
 		if c.logger != nil {

@@ -318,7 +318,7 @@ func upsertFindingProjection(ctx context.Context, db *database.DB, candidateID s
 		// Operator triage decisions (confirmed / accepted_risk / fixed) are never
 		// overwritten by automated rejection.
 		if _, err := db.ExecContext(ctx, `UPDATE vuln_findings SET status='rejected', lifecycle=?, confidence=0
-			WHERE candidate_id=? AND COALESCE(triage,'') NOT IN ('confirmed','accepted_risk','fixed')`, lifecycle, candidateID); err != nil {
+			WHERE candidate_id=? AND LOWER(TRIM(COALESCE(triage,''))) NOT IN ('confirmed','accepted_risk','fixed')`, lifecycle, candidateID); err != nil {
 			return fmt.Errorf("reject finding projection: %w", err)
 		}
 		return nil

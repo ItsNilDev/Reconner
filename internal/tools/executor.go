@@ -159,8 +159,13 @@ func scanStreamLines(r io.Reader, maxLineBytes int, onLine func(string), onOvers
 				}
 				continue
 			} else {
-				if len(buf)+len(chunk) > maxLineBytes {
-					if err != bufio.ErrBufferFull {
+				totalLen := len(buf) + len(chunk)
+				if totalLen > maxLineBytes {
+					if err == bufio.ErrBufferFull && totalLen == maxLineBytes+1 && chunk[len(chunk)-1] == '\r' {
+						buf = append(buf, chunk...)
+						continue
+					}
+					if err != bufio.ErrBufferFull && totalLen <= maxLineBytes+2 {
 						candidate := append(buf, chunk...)
 						trimmed := trimEOL(candidate)
 						if len(trimmed) <= maxLineBytes {
@@ -178,7 +183,7 @@ func scanStreamLines(r io.Reader, maxLineBytes int, onLine func(string), onOvers
 						}
 					}
 					oversized = true
-					droppedBytes = len(buf) + len(chunk)
+					droppedBytes = totalLen
 					buf = nil
 				} else {
 					buf = append(buf, chunk...)

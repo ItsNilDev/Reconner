@@ -348,6 +348,69 @@ describe('ChangeLog filter controls', () => {
       expect(lastSeenAllUrl(fetchMock)).toContain('q=Forbidden')
     })
   })
+
+  it('clears source alerts and drops category=alerts when clicking the All tab', async () => {
+    const fetchMock = installFetch()
+    render(<ChangeLog />)
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
+    fireEvent.change(screen.getByLabelText('Source'), { target: { value: 'alerts' } })
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=alerts'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).not.toContain('category=alerts'))
+    expect((screen.getByLabelText('Source') as HTMLSelectElement).value).toBe('')
+  })
+
+  it('switches feed mode out of Daily signals on search and restores default_view=1 when clicking Daily signals', async () => {
+    const fetchMock = installFetch()
+    render(<ChangeLog />)
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+
+    const dailyBtn = screen.getByRole('button', { name: 'Daily signals' })
+    const allHistoryBtn = screen.getByRole('button', { name: 'All history' })
+    const searchInput = screen.getByPlaceholderText('Search changes…') as HTMLInputElement
+
+    expect(dailyBtn).toHaveClass('active')
+    expect(allHistoryBtn).not.toHaveClass('active')
+
+    fireEvent.change(searchInput, { target: { value: 'alpha' } })
+    expect(dailyBtn).not.toHaveClass('active')
+    expect(allHistoryBtn).toHaveClass('active')
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('q=alpha')
+      expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
+    })
+
+    fireEvent.click(dailyBtn)
+    expect(searchInput.value).toBe('')
+    expect(dailyBtn).toHaveClass('active')
+    expect(allHistoryBtn).not.toHaveClass('active')
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('default_view=1')
+      expect(lastChangesUrl(fetchMock)).not.toContain('q=')
+    })
+  })
+
+  it('stays in All history after selecting a type tab and returning to All', async () => {
+    const fetchMock = installFetch()
+    render(<ChangeLog />)
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+    expect(lastChangesUrl(fetchMock)).toContain('default_view=1')
+
+    fireEvent.click(screen.getByRole('button', { name: 'HTTP' }))
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('category=http,tech')
+      expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).not.toContain('category='))
+    expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
+    expect(screen.getByRole('button', { name: 'All history' })).toHaveClass('active')
+    expect(screen.getByRole('button', { name: 'Daily signals' })).not.toHaveClass('active')
+  })
 })
 
 describe('ChangeLog scope event renderer', () => {

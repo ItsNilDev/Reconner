@@ -379,6 +379,7 @@ export const findings = {
     target_id?: string
     q?: string
     page?: number
+    offset?: number
     limit?: number
   }): Promise<PagedResult<AllFinding>> => {
     const qs = new URLSearchParams()

@@ -41,7 +41,7 @@ export const ForcePasswordChange = () => {
   }
 
   return createPortal(
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" />
       <div className="relative bg-surface-2 border border-border rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
         <div>

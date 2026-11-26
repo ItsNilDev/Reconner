@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { system, type UpdateInfo } from '../../lib/api'
 import { useUIStore } from '../../store/ui'
 import { cn } from '../../lib/utils'
-import { acquireScrollLock } from '../ui'
+import { acquireScrollLock, registerEscapeClose } from '../ui'
 
 const CHECK_INTERVAL = 6 * 60 * 60 * 1000
 const DISMISSED_KEY = 'reconner.dismissed-release'
@@ -62,16 +62,17 @@ export function UpdateCenterProvider({ children }: { children: React.ReactNode }
     }
   }, [load])
 
+  const open = Boolean(detailsOpen && info)
+
   useEffect(() => {
-    if (!detailsOpen) return
+    if (!open) return
     const releaseLock = acquireScrollLock()
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setDetailsOpen(false) }
-    document.addEventListener('keydown', onKey)
+    const unregisterEscape = registerEscapeClose(() => setDetailsOpen(false))
     return () => {
-      document.removeEventListener('keydown', onKey)
+      unregisterEscape()
       releaseLock()
     }
-  }, [detailsOpen])
+  }, [open])
 
   const refresh = useCallback(async () => { await load(true) }, [load])
   const dismiss = useCallback(() => {
@@ -101,7 +102,7 @@ export function UpdateCenterProvider({ children }: { children: React.ReactNode }
   return (
     <UpdateCenterContext.Provider value={value}>
       {children}
-      {detailsOpen && info && createPortal(
+      {open && info && createPortal(
         <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center sm:p-4" role="dialog" aria-modal="true" aria-labelledby="release-title">
           <button className="absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={() => setDetailsOpen(false)} aria-label="Close release details" />
           <section className="relative w-full sm:max-w-2xl max-h-[92dvh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-border bg-surface-2 shadow-2xl animate-slide-up">

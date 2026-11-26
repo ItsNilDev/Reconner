@@ -3,15 +3,20 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gorilla/mux"
+	"github.com/mattn/go-sqlite3"
 	"github.com/recon-platform/internal/config"
 	"github.com/recon-platform/internal/scheduler"
 )
@@ -244,5 +249,106 @@ func TestScanConfigSaveFailureRollsBackInMemory(t *testing.T) {
 	}
 	if len(h.cfg.DNSResolvers) != 1 || h.cfg.DNSResolvers[0] != "1.1.1.1" {
 		t.Fatalf("failed Save did not roll back dns_resolvers: got %v want [1.1.1.1]", h.cfg.DNSResolvers)
+	}
+}
+
+func TestScanConfigSaveFailureNeverExposesUncommittedLimits(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("RECON_CONFIG", path)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DNSResolvers = []string{"1.1.1.1"}
+	cfg.SetConcurrencyLimits(3, 1, 1)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// Replace the config file with a non-empty directory so SaveCandidateLocked
+	// executes apply/marshal/rollback and then fails during os.Rename.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "blocker"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	h, _ := newIsoHandler(t)
+	h.cfg = cfg
+	h.sched = scheduler.New(h.db, nil, cfg, h.logger)
+
+	raw, err := json.Marshal(map[string]any{
+		"max_concurrent_scans":       10,
+		"max_concurrent_deep_scans":  4,
+		"max_concurrent_watch_scans": 5,
+		"dns_resolvers":              []string{"8.8.8.8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stop atomic.Bool
+	var sawUncommitted atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			g, d, w := h.cfg.ConcurrencyLimits()
+			if g != 3 || d != 1 || w != 1 {
+				sawUncommitted.Store(true)
+				return
+			}
+		}
+	}()
+
+	for range 20 {
+		req := httptest.NewRequest(http.MethodPost, "/api/system/scan-config", bytes.NewReader(raw))
+		rec := httptest.NewRecorder()
+		h.handleUpdateScanConfig(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			stop.Store(true)
+			wg.Wait()
+			t.Fatalf("expected 500 when rename fails, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if sawUncommitted.Load() {
+		t.Fatalf("concurrent ConcurrencyLimits() reader observed uncommitted values during failed save")
+	}
+	if gotG, gotD, gotW := h.cfg.ConcurrencyLimits(); gotG != 3 || gotD != 1 || gotW != 1 {
+		t.Fatalf("concurrency limits after failed save = %d/%d/%d, want 3/1/1", gotG, gotD, gotW)
+	}
+	if len(h.cfg.DNSResolvers) != 1 || h.cfg.DNSResolvers[0] != "1.1.1.1" {
+		t.Fatalf("dns_resolvers after failed save = %v, want [1.1.1.1]", h.cfg.DNSResolvers)
+	}
+}
+
+func TestIsSQLiteBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "ErrBusy", err: sqlite3.Error{Code: sqlite3.ErrBusy}, want: true},
+		{name: "ErrLocked", err: sqlite3.Error{Code: sqlite3.ErrLocked}, want: true},
+		{name: "wrapped ErrBusy", err: fmt.Errorf("wrap: %w", sqlite3.Error{Code: sqlite3.ErrBusy}), want: true},
+		{name: "ErrConstraint", err: sqlite3.Error{Code: sqlite3.ErrConstraint}, want: false},
+		{name: "database is locked msg", err: errors.New("database is locked"), want: true},
+		{name: "database table is locked msg", err: errors.New("database table is locked"), want: true},
+		{name: "busy msg", err: errors.New("SQLITE_BUSY"), want: true},
+		{name: "other error", err: errors.New("connection refused"), want: false},
+	}
+	for _, tc := range cases {
+		if got := isSQLiteBusy(tc.err); got != tc.want {
+			t.Errorf("%s: isSQLiteBusy(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
 	}
 }

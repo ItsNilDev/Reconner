@@ -90,29 +90,52 @@ export function acquireScrollLock(): () => void {
   }
 }
 
-const escapeStack: Array<() => void> = []
+type EscapeEntry = { close: () => void }
+const escapeStack: EscapeEntry[] = []
 let escapeListenerAttached = false
 
 function handleGlobalEscape(event: KeyboardEvent) {
   if (event.key !== 'Escape' || event.defaultPrevented) return
   const top = escapeStack[escapeStack.length - 1]
-  if (top) top()
+  if (top) {
+    event.preventDefault()
+    top.close()
+  }
 }
 
-function registerEscapeClose(onClose: () => void): () => void {
-  escapeStack.push(onClose)
+export function registerEscapeClose(onClose: () => void): () => void {
+  const entry: EscapeEntry = { close: onClose }
+  escapeStack.push(entry)
   if (!escapeListenerAttached) {
     document.addEventListener('keydown', handleGlobalEscape)
     escapeListenerAttached = true
   }
+  let unregistered = false
   return () => {
-    const idx = escapeStack.lastIndexOf(onClose)
+    if (unregistered) return
+    unregistered = true
+    const idx = escapeStack.indexOf(entry)
     if (idx !== -1) escapeStack.splice(idx, 1)
     if (escapeStack.length === 0 && escapeListenerAttached) {
       document.removeEventListener('keydown', handleGlobalEscape)
       escapeListenerAttached = false
     }
   }
+}
+
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(', ')
+
+function getFocusableElements(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    el => !el.closest('[hidden], [inert]') && el.getAttribute('aria-hidden') !== 'true',
+  )
 }
 
 export const Modal = ({ open, onClose, title, children, footer, width='md', bodyClassName }: {
@@ -154,16 +177,18 @@ export const Modal = ({ open, onClose, title, children, footer, width='md', body
   )
 }
 
-export const Drawer = ({ open, onClose, title, subtitle, children, footer, width = 'md' }: {
+export const Drawer = ({ open, onClose, title, subtitle, ariaLabel, children, footer, width = 'md' }: {
   open: boolean
   onClose: () => void
   title?: React.ReactNode
   subtitle?: React.ReactNode
+  ariaLabel?: string
   children: React.ReactNode
   footer?: React.ReactNode
   width?: 'md' | 'lg'
 }) => {
   const titleID = useId()
+  const drawerRef = useRef<HTMLElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
@@ -172,9 +197,47 @@ export const Drawer = ({ open, onClose, title, subtitle, children, footer, width
     const releaseLock = acquireScrollLock()
     const unregisterEscape = registerEscapeClose(() => onCloseRef.current())
     if (bodyRef.current) bodyRef.current.scrollTop = 0
+
+    const prevFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const drawer = drawerRef.current
+    if (drawer) {
+      const focusables = getFocusableElements(drawer)
+      ;(focusables[0] ?? drawer).focus()
+    }
+
+    const handleTab = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return
+      const currentDrawer = drawerRef.current
+      if (!currentDrawer) return
+      const topDialog = Array.from(document.querySelectorAll('[role="dialog"]')).pop()
+      if (topDialog && topDialog !== currentDrawer) return
+
+      const focusables = getFocusableElements(currentDrawer)
+      if (focusables.length === 0) {
+        event.preventDefault()
+        currentDrawer.focus()
+        return
+      }
+      const active = document.activeElement
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (event.shiftKey) {
+        if (!active || !currentDrawer.contains(active) || active === first || active === currentDrawer) {
+          event.preventDefault()
+          last.focus()
+        }
+      } else if (!active || !currentDrawer.contains(active) || active === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleTab)
     return () => {
+      document.removeEventListener('keydown', handleTab)
       unregisterEscape()
       releaseLock()
+      if (prevFocused?.isConnected) prevFocused.focus()
     }
   }, [open])
   if (!open) return null
@@ -188,23 +251,33 @@ export const Drawer = ({ open, onClose, title, subtitle, children, footer, width
         onClick={onClose}
       />
       <aside
+        ref={drawerRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={title ? titleID : undefined}
+        aria-label={!title ? (ariaLabel || 'Details panel') : undefined}
         className={cn(
-          'relative flex h-dvh w-full flex-col border-l border-border bg-surface-1 shadow-2xl',
+          'relative flex h-dvh w-full flex-col border-l border-border bg-surface-1 shadow-2xl focus:outline-none',
           width === 'lg' ? 'max-w-2xl' : 'max-w-lg',
         )}
       >
-        {(title || subtitle) && (
-          <header className="flex shrink-0 items-start justify-between gap-3 border-b border-border px-5 py-4">
+        <header
+          className={cn(
+            'flex shrink-0 border-b border-border',
+            title || subtitle
+              ? 'items-start justify-between gap-3 px-5 py-4'
+              : 'items-center justify-end px-4 py-2.5',
+          )}
+        >
+          {(title || subtitle) && (
             <div className="min-w-0">
               {title && <h3 id={titleID} className="text-sm font-semibold">{title}</h3>}
               {subtitle && <div className="mt-1 break-all text-xs text-text-muted">{subtitle}</div>}
             </div>
-            <Button size="sm" variant="ghost" onClick={onClose} className="shrink-0">Close</Button>
-          </header>
-        )}
+          )}
+          <Button type="button" size="sm" variant="ghost" onClick={onClose} className="shrink-0">Close</Button>
+        </header>
         <div ref={bodyRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
           {children}
         </div>

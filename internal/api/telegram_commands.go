@@ -333,10 +333,23 @@ func (b *TelegramBot) statusText(ctx context.Context) string {
 	_ = b.h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE status='pending'`).Scan(&pending)
 	_ = b.h.db.QueryRowContext(ctx, `WITH verified(severity) AS (
 		SELECT severity FROM vuln_findings WHERE COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'
-		UNION ALL SELECT severity FROM nuclei_findings WHERE verification='verified'
+		UNION ALL SELECT n.severity FROM nuclei_findings n WHERE n.verification='verified'
+			AND NOT EXISTS (
+				SELECT 1 FROM vuln_findings vf
+				JOIN candidates c ON c.id = vf.candidate_id
+				WHERE vf.target_id = n.target_id AND c.source_result_id = n.id
+			)
 		UNION ALL SELECT 'medium' FROM open_redirect_findings WHERE verified=1 AND COALESCE(status,'finding')='finding'
-		UNION ALL SELECT 'high' FROM backup_findings
-		UNION ALL SELECT severity FROM js_findings WHERE verified=1
+		UNION ALL SELECT 'high' FROM backup_findings b
+			WHERE NOT EXISTS (
+				SELECT 1 FROM vuln_findings vf
+				WHERE vf.target_id = b.target_id AND vf.type = 'exposed_backup' AND vf.url = b.url
+			)
+		UNION ALL SELECT j.severity FROM js_findings j WHERE j.verified=1
+			AND NOT EXISTS (
+				SELECT 1 FROM vuln_findings vf
+				WHERE vf.target_id = j.target_id AND vf.provenance = 'js_findings:' || j.id
+			)
 	) SELECT COUNT(*),COALESCE(SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END),0) FROM verified`).Scan(&findings, &critical)
 	return fmt.Sprintf("Reconner status\nTargets: %d\nScans: %d running · %d queued\nVerified findings: %d (%d critical)", targets, running, pending, findings, critical)
 }
@@ -433,12 +446,27 @@ func (b *TelegramBot) findingsText(ctx context.Context, targetRef string) string
 	query := `WITH verified(target_id,type,severity,url,parameter,created_at) AS (
 		SELECT target_id,type,severity,url,COALESCE(parameter,''),created_at FROM vuln_findings
 		 WHERE COALESCE(status,'finding')='finding' AND COALESCE(triage,'')<>'false_positive'
-		UNION ALL SELECT target_id,template_name,severity,matched_url,'',created_at FROM nuclei_findings WHERE verification='verified'
+		UNION ALL SELECT n.target_id,n.template_name,n.severity,n.matched_url,'',n.created_at FROM nuclei_findings n
+		 WHERE n.verification='verified'
+		   AND NOT EXISTS (
+		     SELECT 1 FROM vuln_findings vf
+		     JOIN candidates c ON c.id = vf.candidate_id
+		     WHERE vf.target_id = n.target_id AND c.source_result_id = n.id
+		   )
 		UNION ALL SELECT target_id,'open_redirect','medium',url,COALESCE(parameter,''),created_at FROM open_redirect_findings
 		 WHERE verified=1 AND COALESCE(status,'finding')='finding'
-		UNION ALL SELECT target_id,'backup_exposure','high',url,'',created_at FROM backup_findings
+		UNION ALL SELECT b.target_id,'backup_exposure','high',b.url,'',b.created_at FROM backup_findings b
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM vuln_findings vf
+		   WHERE vf.target_id = b.target_id AND vf.type = 'exposed_backup' AND vf.url = b.url
+		 )
 		UNION ALL SELECT j.target_id,j.type,j.severity,COALESCE(f.url,''),'',j.created_at FROM js_findings j
-		 LEFT JOIN js_files f ON f.id=j.js_file_id WHERE j.verified=1
+		 LEFT JOIN js_files f ON f.id=j.js_file_id
+		 WHERE j.verified=1
+		   AND NOT EXISTS (
+		     SELECT 1 FROM vuln_findings vf
+		     WHERE vf.target_id = j.target_id AND vf.provenance = 'js_findings:' || j.id
+		   )
 	) SELECT type,severity,url,parameter,created_at FROM verified
 	  WHERE (?='' OR target_id=?) ORDER BY created_at DESC LIMIT 12`
 	rows, err := b.h.db.QueryContext(ctx, query, targetID, targetID)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/mattn/go-sqlite3"
 	"github.com/recon-platform/internal/scanner"
 )
 
@@ -51,18 +52,34 @@ func oobVulnType(kind string) string {
 	return "blind_ssrf"
 }
 
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se sqlite3.Error
+	if errors.As(err, &se) && (se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "busy")
+}
+
 // RecordOOBHit correlates an out-of-band callback (HTTP /oob/<token> OR the raw
 // JNDI/LDAP listener for Log4Shell) back to its injection point and promotes it
 // to a confirmed critical finding. Idempotent per token; emits the alert only on
 // the first hit. `via` describes how the callback arrived (e.g. "/oob/<token>"
 // or "JNDI/LDAP :1389"). Returns true if the token was known.
 func (h *Handler) RecordOOBHit(token, srcIP, method, ua, via string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	var targetID, injURL, param, kind, sink string
-	var priorHits int
-	err := h.db.QueryRow(`
-		SELECT target_id, url, parameter, kind, sink, hit_count
+	err := h.db.QueryRowContext(ctx, `
+		SELECT target_id, url, parameter, kind, sink
 		FROM oob_probes WHERE token = ?`, token).
-		Scan(&targetID, &injURL, &param, &kind, &sink, &priorHits)
+		Scan(&targetID, &injURL, &param, &kind, &sink)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			h.logger.Error("Failed to look up OOB probe", "token", token, "error", err)
@@ -81,23 +98,40 @@ func (h *Handler) RecordOOBHit(token, srcIP, method, ua, via string) bool {
 		Payload: "oob token=" + token, Evidence: evidence, Source: "oast-callback",
 		DetectionMethod: via, Confidence: 100, Priority: 500, Verdict: scanner.VerifyVerified,
 	}
-	if _, err = scanner.RecordDetectorObservation(context.Background(), h.db, obs); err != nil && strings.Contains(strings.ToLower(err.Error()), "busy") {
-		time.Sleep(200 * time.Millisecond)
-		_, err = scanner.RecordDetectorObservation(context.Background(), h.db, obs)
+	if _, err = scanner.RecordDetectorObservation(ctx, h.db, obs); isSQLiteBusy(err) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			_, err = scanner.RecordDetectorObservation(ctx, h.db, obs)
+		case <-ctx.Done():
+		}
 	}
 	if err != nil {
 		h.logger.Error("Failed to record OOB detector observation", "token", token, "kind", kind, "target", targetID, "src", srcIP, "via", via, "error", err)
 		return false
 	}
 
-	if _, err := h.db.Exec(`
+	var newHits int
+	updateErr := h.db.QueryRowContext(ctx, `
 		UPDATE oob_probes
 		SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
-		WHERE token = ?`, evidence, token); err != nil {
-		h.logger.Error("Failed to update OOB probe stats", "token", token, "kind", kind, "target", targetID, "error", err)
+		WHERE token = ?
+		RETURNING hit_count`, evidence, token).Scan(&newHits)
+	if isSQLiteBusy(updateErr) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			updateErr = h.db.QueryRowContext(ctx, `
+				UPDATE oob_probes
+				SET hit_count = hit_count + 1, last_hit = CURRENT_TIMESTAMP, evidence = ?
+				WHERE token = ?
+				RETURNING hit_count`, evidence, token).Scan(&newHits)
+		case <-ctx.Done():
+		}
+	}
+	if updateErr != nil {
+		h.logger.Error("Failed to update OOB probe stats", "token", token, "kind", kind, "target", targetID, "error", updateErr)
 	}
 
-	if priorHits == 0 && h.sched != nil {
+	if updateErr == nil && newHits == 1 && h.sched != nil {
 		h.sched.EmitVulnFinding(map[string]any{
 			"target_id": targetID, "type": vulnType, "url": injURL, "parameter": param,
 		})

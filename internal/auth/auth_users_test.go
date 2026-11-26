@@ -186,6 +186,34 @@ func TestDeleteUserReassignsOwnedTargets(t *testing.T) {
 	}
 }
 
+func TestDeleteLastAdminPreservesUserAndTargets(t *testing.T) {
+	a := newTestAuth(t)
+	admins, err := a.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminID := admins[0].ID
+
+	if _, err := a.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('sole-admin-t1', 'sole.example.test', ?)`, adminID); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+
+	if err := a.DeleteUser(adminID); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("DeleteUser(sole admin) err = %v, want ErrLastAdmin", err)
+	}
+
+	if _, err := a.GetUser(adminID); err != nil {
+		t.Fatalf("sole admin should still exist after refused delete: %v", err)
+	}
+	var ownerID int64
+	if err := a.db.QueryRow(`SELECT owner_id FROM targets WHERE id = 'sole-admin-t1'`).Scan(&ownerID); err != nil {
+		t.Fatalf("query admin target: %v", err)
+	}
+	if ownerID != adminID {
+		t.Fatalf("sole admin target owner_id = %d, want %d (must stay untouched)", ownerID, adminID)
+	}
+}
+
 func TestAdminPasswordResetInvalidatesOld(t *testing.T) {
 	a := newTestAuth(t)
 	u, _ := a.CreateUser("rot", "oldpassword", RoleMember)

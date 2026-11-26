@@ -281,7 +281,7 @@ const (
 func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn LogFunc) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, js_file_id, type, value FROM js_findings
-		WHERE target_id = ? AND type IN ('aws_key','slack_token','google_api','stripe_key','sendgrid','github_token','secret')
+		WHERE target_id = ? AND COALESCE(verified, 0) = 0 AND type IN ('aws_key','slack_token','google_api','stripe_key','sendgrid','github_token','secret')
 	`, targetID)
 	if err != nil {
 		logFn("warn", "js_analysis", fmt.Sprintf("Failed to query candidate secrets: %v", err))
@@ -312,11 +312,15 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 		}
 		switch verifySecretValue(ctx, it.typ, it.val) {
 		case secretConfirmed:
-			if _, err := s.db.ExecContext(ctx, `UPDATE js_findings SET verified = 1, severity = 'critical' WHERE id = ?`, it.id); err != nil {
+			res, err := s.db.ExecContext(ctx, `UPDATE js_findings SET verified = 1, severity = 'critical' WHERE id = ? AND COALESCE(verified, 0) = 0`, it.id)
+			if err != nil {
 				logFn("warn", "js_analysis", fmt.Sprintf("Failed to mark verified secret %s: %v", it.id, err))
 				if s.logger != nil {
 					s.logger.Warn("Failed to mark verified secret", "target_id", targetID, "finding_id", it.id, "error", err)
 				}
+				continue
+			}
+			if affected, err := res.RowsAffected(); err == nil && affected == 0 {
 				continue
 			}
 			verified++
@@ -331,7 +335,7 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 				Severity:        "critical",
 				URL:             jsURL,
 				Method:          "GET",
-				Parameter:       it.typ,
+				Parameter:       it.typ + ":" + it.id,
 				Location:        "js",
 				Evidence:        fmt.Sprintf("Live %s credential confirmed against provider API", it.typ),
 				Source:          "js_scanner",
@@ -348,7 +352,7 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 				}
 			}
 			logFn("warn", "js_analysis", fmt.Sprintf("VERIFIED live secret: %s", it.typ))
-			if s.broadcast != nil {
+			if s.broadcast != nil && obsErr == nil && obsIDs.FindingID != "" {
 				s.broadcast("new_vuln_finding", map[string]any{
 					"target_id":  targetID,
 					"type":       "verified_secret_" + it.typ,
@@ -358,7 +362,7 @@ func (s *JSScanner) verifySecrets(ctx context.Context, targetID string, logFn Lo
 			}
 		case secretInvalid:
 			// Explicitly rejected by provider → likely placeholder/expired; lower the noise.
-			if _, err := s.db.ExecContext(ctx, `UPDATE js_findings SET severity = 'info' WHERE id = ? AND verified = 0`, it.id); err != nil {
+			if _, err := s.db.ExecContext(ctx, `UPDATE js_findings SET severity = 'info' WHERE id = ? AND COALESCE(verified, 0) = 0`, it.id); err != nil {
 				logFn("warn", "js_analysis", fmt.Sprintf("Failed to downgrade invalid secret %s: %v", it.id, err))
 				if s.logger != nil {
 					s.logger.Warn("Failed to downgrade invalid secret", "target_id", targetID, "finding_id", it.id, "error", err)

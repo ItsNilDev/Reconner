@@ -1358,6 +1358,11 @@ func TestChangesCategoryHostsAndScope(t *testing.T) {
 			path: "/api/changes?category=hosts,http",
 			want: map[string]bool{"wc-host": true, "n-host": true, "mc-http": true},
 		},
+		{
+			name: "category=hosts,http&source=watch intersects category and source",
+			path: "/api/changes?category=hosts,http&source=watch",
+			want: map[string]bool{"wc-host": true},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1380,4 +1385,33 @@ func TestChangesCategoryHostsAndScope(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("seen-all with category=hosts leaves non-hosts unseen", func(t *testing.T) {
+		rec := postChanges(t, h, sid, "/api/changes/seen-all?category=hosts", map[string]any{}, h.handleMarkAllChangesSeen)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("seen-all status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		listRec := serveChanges(t, h, sid, "/api/changes", nil, h.handleListChanges)
+		if listRec.Code != http.StatusOK {
+			t.Fatalf("list status = %d, body = %s", listRec.Code, listRec.Body.String())
+		}
+		var env changesEnvelope
+		if err := json.Unmarshal(listRec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, e := range env.Data {
+			seen[e.ID] = e.Seen
+		}
+		for _, id := range []string{"wc-host", "n-host"} {
+			if !seen[id] {
+				t.Errorf("expected %s to be marked seen, got seen=%v", id, seen)
+			}
+		}
+		for _, id := range []string{"mc-http", "se-bounty", "ws-scope"} {
+			if seen[id] {
+				t.Errorf("expected %s to remain unseen, got seen=%v", id, seen)
+			}
+		}
+	})
 }
