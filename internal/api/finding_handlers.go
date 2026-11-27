@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -59,10 +60,21 @@ func targetListPagination(r *http.Request, defaultLimit, maxLimit int) (page, li
 	if limit > maxLimit {
 		limit = maxLimit
 	}
-	offset = (page - 1) * limit
+	if page-1 > math.MaxInt/limit {
+		// Avoid wrapping (page-1)*limit negative, which SQLite reads as OFFSET 0
+		// and would silently return page 1 for an extreme page number.
+		offset = math.MaxInt
+	} else {
+		offset = (page - 1) * limit
+	}
 	if rawOffset := strings.TrimSpace(q.Get("offset")); rawOffset != "" {
 		if parsed, err := strconv.Atoi(rawOffset); err == nil && parsed >= 0 {
 			offset = parsed
+			// Keep the reported page in sync when a client paginates by raw
+			// offset instead of page number.
+			if q.Get("page") == "" {
+				page = (offset / limit) + 1
+			}
 		}
 	}
 	return page, limit, offset

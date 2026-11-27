@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -272,5 +273,40 @@ func TestTargetProgramLogoSelectionAndValidation(t *testing.T) {
 	}
 	if getEnv.Data.ProgramLogoURL != "https://cdn.example.com/two.png" {
 		t.Errorf("get target t-two ProgramLogoURL = %q, want https://cdn.example.com/two.png", getEnv.Data.ProgramLogoURL)
+	}
+}
+
+func TestTargetListPaginationOverflowAndOffsetPage(t *testing.T) {
+	cases := []struct {
+		name                            string
+		query                           string
+		wantPage, wantLimit, wantOffset int
+	}{
+		{"normal page", "?page=3&limit=50", 3, 50, 100},
+		{"extreme page does not wrap", fmt.Sprintf("?page=%d&limit=500", math.MaxInt), math.MaxInt, 500, math.MaxInt},
+		{"offset without page derives page", "?offset=400&limit=200", 3, 200, 400},
+		{"offset with explicit page preserves page", "?offset=400&page=1&limit=200", 1, 200, 400},
+		{"negative offset ignored", "?offset=-5&page=2&limit=200", 2, 200, 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/targets/t1/subdomains"+tc.query, nil)
+			page, limit, offset := targetListPagination(req, 200, 500)
+			if page != tc.wantPage || limit != tc.wantLimit || offset != tc.wantOffset {
+				t.Fatalf("got page=%d limit=%d offset=%d, want %d/%d/%d",
+					page, limit, offset, tc.wantPage, tc.wantLimit, tc.wantOffset)
+			}
+		})
+	}
+}
+
+func TestValidateProgramLogoURLRejectsPortOnlyHost(t *testing.T) {
+	for _, raw := range []string{"https://:8080/logo.png", "https://", "javascript:alert(1)", "/relative.png"} {
+		if got := validateProgramLogoURL(raw); got != "" {
+			t.Errorf("validateProgramLogoURL(%q) = %q, want empty", raw, got)
+		}
+	}
+	if got := validateProgramLogoURL("https://cdn.example.com/logo.png"); got == "" {
+		t.Error("valid http(s) logo URL was rejected")
 	}
 }

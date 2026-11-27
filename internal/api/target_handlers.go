@@ -195,7 +195,9 @@ func validateProgramLogoURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(trimmed)
-	if err != nil || u.Host == "" {
+	// Hostname() rejects port-only hosts such as https://:8080/logo.png that
+	// would otherwise pass the non-empty Host check.
+	if err != nil || u.Hostname() == "" {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)

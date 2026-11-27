@@ -819,8 +819,8 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 		if _, err := s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium"); err != nil {
 			return err
 		}
-		if s.onScopeNotification != nil {
-			s.onScopeNotification(targetID, "bounty_scope_change", "medium")
+		if cb := s.scopeNotificationCallback(); cb != nil {
+			cb(targetID, "bounty_scope_change", "medium")
 		}
 	}
 	return nil

@@ -124,6 +124,12 @@ describe('ProgramLogo', () => {
     fireEvent.error(img!)
     expect(container.querySelector('img')).toBeNull()
     expect(screen.getByText('A')).toBeInTheDocument()
+
+    // A new valid src must clear the failed state and render the new image.
+    rerender(<ProgramLogo src="https://cdn.example.com/new-logo.png" name="Acme" size="md" />)
+    const recovered = container.querySelector('img')
+    expect(recovered).not.toBeNull()
+    expect(recovered).toHaveAttribute('src', 'https://cdn.example.com/new-logo.png')
   })
 })
 
@@ -244,5 +250,107 @@ describe('TargetDetail server-paged Hosts tab', () => {
     expect(screen.getByText('New results available')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument()
     expect(subdomainQueries).toHaveLength(2)
+  }, 15000)
+
+  it('skips a WS refresh while Load more is in flight so appended rows are not overwritten', async () => {
+    const wsHandlers = new Map<string, Set<(payload: unknown) => void>>()
+    vi.spyOn(ws, 'on').mockImplementation((type, handler) => {
+      if (!wsHandlers.has(type)) wsHandlers.set(type, new Set())
+      wsHandlers.get(type)!.add(handler)
+      return () => wsHandlers.get(type)?.delete(handler)
+    })
+
+    let calls = 0
+    let refreshFetches = 0
+    let resolveLoadMore: ((res: Response) => void) | null = null
+    const fetchMock = mockBaseEndpoints((url) => {
+      calls += 1
+      const limit = Number(url.searchParams.get('limit') || '200')
+      if (calls === 1) return pageResp(makeSubdomains(0, 200), 700, 1, 200)
+      if (calls > 1 && url.searchParams.has('page')) {
+        refreshFetches += 1
+        return pageResp(makeSubdomains(0, 200), 700, 1, limit)
+      }
+      return new Promise<Response>(resolve => {
+        resolveLoadMore = resolve
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderTargetDetail()
+    await screen.findByText('Showing 200 of 700')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load 200 more' }))
+    expect(resolveLoadMore).not.toBeNull()
+
+    vi.useFakeTimers()
+    act(() => {
+      wsHandlers.get('task_progress')?.forEach(h =>
+        h({ target_id: 't1', current_module: 'subdomain_enum' }),
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3100)
+    })
+    // With an append in flight the refresh must not fetch page 1 at all.
+    expect(refreshFetches).toBe(0)
+
+    await act(async () => {
+      resolveLoadMore!(pageResp(makeSubdomains(200, 200), 700, 1, 200))
+    })
+    expect(screen.getByText('Showing 400 of 700')).toBeInTheDocument()
+    expect(screen.getByText('host-399.example.com')).toBeInTheDocument()
+  }, 15000)
+
+  it('asks for confirmation before loading all when the server total exceeds 5,000', async () => {
+    const fetchMock = mockBaseEndpoints((url) => {
+      const limit = Number(url.searchParams.get('limit') || '200')
+      const offset = Number(url.searchParams.get('offset') || '0')
+      return pageResp(makeSubdomains(offset, limit), 6000, 1, limit)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderTargetDetail()
+    await screen.findByText('Showing 200 of 6,000')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load all' }))
+    expect(await screen.findByText(/5,000 rows/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'Load all' })).toBeInTheDocument()
+  }, 15000)
+
+  it('clears a stale data error when a task_finished WS refresh recovers the tab', async () => {
+    const wsHandlers = new Map<string, Set<(payload: unknown) => void>>()
+    vi.spyOn(ws, 'on').mockImplementation((type, handler) => {
+      if (!wsHandlers.has(type)) wsHandlers.set(type, new Set())
+      wsHandlers.get(type)!.add(handler)
+      return () => wsHandlers.get(type)?.delete(handler)
+    })
+
+    let subCalls = 0
+    const fetchMock = mockBaseEndpoints(() => {
+      subCalls += 1
+      if (subCalls === 1) {
+        return new Response(JSON.stringify({ error: 'transient failure' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return pageResp(makeSubdomains(0, 200), 700, 1, 200)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderTargetDetail()
+    await screen.findByRole('alert')
+    expect(screen.getByText('transient failure')).toBeInTheDocument()
+
+    await act(async () => {
+      wsHandlers.get('task_finished')?.forEach(h => h({ target_id: 't1' }))
+    })
+
+    await screen.findByText('Showing 200 of 700')
+    expect(screen.queryByRole('alert')).toBeNull()
   }, 15000)
 })

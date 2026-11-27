@@ -18,8 +18,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/mattn/go-sqlite3"
 	"github.com/recon-platform/internal/auth"
-	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/scheduler"
 )
 
@@ -370,11 +370,14 @@ func TestDashboardBadgesOwnerIsolationAndEmptyDB(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Route through the real router so registration, the GET method
+	// restriction, and requireAuth are all exercised, not just the handler.
+	router := h.Router()
 	readBadges := func(sid string) map[string]int {
 		req := httptest.NewRequest(http.MethodGet, "/api/dashboard/badges", nil)
 		req.AddCookie(&http.Cookie{Name: "recon_session", Value: sid})
 		rec := httptest.NewRecorder()
-		h.requireAuth(h.handleDashboardBadges)(rec, req)
+		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("badges status=%d body=%s", rec.Code, rec.Body.String())
 		}
@@ -385,6 +388,22 @@ func TestDashboardBadgesOwnerIsolationAndEmptyDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		return env.Data
+	}
+
+	anonRec := httptest.NewRecorder()
+	router.ServeHTTP(anonRec, httptest.NewRequest(http.MethodGet, "/api/dashboard/badges", nil))
+	if anonRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated badges status=%d, want 401; body=%s", anonRec.Code, anonRec.Body.String())
+	}
+	postReq := httptest.NewRequest(http.MethodPost, "/api/dashboard/badges", nil)
+	postReq.AddCookie(&http.Cookie{Name: "recon_session", Value: adminSID})
+	postRec := httptest.NewRecorder()
+	router.ServeHTTP(postRec, postReq)
+	// mux has no POST route registered here, so it answers 404 (or 405 on
+	// routers that register a method-agnostic path). Either way the handler
+	// must not serve the GET-only endpoint.
+	if postRec.Code != http.StatusNotFound && postRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST badges status=%d, want 404/405; body=%s", postRec.Code, postRec.Body.String())
 	}
 
 	// Empty DB check.
@@ -501,7 +520,41 @@ func TestDashboardStatsConsolidatedEmptyAndPopulated(t *testing.T) {
 	}
 	if _, err := h.db.Exec(`INSERT INTO vuln_findings (id, target_id, type, severity, url, status) VALUES
 		('vf1','t-deep','xss','high','https://a.deep.example/1','finding'),
-		('vf2','t-deep','xss','low','https://a.deep.example/2','candidate')`); err != nil {
+		('vf2','t-deep','xss','low','https://a.deep.example/2','candidate'),
+		('vf3','t-bob','sqli','high','https://a.bob.example/1','finding')`); err != nil {
+		t.Fatal(err)
+	}
+	// Populate every singleQueries table across admin-owned and member-owned
+	// targets, including rows the surfaced/confirmed filters must exclude.
+	if _, err := h.db.Exec(`INSERT INTO js_files (id,target_id,url) VALUES
+		('j1','t-deep','https://a.deep.example/1.js'),
+		('j2','t-watch','https://a.watch.example/2.js'),
+		('j3','t-bob','https://a.bob.example/3.js')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO directory_findings (id,target_id,url) VALUES
+		('d1','t-deep','https://a.deep.example/admin'),
+		('d2','t-watch','https://a.watch.example/admin'),
+		('d3','t-bob','https://a.bob.example/admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO backup_findings (id,target_id,url) VALUES
+		('b1','t-deep','https://a.deep.example/backup.zip'),
+		('b2','t-watch','https://a.watch.example/backup.zip'),
+		('b3','t-bob','https://a.bob.example/backup.zip')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO open_redirect_findings (id,target_id,url,status) VALUES
+		('o1','t-deep','https://a.deep.example/r?u=1','finding'),
+		('o2','t-deep','https://a.deep.example/r?u=2','candidate'),
+		('o3','t-watch','https://a.watch.example/r?u=3','rejected'),
+		('o4','t-bob','https://a.bob.example/r?u=4','finding')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO nuclei_findings (id,target_id,template_id,verification) VALUES
+		('n1','t-deep','xss','verified'),
+		('n2','t-deep','sqli','rejected'),
+		('n3','t-bob','tech-detect','unverified')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -514,15 +567,20 @@ func TestDashboardStatsConsolidatedEmptyAndPopulated(t *testing.T) {
 		adminStats.RunningTasks != 2 || adminStats.FinishedTasks != 1 || adminStats.FailedTasks != 1 || adminStats.PendingTasks != 1 ||
 		adminStats.WatchRunningTasks != 1 || adminStats.DeepRunningTasks != 1 ||
 		adminStats.WatchFailedTasks != 1 || adminStats.DeepFailedTasks != 0 ||
-		adminStats.VulnFindings != 1 {
+		adminStats.JSFiles != 3 || adminStats.DirectoryFindings != 3 || adminStats.BackupFindings != 3 ||
+		adminStats.OpenRedirectFindings != 2 || adminStats.NucleiFindings != 2 || adminStats.VulnFindings != 2 {
 		t.Fatalf("unexpected admin stats: %+v", adminStats)
 	}
 
 	bobStats := readStats(bobSID)
 	if bobStats.Targets != 1 || bobStats.WatchTargets != 1 || bobStats.DeepTargets != 0 ||
 		bobStats.Subdomains != 1 || bobStats.AliveHosts != 1 ||
-		bobStats.HTTPServices != 1 || bobStats.Parameters != 1 || bobStats.ReflectedParameters != 1 ||
-		bobStats.PendingTasks != 1 || bobStats.RunningTasks != 0 {
+		bobStats.WatchSubdomains != 1 || bobStats.WatchAliveHosts != 1 ||
+		bobStats.HTTPServices != 1 || bobStats.WatchHTTPServices != 1 ||
+		bobStats.Parameters != 1 || bobStats.ReflectedParameters != 1 ||
+		bobStats.PendingTasks != 1 || bobStats.RunningTasks != 0 ||
+		bobStats.JSFiles != 1 || bobStats.DirectoryFindings != 1 || bobStats.BackupFindings != 1 ||
+		bobStats.OpenRedirectFindings != 1 || bobStats.NucleiFindings != 1 || bobStats.VulnFindings != 1 {
 		t.Fatalf("unexpected bob stats: %+v", bobStats)
 	}
 

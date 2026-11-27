@@ -1094,12 +1094,12 @@ func TestSchemePrefixedWildcardNormalization(t *testing.T) {
 
 func TestResolveScopeEventWatchOnlyMonitorAndScheduleNudge(t *testing.T) {
 	cases := []struct {
-		name           string
-		setupSQL       string
-		wantNudged     bool
-		wantNextRun    string // exact expected value when non-empty
-		wantNextNull   bool
-		wantPaused     int
+		name         string
+		setupSQL     string
+		wantNudged   bool
+		wantNextRun  string // exact expected value when non-empty
+		wantNextNull bool
+		wantPaused   int
 	}{
 		{
 			name:       "future watch_next_run pulled forward",
@@ -1260,5 +1260,11 @@ func TestReconcileProjectInvokesScopeNotificationCallbackAfterInsert(t *testing.
 	}
 	if got.rowCount != 1 {
 		t.Fatalf("notification row count at callback time = %d, want 1 (must fire after INSERT)", got.rowCount)
+	}
+
+	// A no-op refresh with no scope delta must not fire the callback again.
+	storeTestProgram(t, svc, &p)
+	if len(calls) != 1 {
+		t.Fatalf("no-op reconcile fired onScopeNotification %d extra time(s), want 1 total (%+v)", len(calls)-1, calls)
 	}
 }

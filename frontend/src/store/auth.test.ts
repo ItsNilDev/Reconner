@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAuthStore } from './auth'
+import { useStatsStore } from './stats'
+import type { DashboardStats } from '../types'
 
 function response(data: unknown, status = 200) {
   return new Response(JSON.stringify({ success: status < 400, data }), {
@@ -11,6 +13,7 @@ function response(data: unknown, status = 200) {
 describe('auth store', () => {
   beforeEach(() => {
     useAuthStore.setState({ user: null, initialized: false, loading: false })
+    useStatsStore.getState().reset()
   })
 
   it('initializes to an anonymous state after an expired session', async () => {
@@ -36,6 +39,29 @@ describe('auth store', () => {
     expect(useAuthStore.getState()).toMatchObject({
       user: { id: 7, username: 'admin', role: 'admin' },
       loading: false,
+    })
+  })
+
+  it('resets dashboard data on login so a second user never sees stale stats', async () => {
+    useStatsStore.setState({
+      badges: { targets: 42, running_tasks: 7 },
+      stats: { targets: 42 } as DashboardStats,
+      charts: {} as never,
+      statsError: 'stale error',
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/auth/login')) return response({ message: 'logged in' })
+      return response({ id: 8, username: 'bob', role: 'member', must_change_password: false })
+    }))
+
+    await useAuthStore.getState().login('bob', 'correct-password')
+
+    expect(useStatsStore.getState()).toMatchObject({
+      badges: { targets: 0, running_tasks: 0 },
+      stats: null,
+      charts: null,
+      statsError: '',
     })
   })
 

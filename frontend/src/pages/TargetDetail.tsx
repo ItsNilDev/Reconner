@@ -580,6 +580,7 @@ export default function TargetDetail() {
   const targetRef = useRef(target)
   const loadedCountRef = useRef(0)
   const loadingAllRef = useRef(false)
+  const loadingMoreRef = useRef(false)
   const queryStateRef = useRef({
     tab,
     search: debouncedSearch,
@@ -596,6 +597,7 @@ export default function TargetDetail() {
   targetRef.current = target
   loadedCountRef.current = data.length
   loadingAllRef.current = loadingAll
+  loadingMoreRef.current = loadingMore
   queryStateRef.current = {
     tab,
     search: debouncedSearch,
@@ -628,6 +630,7 @@ export default function TargetDetail() {
     setSort({ key: null, dir: 'desc' })
     setServerTotal(0)
     setLoadingMore(false)
+    loadingMoreRef.current = false
     setLoadingAll(false)
     loadingAllRef.current = false
     setConfirmLoadAll(false)
@@ -1091,15 +1094,20 @@ export default function TargetDetail() {
   }
 
   const loadMore = async () => {
-    if (!id || !isServerPagedTab(tab) || loadingMore || loadingAllRef.current) return
+    if (!id || !isServerPagedTab(tab) || loadingMoreRef.current || loadingAllRef.current) return
     const seq = requestSeqRef.current
     const requestTarget = id
     const requestTab = tab
     const offset = loadedCountRef.current
     const q = queryStateRef.current
+    // A WS refresh started before this append must not finish afterwards and
+    // replace the appended rows with its older page-1/window snapshot.
+    wsRefreshAbortRef.current?.abort()
+    wsRefreshAbortRef.current = null
     loadAbortRef.current?.abort()
     const controller = new AbortController()
     loadAbortRef.current = controller
+    loadingMoreRef.current = true
     setLoadingMore(true)
     try {
       const res = await fetchServerTabPage(
@@ -1124,6 +1132,7 @@ export default function TargetDetail() {
     } finally {
       if (loadAbortRef.current === controller) {
         loadAbortRef.current = null
+        loadingMoreRef.current = false
         setLoadingMore(false)
       }
     }
@@ -1137,7 +1146,7 @@ export default function TargetDetail() {
   }
 
   const startLoadAll = async (bypassConfirm = false) => {
-    if (!id || !isServerPagedTab(tab) || loadingMore || loadingAllRef.current) return
+    if (!id || !isServerPagedTab(tab) || loadingMoreRef.current || loadingAllRef.current) return
     if (serverTotal > LOAD_ALL_CONFIRM_THRESHOLD && !bypassConfirm) {
       setConfirmLoadAll(true)
       return
@@ -1206,7 +1215,7 @@ export default function TargetDetail() {
       loadTab(requestTab)
       return
     }
-    if (loadingAllRef.current) {
+    if (loadingAllRef.current || loadingMoreRef.current) {
       setStaleAvailable(true)
       return
     }
@@ -1232,12 +1241,15 @@ export default function TargetDetail() {
         )
         if (
           controller.signal.aborted ||
+          loadingMoreRef.current ||
+          loadingAllRef.current ||
           seq !== requestSeqRef.current ||
           requestTab !== activeTabRef.current ||
           requestTarget !== activeIdRef.current
         ) {
           return
         }
+        setDataError('')
         setData(res.data || [])
         setServerTotal(res.total || 0)
         setStaleAvailable(false)
@@ -1270,7 +1282,8 @@ export default function TargetDetail() {
             break
           }
         }
-        if (!controller.signal.aborted && !loadingAllRef.current) {
+        if (!controller.signal.aborted && !loadingAllRef.current && !loadingMoreRef.current) {
+          setDataError('')
           setData(mergeUniqueById([], windowRows))
           setServerTotal(latestTotal)
           setStaleAvailable(false)

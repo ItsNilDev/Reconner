@@ -1684,6 +1684,10 @@ func TestListChangesExcludesRound1WatchScopeBaselineAndHandlesMalformedMetadata(
 		 VALUES ('wse-r2','t1','p1','r2.one.example','landed','a2','{"task_id":"task-r2"}','2026-03-02 00:00:00')`,
 		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
 		 VALUES ('wse-bad','t1','p1','bad.one.example','re_eligible','a3','{not-valid-json','2026-03-03 00:00:00')`,
+		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+		 VALUES ('wse-null','t1','p1','null.one.example','landed','a4',NULL,'2026-03-04 00:00:00')`,
+		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+		 VALUES ('wse-empty','t1','p1','empty.one.example','landed','a5','','2026-03-05 00:00:00')`,
 	}
 	for _, stmt := range rows {
 		if _, err := h.db.Exec(stmt); err != nil {
@@ -1695,33 +1699,65 @@ func TestListChangesExcludesRound1WatchScopeBaselineAndHandlesMalformedMetadata(
 		t.Fatal(err)
 	}
 
-	rec := serveChanges(t, h, sid, "/api/changes?default_view=1", nil, h.handleListChanges)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	checkFeed := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var env changesEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := map[string]ChangeEntry{}
+		for _, e := range env.Data {
+			got[e.ID] = e
+		}
+		if _, found := got["wse-r1"]; found {
+			t.Error("baseline row wse-r1 must be excluded from every Changes feed view")
+		}
+		for _, id := range []string{"wse-r2", "wse-bad", "wse-null", "wse-empty"} {
+			if _, ok := got[id]; !ok {
+				t.Errorf("%s missing from feed, got %+v", id, env.Data)
+			}
+		}
+		for _, tc := range []struct{ id, taskID string }{
+			{"wse-r2", "task-r2"}, {"wse-bad", ""}, {"wse-null", ""}, {"wse-empty", ""},
+		} {
+			if e, ok := got[tc.id]; ok && e.TaskID != tc.taskID {
+				t.Errorf("%s TaskID = %q, want %q", tc.id, e.TaskID, tc.taskID)
+			}
+		}
 	}
-	var env changesEnvelope
-	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	got := map[string]ChangeEntry{}
-	for _, e := range env.Data {
-		got[e.ID] = e
-	}
-	if _, found := got["wse-r1"]; found {
-		t.Errorf("baseline row wse-r1 must be excluded from /api/changes?default_view=1")
-	}
-	r2, ok := got["wse-r2"]
-	if !ok {
-		t.Fatalf("expected round-2 row wse-r2 in /api/changes?default_view=1, got %+v", env.Data)
-	}
-	if r2.TaskID != "task-r2" {
-		t.Errorf("wse-r2 TaskID = %q, want task-r2", r2.TaskID)
-	}
-	bad, ok := got["wse-bad"]
-	if !ok {
-		t.Fatalf("expected malformed-metadata non-baseline row wse-bad, got %+v", env.Data)
-	}
-	if bad.TaskID != "" {
-		t.Errorf("wse-bad TaskID = %q, want empty", bad.TaskID)
-	}
+
+	t.Run("default view", func(t *testing.T) {
+		checkFeed(t, serveChanges(t, h, sid, "/api/changes?default_view=1", nil, h.handleListChanges))
+	})
+	t.Run("all history", func(t *testing.T) {
+		checkFeed(t, serveChanges(t, h, sid, "/api/changes", nil, h.handleListChanges))
+	})
+	// Watch scope events are categorised as "assets" by changeCategoryExpr.
+	t.Run("assets category", func(t *testing.T) {
+		checkFeed(t, serveChanges(t, h, sid, "/api/changes?category=assets", nil, h.handleListChanges))
+	})
+
+	t.Run("seen-all excludes baseline", func(t *testing.T) {
+		rec := postChanges(t, h, sid, "/api/changes/seen-all", map[string]any{}, h.handleMarkAllChangesSeen)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("seen-all status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		for _, tc := range []struct {
+			id   string
+			want int
+		}{
+			{"wse-r1", 0}, {"wse-r2", 1}, {"wse-bad", 1}, {"wse-null", 1}, {"wse-empty", 1},
+		} {
+			var n int
+			if err := h.db.QueryRow(`SELECT COUNT(*) FROM change_seen WHERE change_id=?`, tc.id).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != tc.want {
+				t.Errorf("change_seen count for %s = %d, want %d", tc.id, n, tc.want)
+			}
+		}
+	})
 }

@@ -125,6 +125,10 @@ type Service struct {
 	indexState   DetailIndexStatus
 	indexRetry   map[string]time.Time
 	onScopeEvent ScopeEventNotify
+	// cbMu guards only the WebSocket notification callback. It must stay
+	// separate from s.mu: SyncAll holds s.mu across refreshLinkedProviderDetails
+	// -> reconcileProject, which reads the callback.
+	cbMu                sync.RWMutex
 	onScopeNotification func(targetID, typ, severity string)
 }
 
@@ -148,7 +152,19 @@ func (s *Service) SetScopeEventNotify(fn ScopeEventNotify) { s.onScopeEvent = fn
 // bounty scope-change notification row is persisted so callers can emit
 // real-time WebSocket updates.
 func (s *Service) SetScopeNotificationCallback(fn func(targetID, typ, severity string)) {
+	s.cbMu.Lock()
 	s.onScopeNotification = fn
+	s.cbMu.Unlock()
+}
+
+// scopeNotificationCallback snapshots the callback under the lock so a
+// concurrent setter cannot race with, or nil out, a callback between the nil
+// check and invocation.
+func (s *Service) scopeNotificationCallback() func(targetID, typ, severity string) {
+	s.cbMu.RLock()
+	cb := s.onScopeNotification
+	s.cbMu.RUnlock()
+	return cb
 }
 
 func (s *Service) SetHTTPClient(client *http.Client) {

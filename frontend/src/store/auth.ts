@@ -19,6 +19,10 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       await authApi.login(username, password)
       const user = await authApi.me()
+      // A second login without an intervening logout (e.g. back navigation to
+      // /login) must not leave the previous user's dashboard data or in-flight
+      // single-flight fetches visible to the new user.
+      useStatsStore.getState().reset()
       set({ user, loading: false })
     } catch (err) { set({ loading: false }); throw err }
   },
