@@ -299,6 +299,7 @@ type Scheduler struct {
 	// Chromium/nuclei/sqlmap child processes and only add CPU churn.
 	memoryLog atomic.Bool
 	stopCh    chan struct{}
+	watchNudge chan struct{}
 	stopOnce  sync.Once
 	stopping  bool
 	wg        sync.WaitGroup
@@ -326,6 +327,7 @@ func New(db *database.DB, hub *websocket.Hub, cfg *config.Config, log *logger.Lo
 		taskTargets: make(map[string]string),
 		taskTypes:   make(map[string]string),
 		stopCh:      make(chan struct{}),
+		watchNudge:  make(chan struct{}, 1),
 		paused:      make(map[string]bool),
 	}
 
@@ -1050,9 +1052,13 @@ func (s *Scheduler) createTaskWithOptions(targetID string, modules []string, pri
 	// Non-blocking enqueue: never let a full queue block the HTTP handler. A task
 	// that does not fit remains pending and the two-second database drain picks it
 	// up; spawning a blocked sender here leaked goroutines during shutdown.
-	select {
-	case s.queue <- task.ID:
-	default:
+	if task.Type == watchScanType {
+		s.NudgeWatch()
+	} else {
+		select {
+		case s.queue <- task.ID:
+		default:
+		}
 	}
 	s.hub.Broadcast("task_created", task)
 	return task, nil
@@ -1157,6 +1163,7 @@ func (s *Scheduler) CancelTask(taskID string) error {
 	delete(s.taskTargets, taskID)
 	delete(s.taskTypes, taskID)
 	s.mu.Unlock()
+	s.NudgeWatch()
 
 	if ok {
 		cancel()
@@ -1233,6 +1240,7 @@ func (s *Scheduler) CancelTasksForTarget(targetID string) error {
 		delete(s.taskTypes, t.id)
 	}
 	s.mu.Unlock()
+	s.NudgeWatch()
 	for _, t := range tasks {
 		s.clearTaskControls(t.id)
 	}
@@ -1721,6 +1729,7 @@ func (s *Scheduler) tryStartTask(taskID string) {
 			delete(s.taskTargets, taskID)
 			delete(s.taskTypes, taskID)
 			s.mu.Unlock()
+			s.NudgeWatch()
 		}()
 		s.executeTask(ctx, taskID)
 	}()
@@ -3546,6 +3555,7 @@ func (s *Scheduler) notifyBountyScopeEvent(ctx context.Context, targetID, progra
 	if watchOnly == 1 {
 		_, _ = s.db.Exec(`UPDATE targets SET watch_next_run=CURRENT_TIMESTAMP
 			WHERE id=? AND watch_only=1 AND COALESCE(watch_paused,0)=0`, targetID)
+		s.NudgeWatch()
 		s.logger.Info("Bounty scope change brought the next watch round forward", "target", targetID, "asset", identifier)
 		return
 	}

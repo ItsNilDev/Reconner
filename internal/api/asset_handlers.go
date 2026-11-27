@@ -304,6 +304,9 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
+	if watchOnly == 1 && kind == "web" {
+		h.sched.NudgeWatch()
+	}
 	h.writeSuccess(w, models.Asset{ID: aid, TargetID: id, Name: strings.TrimSpace(req.Name), Value: value, Kind: kind, AssetType: assetType, Source: "manual", ApprovalStatus: "approved", MonitorEnabled: watchOnly == 0})
 }
 

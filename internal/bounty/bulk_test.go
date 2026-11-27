@@ -63,12 +63,12 @@ func TestBulkCreateBreadthProjects(t *testing.T) {
 	}
 
 	for _, res := range results {
-		var watchOnly, monitor, scheduled int
-		if err := db.QueryRow(`SELECT watch_only,monitor_enabled,CASE WHEN watch_next_run IS NULL THEN 0 ELSE 1 END FROM targets WHERE id=?`, res.TargetID).Scan(&watchOnly, &monitor, &scheduled); err != nil {
+		var watchOnly, monitor, scheduled, dueNow, staggerPending int
+		if err := db.QueryRow(`SELECT watch_only,monitor_enabled,CASE WHEN watch_next_run IS NULL THEN 0 ELSE 1 END,CASE WHEN watch_next_run IS NOT NULL AND watch_next_run <= datetime('now') THEN 1 ELSE 0 END,watch_stagger_pending FROM targets WHERE id=?`, res.TargetID).Scan(&watchOnly, &monitor, &scheduled, &dueNow, &staggerPending); err != nil {
 			t.Fatal(err)
 		}
-		if watchOnly != 1 || monitor != 0 || scheduled != 1 {
-			t.Fatalf("target %s: watch_only=%d monitor=%d scheduled=%d, want 1/0/1", res.TargetID, watchOnly, monitor, scheduled)
+		if watchOnly != 1 || monitor != 0 || scheduled != 1 || dueNow != 1 || staggerPending != 1 {
+			t.Fatalf("target %s: watch_only=%d monitor=%d scheduled=%d due_now=%d stagger_pending=%d, want 1/0/1/1/1", res.TargetID, watchOnly, monitor, scheduled, dueNow, staggerPending)
 		}
 		var assets, enabled int
 		if err := db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(monitor_enabled),0) FROM assets WHERE target_id=? AND approval_status='approved'`, res.TargetID).Scan(&assets, &enabled); err != nil {
@@ -96,6 +96,49 @@ func TestBulkCreateBreadthProjects(t *testing.T) {
 	}
 	if targets != 2 {
 		t.Fatalf("repeat import created %d targets, want 2", targets)
+	}
+}
+
+func TestBulkCreateBreadthProjectsAreImmediatelyDueWithStaggerPending(t *testing.T) {
+	svc, db := testCatalog(t)
+	ctx := context.Background()
+
+	programIDs := make([]string, 0, 5)
+	for i := range 5 {
+		idSuffix := string(rune('1' + i))
+		p := Program{
+			Provider: "hackerone", ExternalID: "imm-" + idSuffix, Handle: "imm-" + idSuffix, Name: "Immediate " + idSuffix,
+			Status: "live", ProgramType: "bug_bounty",
+			Assets: []Asset{
+				{ExternalID: "w" + idSuffix, Identifier: "app" + idSuffix + ".immediate.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+			},
+		}
+		storeTestProgram(t, svc, &p)
+		programIDs = append(programIDs, p.ID)
+	}
+
+	results, err := svc.CreateProjectsBulk(ctx, 13, BulkCreateProjectsRequest{
+		ProgramIDs:  programIDs,
+		Coverage:    "breadth",
+		AssetPolicy: "all_eligible_web",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 5 {
+		t.Fatalf("got %d results, want 5", len(results))
+	}
+	for i, res := range results {
+		if !res.OK || res.TargetID == "" {
+			t.Fatalf("result %d failed: %+v", i, res)
+		}
+		var dueNow, staggerPending int
+		if err := db.QueryRow(`SELECT CASE WHEN watch_next_run IS NOT NULL AND watch_next_run <= datetime('now') THEN 1 ELSE 0 END, watch_stagger_pending FROM targets WHERE id=?`, res.TargetID).Scan(&dueNow, &staggerPending); err != nil {
+			t.Fatal(err)
+		}
+		if dueNow != 1 || staggerPending != 1 {
+			t.Fatalf("target %s (program %d): due_now=%d stagger_pending=%d, want 1/1", res.TargetID, i, dueNow, staggerPending)
+		}
 	}
 }
 
@@ -132,14 +175,14 @@ func TestBulkCreateDeepProjects(t *testing.T) {
 	if res.Assets != 2 || res.SkippedNetwork != 0 {
 		t.Fatalf("assets=%d skipped_network=%d, want 2/0", res.Assets, res.SkippedNetwork)
 	}
-	var watchOnly, monitor, hours int
+	var watchOnly, monitor, hours, scheduled, staggerPending int
 	var name, priority, kind string
-	if err := db.QueryRow(`SELECT watch_only,monitor_enabled,monitor_interval_hours,name,priority,kind FROM targets WHERE id=?`, res.TargetID).
-		Scan(&watchOnly, &monitor, &hours, &name, &priority, &kind); err != nil {
+	if err := db.QueryRow(`SELECT watch_only,monitor_enabled,monitor_interval_hours,name,priority,kind,CASE WHEN watch_next_run IS NULL THEN 0 ELSE 1 END,watch_stagger_pending FROM targets WHERE id=?`, res.TargetID).
+		Scan(&watchOnly, &monitor, &hours, &name, &priority, &kind, &scheduled, &staggerPending); err != nil {
 		t.Fatal(err)
 	}
-	if watchOnly != 0 || monitor != 1 || hours != 6 || name != "intigriti/deep-one" || priority != "critical" || kind != "mixed" {
-		t.Fatalf("target = watch=%d monitor=%d hours=%d name=%q priority=%q kind=%q", watchOnly, monitor, hours, name, priority, kind)
+	if watchOnly != 0 || monitor != 1 || hours != 6 || name != "intigriti/deep-one" || priority != "critical" || kind != "mixed" || scheduled != 0 || staggerPending != 0 {
+		t.Fatalf("target = watch=%d monitor=%d hours=%d name=%q priority=%q kind=%q scheduled=%d stagger_pending=%d", watchOnly, monitor, hours, name, priority, kind, scheduled, staggerPending)
 	}
 	var enabled int
 	if err := db.QueryRow(`SELECT COALESCE(SUM(monitor_enabled),0) FROM assets WHERE target_id=?`, res.TargetID).Scan(&enabled); err != nil {

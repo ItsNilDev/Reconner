@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"context"
 	"reflect"
 	"testing"
@@ -402,4 +403,178 @@ func TestWatchLinkedMixedScopeOnlyEnumeratesWildcardRoots(t *testing.T) {
 	if want := []string{"*.foo.com", "bar.com", "https://baz.com/"}; !reflect.DeepEqual(seeds, want) {
 		t.Fatalf("mixed watch seeds=%v, want %v", seeds, want)
 	}
+}
+
+func TestWatchTerminalRulesStaggerFleet(t *testing.T) {
+	s := newTestScheduler(t)
+	s.cfg.WatchRoundIntervalHours = 12
+	s.cfg.WatchRoundsMinGap = 30
+	s.cfg.WatchFailLimit = 3
+
+	ids := []string{"w-a", "w-b", "w-c", "w-d", "w-e"}
+	for _, id := range ids {
+		if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only,watch_stagger_pending) VALUES (?,?,1,1)`, id, id+".example"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := make(map[time.Duration]bool)
+	for _, id := range ids {
+		s.applyWatchTerminalRules(id, "finished")
+		var staggerPending int
+		var nextRun string
+		if err := s.db.QueryRow(`SELECT COALESCE(watch_stagger_pending,0), COALESCE(watch_next_run,'') FROM targets WHERE id=?`, id).Scan(&staggerPending, &nextRun); err != nil {
+			t.Fatal(err)
+		}
+		if staggerPending != 0 {
+			t.Fatalf("target %s: watch_stagger_pending=%d, want 0 after finished", id, staggerPending)
+		}
+		next, err := time.Parse("2006-01-02 15:04:05", nextRun)
+		if err != nil {
+			t.Fatalf("target %s: bad next_run %q: %v", id, nextRun, err)
+		}
+		until := time.Until(next)
+		if until < 11*time.Hour+50*time.Minute || until > 24*time.Hour+10*time.Minute {
+			t.Fatalf("target %s: round 2 gap=%v, want in [12h, 24h)", id, until)
+		}
+		seen[until.Round(time.Minute)] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected staggered round 2 timestamps across fleet, got %v", seen)
+	}
+
+	// Round 2 -> Round 3 should advance by exact +interval (12h) with no further stagger.
+	s.applyWatchTerminalRules("w-a", "finished")
+	var nextRun string
+	if err := s.db.QueryRow(`SELECT COALESCE(watch_next_run,'') FROM targets WHERE id='w-a'`).Scan(&nextRun); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse("2006-01-02 15:04:05", nextRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if until := time.Until(next); until <= 11*time.Hour+50*time.Minute || until > 12*time.Hour+10*time.Minute {
+		t.Fatalf("round 3 gap=%v, want ~12h", until)
+	}
+}
+
+func TestWatchTerminalRulesFailedRetryPreservesStagger(t *testing.T) {
+	s := newTestScheduler(t)
+	s.cfg.WatchRoundIntervalHours = 12
+	s.cfg.WatchRoundsMinGap = 30
+	s.cfg.WatchFailLimit = 3
+
+	for _, id := range []string{"w1", "w2"} {
+		if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only,watch_stagger_pending) VALUES (?,?,1,1)`, id, id+".example"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.applyWatchTerminalRules("w1", "failed")
+	var staggerPending int
+	if err := s.db.QueryRow(`SELECT COALESCE(watch_stagger_pending,0) FROM targets WHERE id='w1'`).Scan(&staggerPending); err != nil {
+		t.Fatal(err)
+	}
+	if staggerPending != 1 {
+		t.Fatalf("failed round should preserve watch_stagger_pending=1, got %d", staggerPending)
+	}
+
+	s.applyWatchTerminalRules("w1", "finished")
+	if err := s.db.QueryRow(`SELECT COALESCE(watch_stagger_pending,0) FROM targets WHERE id='w1'`).Scan(&staggerPending); err != nil {
+		t.Fatal(err)
+	}
+	if staggerPending != 0 {
+		t.Fatalf("first finished round should clear watch_stagger_pending=0, got %d", staggerPending)
+	}
+}
+
+func TestRunDueWatchRoundsSubtractsPendingAndPreservesOrder(t *testing.T) {
+	s := newTestScheduler(t)
+	s.cfg.Limits.MaxConcurrentScans = 10
+	s.cfg.Limits.MaxConcurrentWatchScans = 2 // watchCap*2 = 4
+
+	// Insert 6 due targets with identical watch_next_run and created_at to test rowid ASC order.
+	for i := 1; i <= 6; i++ {
+		id := fmt.Sprintf("t-%d", i)
+		if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only,watch_paused,kind,watch_next_run,created_at) VALUES (?,?,1,0,'web','2020-01-01 00:00:00','2020-01-01 00:00:00')`, id, id+".example"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Pre-insert 3 pending watch_scan tasks (for t-1, t-2, t-3) so limit = 4 - 3 = 1.
+	for i := 1; i <= 3; i++ {
+		tid := fmt.Sprintf("t-%d", i)
+		if _, err := s.db.Exec(`INSERT INTO tasks (id,target_id,type,status,modules) VALUES (?,?,?,'pending','[]')`, "task-"+tid, tid, watchScanType); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.runDueWatchRounds()
+
+	var pendingCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE type=? AND status='pending'`, watchScanType).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 4 {
+		t.Fatalf("pending watch tasks=%d, want 4 (watchCap*2)", pendingCount)
+	}
+	// The 4th task must be for t-4 (rowid ASC order).
+	var fourthTarget string
+	if err := s.db.QueryRow(`SELECT target_id FROM tasks WHERE type=? AND status='pending' ORDER BY rowid DESC LIMIT 1`, watchScanType).Scan(&fourthTarget); err != nil {
+		t.Fatal(err)
+	}
+	if fourthTarget != "t-4" {
+		t.Fatalf("4th created task target=%q, want t-4", fourthTarget)
+	}
+
+	// Calling again when pendingWatch == 4 should create 0 more tasks.
+	s.runDueWatchRounds()
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE type=? AND status='pending'`, watchScanType).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 4 {
+		t.Fatalf("pending watch tasks after full-cap call=%d, want 4", pendingCount)
+	}
+}
+
+func TestNudgeWatchNilSafeNonBlockingAndWakesScheduler(t *testing.T) {
+	var nilSched *Scheduler
+	nilSched.NudgeWatch()
+
+	s := newTestScheduler(t)
+	s.cfg.Limits.MaxConcurrentScans = 4
+	s.cfg.Limits.MaxConcurrentWatchScans = 2
+	// Repeated calls before Start() must not block.
+	for range 10 {
+		s.NudgeWatch()
+	}
+
+	// Drain the buffered signal, start watchScheduler (initial pass sees no targets),
+	// then insert a due target and verify NudgeWatch wakes watchScheduler immediately.
+	select {
+	case <-s.watchNudge:
+	default:
+	}
+	s.wg.Add(1)
+	go s.watchScheduler()
+	t.Cleanup(func() {
+		s.stopOnce.Do(func() { close(s.stopCh) })
+		s.wg.Wait()
+	})
+	time.Sleep(30 * time.Millisecond)
+
+	if _, err := s.db.Exec(`INSERT INTO targets (id,domain,watch_only,watch_paused,kind,watch_next_run) VALUES ('w-wake','wake.example',1,0,'web','2020-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+
+	s.NudgeWatch()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var cnt int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE target_id='w-wake' AND type=?`, watchScanType).Scan(&cnt)
+		if cnt > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("NudgeWatch did not wake watchScheduler to enqueue due target within 2s")
 }

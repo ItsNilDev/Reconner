@@ -105,6 +105,9 @@ func (h *Handler) handleCreateProjectFromProgram(w http.ResponseWriter, r *http.
 		return
 	}
 	h.hub.BroadcastToTarget(id, "target_created", map[string]string{"id": id, "target_id": id})
+	if req.WatchOnly {
+		h.sched.NudgeWatch()
+	}
 	h.writeJSON(w, http.StatusCreated, map[string]any{"success": true, "data": map[string]string{"id": id, "url": "/targets/" + id}})
 }
 
@@ -113,9 +116,6 @@ func (h *Handler) handleBulkCreateProjectsFromPrograms(w http.ResponseWriter, r 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
-	}
-	if h.cfg != nil {
-		req.WatchIntervalMinutes = h.cfg.WatchRoundIntervalMinutes()
 	}
 	results, err := h.bounty.CreateProjectsBulk(r.Context(), h.currentUserID(r), req)
 	if err != nil {
@@ -128,6 +128,9 @@ func (h *Handler) handleBulkCreateProjectsFromPrograms(w http.ResponseWriter, r 
 			created++
 			h.hub.BroadcastToTarget(res.TargetID, "target_created", map[string]string{"id": res.TargetID, "target_id": res.TargetID})
 		}
+	}
+	if created > 0 && (req.Coverage == "" || strings.EqualFold(strings.TrimSpace(req.Coverage), "breadth")) {
+		h.sched.NudgeWatch()
 	}
 	h.writeJSON(w, http.StatusCreated, map[string]any{
 		"success": true,
@@ -195,5 +198,8 @@ func (h *Handler) handleResolveBountyEvent(w http.ResponseWriter, r *http.Reques
 	}
 	tid := mux.Vars(r)["id"]
 	h.hub.Broadcast("target_updated", map[string]string{"id": tid, "target_id": tid})
+	if strings.EqualFold(strings.TrimSpace(req.Decision), "approve") {
+		h.sched.NudgeWatch()
+	}
 	h.writeSuccess(w, map[string]string{"status": req.Decision})
 }

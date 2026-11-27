@@ -321,6 +321,7 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 	}
 
 	var saveErr error
+	var prevG, prevW, cfgG, cfgW int
 	func() {
 		h.cfg.Lock()
 		defer h.cfg.Unlock()
@@ -335,7 +336,8 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		prevExclude := h.cfg.NucleiExcludeTemplateIDs
 		prevRepos := h.cfg.NucleiExtraTemplateRepos
 		prevMonitor := h.cfg.MonitorModules
-		prevG, prevD, prevW := h.cfg.ConcurrencyLimits()
+		var prevD int
+		prevG, prevD, prevW = h.cfg.ConcurrencyLimits()
 		prevWatchHTTPThreads := h.cfg.Limits.WatchHTTPThreads
 		prevWatchHTTPRateLimit := h.cfg.Limits.WatchHTTPRateLimit
 		prevWatchRoundsMinGap := h.cfg.WatchRoundsMinGap
@@ -352,7 +354,8 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 		// the total to NumCPU here: that silently discarded the saved value on small
 		// boxes. Admission honors these numbers inside a visible hardware envelope
 		// and brakes them under live pressure (see scheduler.admissionCaps).
-		cfgG, cfgD, cfgW := prevG, prevD, prevW
+		cfgD := prevD
+		cfgG, cfgW = prevG, prevW
 		if body.MaxConcurrentScans != nil {
 			cfgG = clamp(*body.MaxConcurrentScans, 1, 32)
 		}
@@ -458,6 +461,9 @@ func (h *Handler) handleUpdateScanConfig(w http.ResponseWriter, r *http.Request)
 	if saveErr != nil {
 		h.writeError(w, http.StatusInternalServerError, "could not persist to config.json: "+saveErr.Error())
 		return
+	}
+	if cfgG > prevG || cfgW > prevW {
+		h.sched.NudgeWatch()
 	}
 	h.handleGetScanConfig(w, r)
 }

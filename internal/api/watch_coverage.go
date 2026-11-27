@@ -124,6 +124,7 @@ func applyWatchCoverage(ctx context.Context, tx *sql.Tx, targetID string, toWatc
 				watch_fail_count = 0,
 				watch_root_index = 0,
 				watch_paused = 0,
+				watch_stagger_pending = 1,
 				monitor_enabled = 1,
 				monitor_last_run = NULL,
 				updated_at = CURRENT_TIMESTAMP
@@ -146,6 +147,7 @@ func applyWatchCoverage(ctx context.Context, tx *sql.Tx, targetID string, toWatc
 			watch_only = 0,
 			watch_next_run = NULL,
 			watch_paused = 0,
+			watch_stagger_pending = 0,
 			monitor_enabled = 0,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`, targetID); err != nil {
@@ -181,6 +183,7 @@ func (h *Handler) handleBulkCoverage(w http.ResponseWriter, r *http.Request) {
 		Assets []string `json:"assets,omitempty"`
 	}
 	results := make([]bulkResult, 0, len(req.IDs))
+	anySucceeded := false
 
 	for _, id := range req.IDs {
 		id = strings.TrimSpace(id)
@@ -221,9 +224,13 @@ func (h *Handler) handleBulkCoverage(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		results = append(results, bulkResult{ID: id, OK: true})
+		anySucceeded = true
 	}
 
 	h.hub.Broadcast("target_updated", map[string]string{"id": "bulk"})
+	if req.WatchOnly && anySucceeded {
+		h.sched.NudgeWatch()
+	}
 	h.writeSuccess(w, map[string]any{"results": results})
 }
 

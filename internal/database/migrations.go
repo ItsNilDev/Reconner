@@ -218,6 +218,7 @@ func RunMigrations(db *DB) error {
 		alterTelegramOutboxAddTargetID,
 		alterTelegramOutboxAddItemJSON,
 		createTelegramOutboxBatchIndex,
+		alterTargetsAddWatchStaggerPending,
 	}
 
 	for i, m := range migrations {
@@ -2101,6 +2102,7 @@ const alterTargetsAddWatchNextRun = `ALTER TABLE targets ADD COLUMN watch_next_r
 const alterTargetsAddWatchFailCount = `ALTER TABLE targets ADD COLUMN watch_fail_count INTEGER NOT NULL DEFAULT 0;`
 const alterTargetsAddWatchRootIndex = `ALTER TABLE targets ADD COLUMN watch_root_index INTEGER NOT NULL DEFAULT 0;`
 const alterTargetsAddWatchPaused = `ALTER TABLE targets ADD COLUMN watch_paused INTEGER NOT NULL DEFAULT 0;`
+const alterTargetsAddWatchStaggerPending = `ALTER TABLE targets ADD COLUMN watch_stagger_pending INTEGER NOT NULL DEFAULT 0;`
 
 // Watch host lifecycle. A host is announced at most once, when it is first
 // seen with a live HTTP response. The marker lives in watch_hosts so it

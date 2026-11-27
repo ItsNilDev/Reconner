@@ -757,6 +757,9 @@ func (h *Handler) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to update target")
 		return
 	}
+	if (req.WatchOnly != nil && *req.WatchOnly) || (req.WatchPaused != nil && !*req.WatchPaused) {
+		h.sched.NudgeWatch()
+	}
 
 	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
 	h.writeSuccess(w, map[string]string{"message": "updated"})

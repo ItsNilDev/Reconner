@@ -102,8 +102,8 @@ func coverageRequest(h *Handler, targetID string, adminID int64, body map[string
 func TestCoverageFlipDisablesMonitor(t *testing.T) {
 	h, adminID := newIsoHandler(t)
 	h.hub = websocket.NewHub()
-	_, _ = h.db.Exec(`INSERT INTO targets(id,domain,watch_only,monitor_enabled,watch_next_run)
-		VALUES ('cf-t','example.test',1,1,'2026-01-01 00:00:00')`)
+	_, _ = h.db.Exec(`INSERT INTO targets(id,domain,watch_only,monitor_enabled,watch_stagger_pending,watch_next_run)
+		VALUES ('cf-t','example.test',1,1,1,'2026-01-01 00:00:00')`)
 	_, _ = h.db.Exec(`INSERT INTO assets(id,target_id,value,asset_type,monitor_enabled)
 		VALUES ('cf-a','cf-t','a.example.test','domain',1)`)
 
@@ -111,15 +111,81 @@ func TestCoverageFlipDisablesMonitor(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var watchOnly, monitor, nextNull, assetMonitor int
-	if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(monitor_enabled,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='cf-t'`).Scan(&watchOnly, &monitor, &nextNull); err != nil {
+	var watchOnly, monitor, staggerPending, nextNull, assetMonitor int
+	if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(monitor_enabled,-1), COALESCE(watch_stagger_pending,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='cf-t'`).Scan(&watchOnly, &monitor, &staggerPending, &nextNull); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.db.QueryRow(`SELECT COALESCE(monitor_enabled,-1) FROM assets WHERE id='cf-a'`).Scan(&assetMonitor); err != nil {
 		t.Fatal(err)
 	}
-	if watchOnly != 0 || monitor != 0 || nextNull != 1 || assetMonitor != 0 {
-		t.Fatalf("flip state watch=%d monitor=%d nextNull=%d assetMonitor=%d", watchOnly, monitor, nextNull, assetMonitor)
+	if watchOnly != 0 || monitor != 0 || staggerPending != 0 || nextNull != 1 || assetMonitor != 0 {
+		t.Fatalf("flip state watch=%d monitor=%d staggerPending=%d nextNull=%d assetMonitor=%d", watchOnly, monitor, staggerPending, nextNull, assetMonitor)
+	}
+}
+
+func TestCoverageFlipToBreadthSetsStaggerPending(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	if _, err := h.db.Exec(`INSERT INTO targets(id,domain,kind,watch_only,monitor_enabled,watch_stagger_pending)
+		VALUES ('cb-t','example.test','web',0,1,0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := coverageRequest(h, "cb-t", adminID, map[string]any{"watch_only": true, "kind": "web"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var watchOnly, staggerPending, nextNull int
+	if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(watch_stagger_pending,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='cb-t'`).
+		Scan(&watchOnly, &staggerPending, &nextNull); err != nil {
+		t.Fatal(err)
+	}
+	if watchOnly != 1 || staggerPending != 1 || nextNull != 0 {
+		t.Fatalf("flip-to-breadth state watch=%d staggerPending=%d nextNull=%d, want 1/1/0", watchOnly, staggerPending, nextNull)
+	}
+}
+
+func TestBulkCoverageSetsAndClearsStaggerPending(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	h.hub = websocket.NewHub()
+	if _, err := h.db.Exec(`INSERT INTO targets(id,domain,kind,watch_only,watch_stagger_pending)
+		VALUES ('bc-1','one.test','web',0,0), ('bc-2','two.test','web',0,0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	doBulk := func(watchOnly bool) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(map[string]any{"ids": []string{"bc-1", "bc-2"}, "watch_only": watchOnly})
+		req := httptest.NewRequest(http.MethodPost, "/api/targets/bulk/coverage", bytes.NewReader(raw))
+		req = req.WithContext(context.WithValue(req.Context(), ctxUserIDKey, adminID))
+		rec := httptest.NewRecorder()
+		h.handleBulkCoverage(rec, req)
+		return rec
+	}
+
+	if rec := doBulk(true); rec.Code != http.StatusOK {
+		t.Fatalf("bulk to breadth status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, id := range []string{"bc-1", "bc-2"} {
+		var watchOnly, staggerPending int
+		if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(watch_stagger_pending,-1) FROM targets WHERE id=?`, id).Scan(&watchOnly, &staggerPending); err != nil {
+			t.Fatal(err)
+		}
+		if watchOnly != 1 || staggerPending != 1 {
+			t.Fatalf("%s after bulk to breadth: watch=%d staggerPending=%d, want 1/1", id, watchOnly, staggerPending)
+		}
+	}
+
+	if rec := doBulk(false); rec.Code != http.StatusOK {
+		t.Fatalf("bulk to deep status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, id := range []string{"bc-1", "bc-2"} {
+		var watchOnly, staggerPending int
+		if err := h.db.QueryRow(`SELECT COALESCE(watch_only,-1), COALESCE(watch_stagger_pending,-1) FROM targets WHERE id=?`, id).Scan(&watchOnly, &staggerPending); err != nil {
+			t.Fatal(err)
+		}
+		if watchOnly != 0 || staggerPending != 0 {
+			t.Fatalf("%s after bulk to deep: watch=%d staggerPending=%d, want 0/0", id, watchOnly, staggerPending)
+		}
 	}
 }
 

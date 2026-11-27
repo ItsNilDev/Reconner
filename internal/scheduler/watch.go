@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
@@ -103,9 +104,11 @@ func (s *Scheduler) runDueWatchRounds() {
 	// Bound pending creation by the EFFECTIVE cap, not the configured value:
 	// on a small box a configured 16 may resolve to a cap of 3, and creating
 	// 32 pending rows would still flood the lane when it reopens.
-	limit := watchCap * 2
-	if limit < 1 {
-		limit = 1
+	var pendingWatch int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE type = ? AND status = 'pending'`, watchScanType).Scan(&pendingWatch)
+	limit := watchCap*2 - pendingWatch
+	if limit <= 0 {
+		return
 	}
 	rows, err := s.db.Query(`
 		SELECT id, domain FROM targets
@@ -118,7 +121,7 @@ func (s *Scheduler) runDueWatchRounds() {
 			SELECT 1 FROM tasks t WHERE t.target_id = targets.id
 			  AND t.status IN ('pending','running','paused','interrupted')
 		  )
-		ORDER BY watch_next_run ASC
+		ORDER BY watch_next_run ASC, created_at ASC, rowid ASC, id ASC
 		LIMIT ?
 	`, limit)
 	if err != nil {
@@ -160,7 +163,7 @@ func (s *Scheduler) drainPendingWatchTasks() {
 	rows, err := s.db.Query(`
 		SELECT t.id FROM tasks t
 		WHERE t.status = 'pending' AND t.type = ?
-		ORDER BY t.created_at ASC
+		ORDER BY t.created_at ASC, t.rowid ASC, t.id ASC
 		LIMIT 10
 	`, watchScanType)
 	if err != nil {
@@ -245,8 +248,21 @@ func (s *Scheduler) checkWatchKindGuard() {
 // watchScheduler runs the watch-round loop. It is a separate goroutine from
 // the deep monitor scheduler: the two tiers have different triggers, different
 // pipelines and different notifications.
+// NudgeWatch wakes watchScheduler immediately so newly created, unpaused, or
+// slot-freed watch rounds start without waiting for the 60s ticker.
+func (s *Scheduler) NudgeWatch() {
+	if s == nil || s.watchNudge == nil {
+		return
+	}
+	select {
+	case s.watchNudge <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Scheduler) watchScheduler() {
 	defer s.wg.Done()
+	s.drainPendingWatchTasks()
 	s.runDueWatchRounds()
 	s.drainPendingWatchTasks()
 	s.flushScopeLandings()
@@ -256,7 +272,22 @@ func (s *Scheduler) watchScheduler() {
 		select {
 		case <-s.stopCh:
 			return
+		case <-s.watchNudge:
+			select {
+			case <-s.stopCh:
+				return
+			default:
+			}
+			s.drainPendingWatchTasks()
+			s.runDueWatchRounds()
+			s.drainPendingWatchTasks()
 		case <-ticker.C:
+			select {
+			case <-s.stopCh:
+				return
+			default:
+			}
+			s.drainPendingWatchTasks()
 			s.runDueWatchRounds()
 			s.drainPendingWatchTasks()
 			// The grouped scope-landed message is flushed once per tick window,
@@ -284,9 +315,19 @@ func (s *Scheduler) applyWatchTerminalRules(targetID, status string) {
 	interval := s.watchRoundIntervalMinutes()
 	switch status {
 	case "finished":
+		var staggerPending, activeWatchCount int
+		_ = s.db.QueryRow(`SELECT COALESCE(watch_stagger_pending,0) FROM targets WHERE id=?`, targetID).Scan(&staggerPending)
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM targets WHERE COALESCE(watch_only,0)=1 AND COALESCE(watch_paused,0)=0`).Scan(&activeWatchCount)
+		nextMinutes := interval
+		if staggerPending == 1 && activeWatchCount > 1 && interval > 1 {
+			h := fnv.New32a()
+			_, _ = h.Write([]byte(targetID))
+			offset := int(uint64(h.Sum32()) % uint64(interval))
+			nextMinutes = interval + offset
+		}
 		_, _ = s.db.Exec(`UPDATE targets SET watch_last_run=CURRENT_TIMESTAMP,
-			watch_next_run=datetime('now','+' || ? || ' minutes'), watch_fail_count=0
-			WHERE id=? AND watch_only=1`, interval, targetID)
+			watch_next_run=datetime('now','+' || ? || ' minutes'), watch_fail_count=0, watch_stagger_pending=0
+			WHERE id=? AND watch_only=1`, nextMinutes, targetID)
 	case "failed":
 		_, _ = s.db.Exec(`UPDATE targets SET watch_last_run=CURRENT_TIMESTAMP,
 			watch_fail_count=COALESCE(watch_fail_count,0)+1
