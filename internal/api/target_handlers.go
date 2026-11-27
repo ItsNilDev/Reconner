@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -188,6 +189,86 @@ func loadAllTargetExclusions(ctx context.Context, db *database.DB, targetIDs []s
 	return manualMap, managedMap, nil
 }
 
+func validateProgramLogoURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	return trimmed
+}
+
+func loadTargetProgramLogo(ctx context.Context, db *database.DB, targetID string) (string, error) {
+	logos, err := loadAllTargetProgramLogos(ctx, db, []string{targetID})
+	if err != nil {
+		return "", err
+	}
+	return logos[targetID], nil
+}
+
+func loadAllTargetProgramLogos(ctx context.Context, db *database.DB, targetIDs []string) (map[string]string, error) {
+	logos := make(map[string]string, len(targetIDs))
+	if len(targetIDs) == 0 {
+		return logos, nil
+	}
+	const chunkSize = 500
+	for start := 0; start < len(targetIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(targetIDs) {
+			end = len(targetIDs)
+		}
+		chunk := targetIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := db.QueryContext(ctx,
+			`SELECT pp.target_id, COALESCE(TRIM(bp.logo_url), '')
+			 FROM project_programs pp
+			 JOIN bounty_programs bp ON bp.id = pp.program_id
+			 WHERE pp.target_id IN (`+placeholders+`)
+			 ORDER BY pp.target_id,
+			          CASE WHEN LOWER(TRIM(COALESCE(bp.logo_url, ''))) LIKE 'https://%'
+			                 OR LOWER(TRIM(COALESCE(bp.logo_url, ''))) LIKE 'http://%'
+			               THEN 0 ELSE 1 END,
+			          pp.created_at ASC,
+			          pp.program_id ASC`,
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var targetID, rawLogo string
+			if err := rows.Scan(&targetID, &rawLogo); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if _, already := logos[targetID]; already {
+				continue
+			}
+			if valid := validateProgramLogoURL(rawLogo); valid != "" {
+				logos[targetID] = valid
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return logos, nil
+}
+
 func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	search := q.Get("search")
@@ -299,9 +380,15 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to load target exclusions")
 		return
 	}
+	logoMap, err := loadAllTargetProgramLogos(r.Context(), h.db, targetIDs)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load target program logos")
+		return
+	}
 	for i := range targets {
 		targets[i].ExcludeScope = manualMap[targets[i].ID]
 		targets[i].ManagedExclusions = managedMap[targets[i].ID]
+		targets[i].ProgramLogoURL = logoMap[targets[i].ID]
 	}
 
 	h.writeSuccess(w, targets)
@@ -506,6 +593,12 @@ func (h *Handler) handleGetTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	t.ExcludeScope = manualExcl
 	t.ManagedExclusions = managedExcl
+	logoURL, err := loadTargetProgramLogo(r.Context(), h.db, id)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load target program logo")
+		return
+	}
+	t.ProgramLogoURL = logoURL
 
 	t.WatchOnly = watchOnly == 1
 	t.WatchPaused = watchPaused == 1
@@ -1894,6 +1987,9 @@ func (h *Handler) handleImportTargets(w http.ResponseWriter, r *http.Request) {
 			tx.Rollback()
 			invalid++
 			continue
+		}
+		if h.hub != nil {
+			h.hub.BroadcastToTarget(id, "target_created", map[string]string{"id": id, "target_id": id})
 		}
 		created++
 	}

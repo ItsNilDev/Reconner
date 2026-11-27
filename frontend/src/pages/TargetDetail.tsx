@@ -4,6 +4,7 @@ import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, boun
 import type { WatchScopeEvent } from '../lib/api'
 import { useUIStore } from '../store/ui'
 import { Badge, Button, Spinner, Empty, CopyButton, ErrorBoundary, SkeletonRows, Modal } from '../components/ui'
+import { ProgramLogo } from '../components/ui/ProgramLogo'
 import { ScanModal } from '../components/targets/ScanModal'
 import { EvidenceViewer } from '../components/targets/EvidenceViewer'
 import { LiveResults } from '../components/targets/LiveResults'
@@ -102,6 +103,43 @@ const WP_NONVULN_TYPES = new Set([...WP_INVENTORY_TYPES, WP_USER_TYPE, ...WP_END
 // Rows rendered per page-window before the operator asks for more (item 3:
 // keeps deep-range result sets from mounting tens of thousands of DOM nodes).
 const PAGE = 200
+const SERVER_PAGE_SIZE = 200
+const LOAD_ALL_CHUNK = 500
+const LOAD_ALL_CONFIRM_THRESHOLD = 5000
+const WS_REFRESH_WINDOW_CAP = 2500
+
+const isServerPagedTab = (t: string) => t === 'subdomains' || t === 'http' || t === 'params'
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException
+    ? err.name === 'AbortError'
+    : typeof err === 'object' && err !== null && (err as { name?: string }).name === 'AbortError'
+}
+
+function rowId(item: unknown): string | undefined {
+  if (item && typeof item === 'object' && 'id' in item && typeof item.id === 'string' && item.id) {
+    return item.id
+  }
+  return undefined
+}
+
+function mergeUniqueById(prev: unknown[], incoming: unknown[]): unknown[] {
+  if (prev.length === 0) return incoming
+  const seen = new Set<string>()
+  for (const item of prev) {
+    const itemId = rowId(item)
+    if (itemId) seen.add(itemId)
+  }
+  if (seen.size === 0) return [...prev, ...incoming]
+  const appended = incoming.filter(item => {
+    const itemId = rowId(item)
+    if (!itemId) return true
+    if (seen.has(itemId)) return false
+    seen.add(itemId)
+    return true
+  })
+  return [...prev, ...appended]
+}
 
 const severityColor: Record<string, string> = {
   critical: 'text-severity-critical',
@@ -495,8 +533,15 @@ export default function TargetDetail() {
   // Client-side Hosts/URLs filters: text search, alive hosts only, and rows
   // first seen in the last 24h.
   const [hostSearch, setHostSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [aliveOnly, setAliveOnly] = useState(false)
   const [newOnly, setNewOnly] = useState(false)
+  const [reflectedOnly, setReflectedOnly] = useState(false)
+  const [serverTotal, setServerTotal] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [loadingAll, setLoadingAll] = useState(false)
+  const [confirmLoadAll, setConfirmLoadAll] = useState(false)
+  const [staleAvailable, setStaleAvailable] = useState(false)
   const [scanOpen, setScanOpen] = useState(false)
   const [assets, setAssets] = useState<Asset[]>([])
   const [scanAsset, setScanAsset] = useState<Asset | null>(null)
@@ -521,6 +566,10 @@ export default function TargetDetail() {
   const [resuming, setResuming] = useState(false)
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const findingRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const loadAbortRef = useRef<AbortController | null>(null)
+  const loadAllAbortRef = useRef<AbortController | null>(null)
+  const wsRefreshAbortRef = useRef<AbortController | null>(null)
   // A stale tab request must never replace the rows of the tab the operator
   // switched to. Each load captures its sequence and target (B14).
   const requestSeqRef = useRef(0)
@@ -528,11 +577,62 @@ export default function TargetDetail() {
   const activeTabRef = useRef(tab)
   const activeIdRef = useRef(id)
   const searchParamsRef = useRef(searchParams)
+  const targetRef = useRef(target)
+  const loadedCountRef = useRef(0)
+  const loadingAllRef = useRef(false)
+  const queryStateRef = useRef({
+    tab,
+    search: debouncedSearch,
+    aliveOnly,
+    statusClass,
+    newOnly,
+    reflectedOnly,
+    sort,
+    fpView,
+  })
   activeTabRef.current = tab
   activeIdRef.current = id
   searchParamsRef.current = searchParams
+  targetRef.current = target
+  loadedCountRef.current = data.length
+  loadingAllRef.current = loadingAll
+  queryStateRef.current = {
+    tab,
+    search: debouncedSearch,
+    aliveOnly,
+    statusClass,
+    newOnly,
+    reflectedOnly,
+    sort,
+    fpView,
+  }
   const [dataError, setDataError] = useState('')
 
+  const resetTabFilters = useCallback(() => {
+    if (searchDebounceRef.current) {
+      clearTimeout(searchDebounceRef.current)
+      searchDebounceRef.current = null
+    }
+    loadAbortRef.current?.abort()
+    loadAbortRef.current = null
+    loadAllAbortRef.current?.abort()
+    loadAllAbortRef.current = null
+    wsRefreshAbortRef.current?.abort()
+    wsRefreshAbortRef.current = null
+    setHostSearch('')
+    setDebouncedSearch('')
+    setStatusClass('all')
+    setAliveOnly(false)
+    setNewOnly(false)
+    setReflectedOnly(false)
+    setSort({ key: null, dir: 'desc' })
+    setServerTotal(0)
+    setLoadingMore(false)
+    setLoadingAll(false)
+    loadingAllRef.current = false
+    setConfirmLoadAll(false)
+    setStaleAvailable(false)
+  }, [])
   useEffect(() => {
     const t = searchParams.get('tab')
     if (t && t.length < 60) setTab(t)
@@ -552,11 +652,7 @@ export default function TargetDetail() {
     const reqTab = searchParamsRef.current.get('tab')
     setTab(reqTab && reqTab.length < 60 ? reqTab : 'subdomains')
     setFpView(false)
-    setHostSearch('')
-    setStatusClass('all')
-    setAliveOnly(false)
-    setNewOnly(false)
-    setSort({ key: null, dir: 'desc' })
+    resetTabFilters()
     setLoading(true)
     setTarget(null)
     setAssets([])
@@ -593,7 +689,7 @@ export default function TargetDetail() {
       for (const prog of r.programs || []) names[prog.id] = prog.name
       setProgramNames(names)
     }).catch(() => {})
-  }, [id, loadScopeEvents])
+  }, [id, loadScopeEvents, resetTabFilters])
 
   const loadAssets = () => {
     if (!id) return
@@ -698,11 +794,11 @@ export default function TargetDetail() {
         network_initial_access: 'vulns',
       }
       const targetTab = moduleToTab[p.current_module]
-      if (targetTab && targetTab === tab) {
+      if (targetTab && targetTab === activeTabRef.current) {
         // Only refresh current tab if it matches the module that just ran
-        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+        clearTimeout(refreshTimerRef.current ?? undefined)
         refreshTimerRef.current = setTimeout(() => {
-          loadTab(tab)
+          refreshFromWS('progress')
           targetsApi.get(id!).then(t => { setTarget(t); setIsScanning(t.scan_status === 'running') }).catch(() => {})
         }, 3000)
       }
@@ -749,7 +845,7 @@ export default function TargetDetail() {
         const ev = p as { target_id: string }
         if (ev.target_id !== id) return
         setIsScanning(false)
-        loadTab(tab)
+        refreshFromWS('finished')
         // A breadth round can land or revoke Watch scope. Reload both scope
         // views so the review card and the history agree after the round.
         loadScopeEvents()
@@ -764,8 +860,26 @@ export default function TargetDetail() {
     return () => unsubs.forEach(u => u())
   }, [id, tab, loadScopeEvents])
 
-  useEffect(() => { if (id) loadTab(tab) }, [tab, id, fpView])
+  const hasTabOverride = Boolean(searchParams.get('tab'))
+  const loadedTargetId = target?.id
+  const serverTab = isServerPagedTab(tab)
+  const serverQueryKey = serverTab
+    ? JSON.stringify({
+        s: debouncedSearch.trim(),
+        a: tab === 'subdomains' ? aliveOnly : false,
+        sc: tab === 'http' ? statusClass : 'all',
+        n: tab === 'subdomains' || tab === 'http' ? newOnly : false,
+        r: tab === 'params' ? reflectedOnly : false,
+        sk: sort.key,
+        sd: sort.dir,
+      })
+    : ''
 
+  useEffect(() => {
+    if (!id) return
+    if (!hasTabOverride && loadedTargetId !== id) return
+    loadTab(tab)
+  }, [tab, id, fpView, loadedTargetId, hasTabOverride, serverQueryKey])
   // Client-side sort of the loaded rows by response size or status code. Works
   // on any tab: reads the first present numeric field, so tabs without size/
   // status are simply unaffected. Lets you manage high-volume result sets.
@@ -780,6 +894,7 @@ export default function TargetDetail() {
   const applySort = (key: 'size' | 'status' | 'severity' | 'created') => {
     const dir: 'asc' | 'desc' = sort.key === key && sort.dir === 'desc' ? 'asc' : 'desc'
     setSort({ key, dir })
+    if (isServerPagedTab(tab)) return
     if (key === 'created') {
       setData(prev => [...prev].sort((a, b) => {
         const av = String((a as Record<string, unknown>)?.created_at || '')
@@ -798,30 +913,12 @@ export default function TargetDetail() {
   }
   const isSeverityTab = tab === 'nuclei' || tab === 'vulns' || tab === 'candidates'
 
-  // Filter Hosts/URLs client-side before windowing. The status-class filter is
-  // URLs-only; search, alive-only and New 24h apply to both surface tabs.
-  const filteredData = (() => {
-    let rows = data
-    if (tab === 'http' && statusClass !== 'all') {
-      rows = rows.filter(row => {
-        const code = Number((row as { status_code?: number })?.status_code || 0)
-        return Math.floor(code / 100) === Number(statusClass)
-      })
-    }
-    if (tab === 'subdomains' || tab === 'http') {
-      const q = hostSearch.trim().toLowerCase()
-      if (q) rows = rows.filter(row => {
-        const o = row as Record<string, unknown>
-        return [o.subdomain, o.url, o.ip, o.page_title].some(v => typeof v === 'string' && v.toLowerCase().includes(q))
-      })
-      if (tab === 'subdomains' && aliveOnly) rows = rows.filter(row => !!(row as Subdomain).is_alive)
-      if (newOnly) rows = rows.filter(row => isRecentHost((row as { created_at?: string }).created_at))
-    }
-    return rows
-  })()
-  // Windowed view of the loaded rows — only the first `visibleCount` are mounted.
-  const pageData = filteredData.slice(0, visibleCount)
-  const hasMore = filteredData.length > visibleCount
+  // Server-paged tabs ('subdomains', 'http', 'params') filter/sort on the server
+  // and render all loaded chunks; the remaining 12 tabs stay client-filtered and
+  // client-windowed via visibleCount (PAGE = 200).
+  const filteredData = data
+  const pageData = isServerPagedTab(tab) ? filteredData : filteredData.slice(0, visibleCount)
+  const hasMore = !isServerPagedTab(tab) && filteredData.length > visibleCount
 
   // vulns/candidates: group same-root-cause findings (a host-wide issue like
   // Host Header Injection re-confirmed on every URL) before windowing, so the
@@ -843,6 +940,49 @@ export default function TargetDetail() {
   const footerTotalCount = isVulnTab ? vulnGroups.length : filteredData.length
   const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : hasMore
 
+  const buildServerParams = (
+    t: string,
+    q: typeof queryStateRef.current,
+    paging: { page?: number; offset?: number; limit: number },
+  ): Record<string, string | number | boolean | undefined> => {
+    const params: Record<string, string | number | boolean | undefined> = {
+      limit: paging.limit,
+    }
+    if (paging.page !== undefined) params.page = paging.page
+    if (paging.offset !== undefined) params.offset = paging.offset
+    const search = q.search.trim()
+    if (search) params.search = search
+    if (t === 'subdomains') {
+      if (q.aliveOnly) params.alive = 'true'
+      if (q.newOnly) params.new_only = 1
+      if (q.sort.key === 'created' || q.sort.key === 'status') {
+        params.sort = q.sort.key
+        params.dir = q.sort.dir
+      }
+    } else if (t === 'http') {
+      if (q.statusClass !== 'all') params.status_class = q.statusClass
+      if (q.newOnly) params.new_only = 1
+      if (q.sort.key === 'created' || q.sort.key === 'size' || q.sort.key === 'status') {
+        params.sort = q.sort.key
+        params.dir = q.sort.dir
+      }
+    } else if (t === 'params') {
+      if (q.reflectedOnly) params.reflected = 'true'
+    }
+    return params
+  }
+
+  const fetchServerTabPage = (
+    targetId: string,
+    t: string,
+    params: Record<string, string | number | boolean | undefined>,
+    signal: AbortSignal,
+  ) => {
+    if (t === 'subdomains') return findingsApi.subdomainsPage(targetId, params, signal)
+    if (t === 'http') return findingsApi.httpServicesPage(targetId, params, signal)
+    return findingsApi.parametersPage(targetId, params, signal)
+  }
+
   const loadTab = async (t: string) => {
     if (!id) return
     const seq = ++requestSeqRef.current
@@ -851,34 +991,83 @@ export default function TargetDetail() {
       // The shared ChangeLog owns its own paged fetch and controls. Do not
       // load the old full-history table in the background.
       setData([])
+      setServerTotal(0)
       setDataError('')
       setTabLoading(false)
+      return
+    }
+    if (isServerPagedTab(t)) {
+      loadAbortRef.current?.abort()
+      loadAllAbortRef.current?.abort()
+      loadAllAbortRef.current = null
+      wsRefreshAbortRef.current?.abort()
+      wsRefreshAbortRef.current = null
+      loadingAllRef.current = false
+      setLoadingAll(false)
+      setLoadingMore(false)
+      setConfirmLoadAll(false)
+      setStaleAvailable(false)
+      const controller = new AbortController()
+      loadAbortRef.current = controller
+      const q = queryStateRef.current
+      setTabLoading(true)
+      try {
+        const res = await fetchServerTabPage(
+          requestTarget,
+          t,
+          buildServerParams(t, q, { page: 1, limit: SERVER_PAGE_SIZE }),
+          controller.signal,
+        )
+        if (
+          controller.signal.aborted ||
+          seq !== requestSeqRef.current ||
+          t !== activeTabRef.current ||
+          requestTarget !== activeIdRef.current
+        ) {
+          return
+        }
+        setDataError('')
+        setData(res.data || [])
+        setServerTotal(res.total || 0)
+        setVisibleCount(PAGE)
+      } catch (e) {
+        if (isAbortError(e) || controller.signal.aborted) return
+        if (seq !== requestSeqRef.current || t !== activeTabRef.current || requestTarget !== activeIdRef.current) return
+        setData([])
+        setServerTotal(0)
+        setDataError(e instanceof Error ? e.message : 'Failed to load this tab')
+      } finally {
+        if (loadAbortRef.current === controller) {
+          loadAbortRef.current = null
+        }
+        if (!controller.signal.aborted && seq === requestSeqRef.current && t === activeTabRef.current && requestTarget === activeIdRef.current) {
+          setTabLoading(false)
+        }
+      }
       return
     }
     setTabLoading(true)
     try {
       let r: unknown[] = []
-      if (t === 'subdomains') r = await findingsApi.subdomains(id)
-      else if (t === 'http') r = await findingsApi.httpServices(id)
-      else if (t === 'js') r = await findingsApi.jsFiles(id)
+      const curFpView = queryStateRef.current.fpView
+      if (t === 'js') r = await findingsApi.jsFiles(id)
       else if (t === 'js-findings') r = await findingsApi.jsFindings(id)
-      else if (t === 'params') r = await findingsApi.parameters(id, false)
       else if (t === 'dirs') r = await findingsApi.directoryFindings(id)
       else if (t === 'admin-panels') r = await findingsApi.adminPanels(id)
-			else if (t === 'network-services') r = await targetsApi.networkServices(id)
+      else if (t === 'network-services') r = await targetsApi.networkServices(id)
       else if (t === 'backups') r = await findingsApi.backupFindings(id)
       else if (t === 'redirects') r = await findingsApi.openRedirects(id)
       else if (t === 'nuclei') r = await findingsApi.nucleiFindings(id)
       else if (t === 'vulns' || t === 'candidates') {
         r = t === 'vulns'
-          ? (fpView ? await findingsApi.vulnFindings(id, 'all', 'false_positive') : await findingsApi.vulnFindings(id, 'finding'))
+          ? (curFpView ? await findingsApi.vulnFindings(id, 'all', 'false_positive') : await findingsApi.vulnFindings(id, 'finding'))
           : await findingsApi.vulnFindings(id, 'candidate')
         // On a WordPress project, wp_enum/wp_users/wp_endpoints' confirmed
         // inventory facts (plugin present, username recovered, endpoint
         // reachable) have their own dedicated tabs below — keep them out of
         // the generic Confirmed/Needs Review lists so those stay what their
         // names say: actual vulnerabilities, not install inventory.
-        if ((target?.tags || []).includes(WP_TAG)) {
+        if ((targetRef.current?.tags || []).includes(WP_TAG)) {
           r = (r as VulnFinding[]).filter(f => !WP_NONVULN_TYPES.has(f.type))
         }
       }
@@ -901,6 +1090,211 @@ export default function TargetDetail() {
     }
   }
 
+  const loadMore = async () => {
+    if (!id || !isServerPagedTab(tab) || loadingMore || loadingAllRef.current) return
+    const seq = requestSeqRef.current
+    const requestTarget = id
+    const requestTab = tab
+    const offset = loadedCountRef.current
+    const q = queryStateRef.current
+    loadAbortRef.current?.abort()
+    const controller = new AbortController()
+    loadAbortRef.current = controller
+    setLoadingMore(true)
+    try {
+      const res = await fetchServerTabPage(
+        requestTarget,
+        requestTab,
+        buildServerParams(requestTab, q, { offset, limit: SERVER_PAGE_SIZE }),
+        controller.signal,
+      )
+      if (
+        controller.signal.aborted ||
+        seq !== requestSeqRef.current ||
+        requestTab !== activeTabRef.current ||
+        requestTarget !== activeIdRef.current
+      ) {
+        return
+      }
+      setData(prev => mergeUniqueById(prev, res.data || []))
+      setServerTotal(res.total || 0)
+    } catch (e) {
+      if (isAbortError(e) || controller.signal.aborted) return
+      addToast('error', e instanceof Error ? e.message : 'Failed to load more rows')
+    } finally {
+      if (loadAbortRef.current === controller) {
+        loadAbortRef.current = null
+        setLoadingMore(false)
+      }
+    }
+  }
+
+  const stopLoadAll = () => {
+    loadAllAbortRef.current?.abort()
+    loadAllAbortRef.current = null
+    loadingAllRef.current = false
+    setLoadingAll(false)
+  }
+
+  const startLoadAll = async (bypassConfirm = false) => {
+    if (!id || !isServerPagedTab(tab) || loadingMore || loadingAllRef.current) return
+    if (serverTotal > LOAD_ALL_CONFIRM_THRESHOLD && !bypassConfirm) {
+      setConfirmLoadAll(true)
+      return
+    }
+    setConfirmLoadAll(false)
+    setStaleAvailable(false)
+    wsRefreshAbortRef.current?.abort()
+    wsRefreshAbortRef.current = null
+    loadAbortRef.current?.abort()
+    loadAbortRef.current = null
+
+    const seq = requestSeqRef.current
+    const requestTarget = id
+    const requestTab = tab
+    const q = queryStateRef.current
+    const controller = new AbortController()
+    loadAllAbortRef.current = controller
+    loadingAllRef.current = true
+    setLoadingAll(true)
+
+    let nextOffset = loadedCountRef.current
+    try {
+      while (!controller.signal.aborted) {
+        const res = await fetchServerTabPage(
+          requestTarget,
+          requestTab,
+          buildServerParams(requestTab, q, { offset: nextOffset, limit: LOAD_ALL_CHUNK }),
+          controller.signal,
+        )
+        if (
+          controller.signal.aborted ||
+          seq !== requestSeqRef.current ||
+          requestTab !== activeTabRef.current ||
+          requestTarget !== activeIdRef.current
+        ) {
+          break
+        }
+        const chunk = res.data || []
+        const total = res.total || 0
+        setData(prev => mergeUniqueById(prev, chunk))
+        setServerTotal(total)
+        nextOffset += chunk.length
+        if (chunk.length === 0 || nextOffset >= total || chunk.length < LOAD_ALL_CHUNK) {
+          break
+        }
+      }
+    } catch (e) {
+      if (!isAbortError(e) && !controller.signal.aborted) {
+        addToast('error', e instanceof Error ? e.message : 'Failed while loading all rows')
+      }
+    } finally {
+      if (loadAllAbortRef.current === controller) {
+        loadAllAbortRef.current = null
+        loadingAllRef.current = false
+        setLoadingAll(false)
+      }
+    }
+  }
+
+  const refreshFromWS = async (reason: 'progress' | 'finished') => {
+    const requestTarget = activeIdRef.current
+    const q = queryStateRef.current
+    const requestTab = q.tab
+    if (!requestTarget || requestTab === 'monitor') return
+    if (!isServerPagedTab(requestTab)) {
+      loadTab(requestTab)
+      return
+    }
+    if (loadingAllRef.current) {
+      setStaleAvailable(true)
+      return
+    }
+    const currentCount = loadedCountRef.current
+    if (currentCount > SERVER_PAGE_SIZE) {
+      if (reason === 'progress' || currentCount > WS_REFRESH_WINDOW_CAP) {
+        setStaleAvailable(true)
+        return
+      }
+    }
+    // Separate AbortController for WS background refresh (never aborts Load all).
+    wsRefreshAbortRef.current?.abort()
+    const controller = new AbortController()
+    wsRefreshAbortRef.current = controller
+    const seq = requestSeqRef.current
+    try {
+      if (currentCount <= SERVER_PAGE_SIZE) {
+        const res = await fetchServerTabPage(
+          requestTarget,
+          requestTab,
+          buildServerParams(requestTab, q, { page: 1, limit: SERVER_PAGE_SIZE }),
+          controller.signal,
+        )
+        if (
+          controller.signal.aborted ||
+          seq !== requestSeqRef.current ||
+          requestTab !== activeTabRef.current ||
+          requestTarget !== activeIdRef.current
+        ) {
+          return
+        }
+        setData(res.data || [])
+        setServerTotal(res.total || 0)
+        setStaleAvailable(false)
+      } else {
+        const targetWindow = Math.min(currentCount, WS_REFRESH_WINDOW_CAP)
+        const windowRows: unknown[] = []
+        let latestTotal = 0
+        let nextOffset = 0
+        while (nextOffset < targetWindow && !controller.signal.aborted) {
+          const chunkLimit = Math.min(LOAD_ALL_CHUNK, targetWindow - nextOffset)
+          const res = await fetchServerTabPage(
+            requestTarget,
+            requestTab,
+            buildServerParams(requestTab, q, { offset: nextOffset, limit: chunkLimit }),
+            controller.signal,
+          )
+          if (
+            controller.signal.aborted ||
+            seq !== requestSeqRef.current ||
+            requestTab !== activeTabRef.current ||
+            requestTarget !== activeIdRef.current
+          ) {
+            return
+          }
+          const chunk = res.data || []
+          latestTotal = res.total || 0
+          windowRows.push(...chunk)
+          nextOffset += chunk.length
+          if (chunk.length === 0 || nextOffset >= latestTotal || chunk.length < chunkLimit) {
+            break
+          }
+        }
+        if (!controller.signal.aborted && !loadingAllRef.current) {
+          setData(mergeUniqueById([], windowRows))
+          setServerTotal(latestTotal)
+          setStaleAvailable(false)
+        }
+      }
+    } catch (e) {
+      if (isAbortError(e) || controller.signal.aborted) return
+    } finally {
+      if (wsRefreshAbortRef.current === controller) {
+        wsRefreshAbortRef.current = null
+      }
+    }
+  }
+
+  const handleSearchChange = (value: string) => {
+    setHostSearch(value)
+    setVisibleCount(PAGE)
+    clearTimeout(searchDebounceRef.current ?? undefined)
+    searchDebounceRef.current = setTimeout(() => {
+      searchDebounceRef.current = null
+      setDebouncedSearch(value)
+    }, 250)
+  }
+
   // Clear delayed refresh timers on tab/target change and unmount, so a stale
   // timer cannot fetch an abandoned tab (review finding #4).
   useEffect(() => () => {
@@ -908,6 +1302,12 @@ export default function TargetDetail() {
     if (findingRefreshTimerRef.current) clearTimeout(findingRefreshTimerRef.current)
   }, [tab, id])
 
+  useEffect(() => () => {
+    clearTimeout(searchDebounceRef.current ?? undefined)
+    loadAbortRef.current?.abort()
+    loadAllAbortRef.current?.abort()
+    wsRefreshAbortRef.current?.abort()
+  }, [])
   if (loading) return <div className="flex items-center justify-center h-64"><Spinner /></div>
   if (!target) return null
 
@@ -1053,22 +1453,27 @@ export default function TargetDetail() {
           <div className="relative flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
             <div className="min-w-0 flex-1">
               <button onClick={() => navigate('/targets')} className="mb-2 text-[10px] font-semibold uppercase tracking-[.16em] text-text-muted transition-colors hover:text-accent">← Project fleet</button>
-              <div className="flex min-w-0 flex-wrap items-center gap-2.5">
-                <span className={cn('h-2.5 w-2.5 shrink-0 rounded-full', dot[target.scan_status] || 'bg-text-muted')} />
-                {/* A network target's domain may contain thousands of hosts. Keep the
-                    control deck stable and expose the complete scope in the tooltip. */}
-                <h1 className="min-w-0 max-w-[36ch] truncate text-xl font-semibold tracking-tight md:max-w-[52ch]" title={target.domain}>
-                  {target.name || target.domain}
-                </h1>
-                <span className="badge-neutral uppercase">{target.scan_status}</span>
-                {target.priority !== 'medium' && (
-                  <Badge variant={target.priority === 'critical' ? 'critical' : target.priority === 'high' ? 'high' : 'low'}>
-                    {target.priority}
-                  </Badge>
-                )}
-                {target.monitor_enabled && <span className="badge-low">Automated</span>}
+              <div className="flex items-start gap-3">
+                <ProgramLogo src={target.program_logo_url} name={target.name || target.domain} size="md" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+                    <span className={cn('h-2.5 w-2.5 shrink-0 rounded-full', dot[target.scan_status] || 'bg-text-muted')} />
+                    {/* A network target's domain may contain thousands of hosts. Keep the
+                        control deck stable and expose the complete scope in the tooltip. */}
+                    <h1 className="min-w-0 max-w-[36ch] truncate text-xl font-semibold tracking-tight md:max-w-[52ch]" title={target.domain}>
+                      {target.name || target.domain}
+                    </h1>
+                    <span className="badge-neutral uppercase">{target.scan_status}</span>
+                    {target.priority !== 'medium' && (
+                      <Badge variant={target.priority === 'critical' ? 'critical' : target.priority === 'high' ? 'high' : 'low'}>
+                        {target.priority}
+                      </Badge>
+                    )}
+                    {target.monitor_enabled && <span className="badge-low">Automated</span>}
+                  </div>
+                  {target.name && <p className="mt-1.5 max-w-3xl truncate font-mono text-[11px] text-text-muted" title={target.domain}>{target.domain}</p>}
+                </div>
               </div>
-              {target.name && <p className="mt-1.5 max-w-3xl truncate font-mono text-[11px] text-text-muted" title={target.domain}>{target.domain}</p>}
             </div>
 
             <div className="flex flex-wrap items-center gap-2 xl:justify-end">
@@ -1436,6 +1841,7 @@ export default function TargetDetail() {
                 // skeleton now, so the new tab never renders another tab's row
                 // shape — that crashed the page (undefined change_type) when
                 // switching to Changes.
+                resetTabFilters()
                 setTabLoading(true)
                 setData([])
                 setVisibleCount(PAGE)
@@ -1474,20 +1880,22 @@ export default function TargetDetail() {
             {fpView ? '← Back to findings' : 'False Positives'}
           </button>
         )}
-        <span>Sort by:</span>
+        {tab !== 'params' && <span>Sort by:</span>}
         {isSeverityTab && (
           <button onClick={() => applySort('severity')}
             className={cn('px-2 py-1 rounded border', sort.key === 'severity' ? 'border-accent text-accent' : 'border-border')}>
             Severity {sort.key === 'severity' ? (sort.dir === 'asc' ? '↑ low→high' : '↓ high→low') : ''}
           </button>
         )}
+        {(tab === 'subdomains' || tab === 'http' || tab === 'params') && (
+          <input type="search" value={hostSearch}
+            onChange={e => handleSearchChange(e.target.value)}
+            placeholder={tab === 'subdomains' ? 'Search hosts…' : tab === 'http' ? 'Search URLs…' : 'Search parameters…'}
+            aria-label={tab === 'subdomains' ? 'Search hosts' : tab === 'http' ? 'Search URLs' : 'Search parameters'}
+            className="rounded border border-border bg-surface px-2 py-1 text-[11px] text-text-primary placeholder:text-text-muted w-44" />
+        )}
         {(tab === 'subdomains' || tab === 'http') && (
           <>
-            <input type="search" value={hostSearch}
-              onChange={e => { setHostSearch(e.target.value); setVisibleCount(PAGE) }}
-              placeholder={tab === 'subdomains' ? 'Search hosts…' : 'Search URLs…'}
-              aria-label={tab === 'subdomains' ? 'Search hosts' : 'Search URLs'}
-              className="rounded border border-border bg-surface px-2 py-1 text-[11px] text-text-primary placeholder:text-text-muted w-44" />
             <button onClick={() => applySort('created')}
               className={cn('px-2 py-1 rounded border', sort.key === 'created' ? 'border-accent text-accent' : 'border-border')}>
               Newest {sort.key === 'created' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
@@ -1505,16 +1913,25 @@ export default function TargetDetail() {
             </button>
           </>
         )}
-        {tab !== 'subdomains' && (
+        {tab === 'params' && (
+          <label className="flex items-center gap-1 cursor-pointer select-none">
+            <input type="checkbox" checked={reflectedOnly} onChange={e => { setReflectedOnly(e.target.checked); setVisibleCount(PAGE) }}
+              className="accent-accent w-3.5 h-3.5" />
+            Reflected only
+          </label>
+        )}
+        {tab !== 'subdomains' && tab !== 'params' && (
           <button onClick={() => applySort('size')}
             className={cn('px-2 py-1 rounded border', sort.key === 'size' ? 'border-accent text-accent' : 'border-border')}>
             File size {sort.key === 'size' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
           </button>
         )}
-        <button onClick={() => applySort('status')}
-          className={cn('px-2 py-1 rounded border', sort.key === 'status' ? 'border-accent text-accent' : 'border-border')}>
-          Response {sort.key === 'status' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
-        </button>
+        {tab !== 'params' && (
+          <button onClick={() => applySort('status')}
+            className={cn('px-2 py-1 rounded border', sort.key === 'status' ? 'border-accent text-accent' : 'border-border')}>
+            Response {sort.key === 'status' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+          </button>
+        )}
         {tab === 'http' && (
           <span className="flex items-center gap-1 ml-2 pl-2 border-l border-border">
             <span className="text-text-muted">Status:</span>
@@ -1535,6 +1952,18 @@ export default function TargetDetail() {
           not leave the fallback stuck when the operator switches tabs. */}
       <ErrorBoundary key={tab}>
       <div className="card overflow-hidden" style={{ padding: 0 }}>
+        {isServerPagedTab(tab) && staleAvailable && !tabLoading && (
+          <div className="flex items-center justify-between gap-2 px-4 py-2 border-b border-border bg-accent/10 text-xs">
+            <span className="text-text-secondary">New results available</span>
+            <button
+              type="button"
+              onClick={() => { setStaleAvailable(false); loadTab(tab) }}
+              className="text-accent font-semibold hover:underline"
+            >
+              Refresh
+            </button>
+          </div>
+        )}
         {tab === 'monitor'
           ? <div className="p-3"><ChangeLog key={id} targetId={id} compact initialEventId={initialEventId} initialQuery={initialQuery} onClearEventId={() => { const next = new URLSearchParams(searchParams); next.delete('event'); setSearchParams(next, { replace: true }) }} /></div>
           : dataError && !tabLoading
@@ -1993,7 +2422,73 @@ export default function TargetDetail() {
               </div>
               </>
             )}
-        {!tabLoading && footerHasMore && (
+        {isServerPagedTab(tab) && !tabLoading && data.length > 0 && (data.length < serverTotal || loadingAll || serverTotal > SERVER_PAGE_SIZE) && (
+          <div className="flex flex-wrap items-center justify-center gap-3 py-3 border-t border-border text-xs px-4">
+            {loadingAll ? (
+              <>
+                <span className="text-text-muted">
+                  Loading all… {data.length.toLocaleString()} / {serverTotal.toLocaleString()}
+                </span>
+                <button
+                  type="button"
+                  onClick={stopLoadAll}
+                  className="btn-secondary text-xs text-severity-critical"
+                >
+                  Stop
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="text-text-muted">
+                  Showing {data.length.toLocaleString()} of {serverTotal.toLocaleString()}
+                </span>
+                {data.length < serverTotal && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={loadingMore}
+                      onClick={loadMore}
+                      className="btn-secondary text-xs disabled:opacity-50"
+                    >
+                      {loadingMore
+                        ? 'Loading…'
+                        : `Load ${Math.min(SERVER_PAGE_SIZE, serverTotal - data.length).toLocaleString()} more`}
+                    </button>
+                    {!confirmLoadAll ? (
+                      <button
+                        type="button"
+                        disabled={loadingMore}
+                        onClick={() => startLoadAll(false)}
+                        className="text-accent hover:underline disabled:opacity-50"
+                      >
+                        Load all
+                      </button>
+                    ) : (
+                      <span className="flex items-center gap-2 text-severity-medium">
+                        <span>&gt;5,000 rows — may slow scrolling; server search/export is faster.</span>
+                        <button
+                          type="button"
+                          onClick={() => startLoadAll(true)}
+                          className="text-accent font-semibold hover:underline"
+                        >
+                          Continue
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmLoadAll(false)}
+                          className="text-text-muted hover:text-text-secondary"
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        {!isServerPagedTab(tab) && !tabLoading && footerHasMore && (
           <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
             <span className="text-text-muted">
               Showing {footerShownCount.toLocaleString()} of {footerTotalCount.toLocaleString()}

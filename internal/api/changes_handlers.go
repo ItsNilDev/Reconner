@@ -175,7 +175,7 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	// separate metadata, so a later loss of scope cannot rewrite history.
 	sourceWatchScope := `SELECT we.id, 'watch_scope' AS source, we.target_id,
 		COALESCE(t.domain,'') AS target_name,
-		COALESCE(json_extract(we.metadata,'$.task_id'),'') AS task_id,
+		CASE WHEN json_valid(we.metadata) THEN COALESCE(json_extract(we.metadata,'$.task_id'),'') ELSE '' END AS task_id,
 		COALESCE(we.identifier,'') AS url,
 		CASE WHEN we.event_type='landed' THEN 'scope_landed'
 		     WHEN we.event_type='re_eligible' THEN 'scope_re_eligible'
@@ -185,7 +185,8 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		COALESCE(we.detected_at,'') AS detected_at,
 		COALESCE(we.program_id,'') AS program_id, COALESCE(we.asset_id,'') AS program_asset_id,
 		'' AS scope_status, '' AS resolved_at, 0 AS old_status, 0 AS new_status
-		FROM watch_scope_events we JOIN targets t ON t.id=we.target_id WHERE 1=1`
+		FROM watch_scope_events we JOIN targets t ON t.id=we.target_id WHERE 1=1
+		  AND COALESCE(CASE WHEN json_valid(we.metadata) THEN json_extract(we.metadata,'$.baseline') ELSE 0 END, 0) <> 1`
 	if !isAdmin {
 		sourceWatchScope += ` AND t.owner_id=?`
 		args = append(args, uid)

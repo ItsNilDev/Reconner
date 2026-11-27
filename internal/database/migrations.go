@@ -219,6 +219,8 @@ func RunMigrations(db *DB) error {
 		alterTelegramOutboxAddItemJSON,
 		createTelegramOutboxBatchIndex,
 		alterTargetsAddWatchStaggerPending,
+		alterTargetsAddWatchScopeBaselined,
+		createPerfPaginationIndexes,
 	}
 
 	for i, m := range migrations {
@@ -243,6 +245,9 @@ func RunMigrations(db *DB) error {
 	}
 	if err := backfillWatchHosts(db); err != nil {
 		return fmt.Errorf("watch host lifecycle migration failed: %w", err)
+	}
+	if err := backfillWatchScopeBaselined(db); err != nil {
+		return fmt.Errorf("watch scope baseline migration failed: %w", err)
 	}
 	if err := backfillManagedScope(db); err != nil {
 		return fmt.Errorf("managed scope migration failed: %w", err)
@@ -2403,4 +2408,31 @@ func migrateTargetExclusions(db *DB) error {
 	}
 
 	return tx.Commit()
+}
+
+// watch_scope_baselined records durably that a target's Round-1 watch scope
+// landing baseline has already been established, surviving task/event pruning
+// and partial Round-1 cancellations.
+const alterTargetsAddWatchScopeBaselined = `ALTER TABLE targets ADD COLUMN watch_scope_baselined INTEGER NOT NULL DEFAULT 0;`
+
+const createPerfPaginationIndexes = `
+CREATE INDEX IF NOT EXISTS idx_targets_owner ON targets(owner_id);
+CREATE INDEX IF NOT EXISTS idx_subdomains_target_name ON subdomains(target_id, subdomain, id);
+CREATE INDEX IF NOT EXISTS idx_subdomains_target_created ON subdomains(target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_http_services_target_url ON http_services(target_id, url, id);
+CREATE INDEX IF NOT EXISTS idx_http_services_target_created ON http_services(target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_parameters_target_name ON parameters(target_id, parameter, id);
+`
+
+// backfillWatchScopeBaselined marks existing targets that already completed a
+// watch round, announced watch hosts, or recorded watch scope events so
+// upgrading never suppresses future incremental scope landings.
+func backfillWatchScopeBaselined(db *DB) error {
+	_, err := db.Exec(`UPDATE targets SET watch_scope_baselined = 1
+		WHERE COALESCE(watch_scope_baselined, 0) = 0 AND (
+			EXISTS(SELECT 1 FROM tasks t WHERE t.target_id = targets.id AND t.type = 'watch_scan' AND t.status = 'finished')
+			OR EXISTS(SELECT 1 FROM watch_hosts wh WHERE wh.target_id = targets.id AND wh.announced_at IS NOT NULL)
+			OR EXISTS(SELECT 1 FROM watch_scope_events wse WHERE wse.target_id = targets.id)
+		)`)
+	return err
 }

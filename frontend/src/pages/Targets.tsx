@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { targets as targetsApi } from '../lib/api'
 import { Button, Input, Modal, Spinner, EmptyState, Badge } from '../components/ui'
+import { ProgramLogo } from '../components/ui/ProgramLogo'
 import { ScanModal } from '../components/targets/ScanModal'
 import { useUIStore } from '../store/ui'
 import { timeAgo, timeUntil, cn } from '../lib/utils'
@@ -419,40 +420,47 @@ export default function Targets({ filterKind }: { filterKind?: 'web' | 'network'
                   className={cn('card-hover p-4 cursor-pointer', selectMode && selected.has(t.id) && 'ring-1 ring-accent')}
                   onClick={() => selectMode ? toggleSelect(t.id) : navigate(`/targets/${t.id}`)}
                 >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex items-center gap-2 min-w-0">
+                  <div className="flex items-start justify-between gap-2 mb-3">
+                    <div className="flex items-start gap-2 min-w-0 flex-1">
                       {selectMode && (
                         <input
                           type="checkbox"
                           checked={selected.has(t.id)}
                           onChange={() => toggleSelect(t.id)}
                           onClick={e => e.stopPropagation()}
-                          className="accent-accent w-3.5 h-3.5 shrink-0"
+                          className="accent-accent w-3.5 h-3.5 shrink-0 mt-1.5"
                         />
                       )}
-                      <span className={cn('w-2 h-2 rounded-full shrink-0', dot[t.scan_status] || 'bg-text-muted')} />
-                      <span className="text-sm font-semibold truncate" title={t.domain}>{t.name || t.domain}</span>
-                      {/* Coverage badge: the tier the project runs. */}
-                      <span
-                        className={cn(
-                          'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
-                          t.watch_only ? 'bg-accent/15 text-accent' : 'bg-surface-alt text-text-muted',
-                        )}
-                        title={t.watch_only ? 'Breadth watch: passive discovery + HTTP probe, chained rounds' : 'Deep scan: the full pipeline'}
-                      >
-                        {t.watch_only ? 'Breadth' : 'Deep'}
-                      </span>
-                      {t.watch_only && t.watch_paused && (
-                        <span className="shrink-0 rounded bg-severity-medium/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-medium" title="Watching is paused">
-                          Paused
-                        </span>
-                      )}
-                      {t.watch_only && t.watch_paused && (t.watch_fail_count || 0) > 0 && (
-                        <span className="shrink-0 rounded bg-severity-critical/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-critical"
-                          title={`Auto-paused after ${t.watch_fail_count} failed round(s)`}>
-                          {t.watch_fail_count} failed
-                        </span>
-                      )}
+                      <ProgramLogo src={t.program_logo_url} name={t.name || t.domain} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className={cn('w-2 h-2 rounded-full shrink-0', dot[t.scan_status] || 'bg-text-muted')} />
+                          <span className="text-sm font-semibold truncate" title={t.domain}>{t.name || t.domain}</span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                          {/* Coverage badge: the tier the project runs. */}
+                          <span
+                            className={cn(
+                              'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
+                              t.watch_only ? 'bg-accent/15 text-accent' : 'bg-surface-alt text-text-muted',
+                            )}
+                            title={t.watch_only ? 'Breadth watch: passive discovery + HTTP probe, chained rounds' : 'Deep scan: the full pipeline'}
+                          >
+                            {t.watch_only ? 'Breadth' : 'Deep'}
+                          </span>
+                          {t.watch_only && t.watch_paused && (
+                            <span className="shrink-0 rounded bg-severity-medium/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-medium" title="Watching is paused">
+                              Paused
+                            </span>
+                          )}
+                          {t.watch_only && t.watch_paused && (t.watch_fail_count || 0) > 0 && (
+                            <span className="shrink-0 rounded bg-severity-critical/15 px-1.5 py-0.5 text-[10px] font-medium text-severity-critical"
+                              title={`Auto-paused after ${t.watch_fail_count} failed round(s)`}>
+                              {t.watch_fail_count} failed
+                            </span>
+                          )}
+                        </div>
+                      </div>
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       <Button

@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import { cn } from '../../lib/utils'
 import { useAuthStore } from '../../store/auth'
-import { dashboard } from '../../lib/api'
+import { useStatsStore } from '../../store/stats'
+import { ws } from '../../lib/websocket'
 import { useUIStore } from '../../store/ui'
 import { useUpdateCenter } from './UpdateCenter'
 import { BrandMark } from '../brand/BrandMark'
@@ -50,21 +51,82 @@ export const Sidebar = () => {
   const navigate = useNavigate()
   const [donateOpen, setDonateOpen] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
-  const [targetsN, setTargetsN] = useState(0)
-  const [runningN, setRunningN] = useState(0)
+  const badges = useStatsStore(s => s.badges)
+  const fetchBadges = useStatsStore(s => s.fetchBadges)
+  const targetsN = badges.targets
+  const runningN = badges.running_tasks
   const { mobileNavOpen, setMobileNavOpen } = useUIStore()
   const { info, visible: updateAvailable, showDetails } = useUpdateCenter()
 
-  // Light poll for the nav badges (target count + live running-scan count).
+  // Event-driven sync for the nav badges (target count + live running-scan count).
   useEffect(() => {
     let alive = true
-    const tick = () => dashboard.stats()
-      .then(s => { if (alive) { setTargetsN(s.targets || 0); setRunningN(s.running_tasks || 0) } })
-      .catch(() => {})
-    tick()
-    const i = setInterval(tick, 15000)
-    return () => { alive = false; clearInterval(i) }
-  }, [])
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let fallbackTimer: ReturnType<typeof setInterval> | null = null
+    let hiddenAt: number | null = document.hidden ? Date.now() : null
+
+    const loadNow = () => {
+      if (!alive) return
+      if (timer) { clearTimeout(timer); timer = null }
+      void fetchBadges()
+    }
+
+    const scheduleLoad = () => {
+      if (!alive) return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        if (alive) void fetchBadges()
+      }, 1500)
+    }
+
+    const syncFallbackPoll = () => {
+      const shouldPoll = !ws.connected && !document.hidden
+      if (shouldPoll && !fallbackTimer) {
+        fallbackTimer = setInterval(() => {
+          if (!ws.connected && !document.hidden) void fetchBadges()
+        }, 60 * 1000)
+      } else if (!shouldPoll && fallbackTimer) {
+        clearInterval(fallbackTimer)
+        fallbackTimer = null
+      }
+    }
+
+    const onVis = () => {
+      if (document.hidden) {
+        hiddenAt = Date.now()
+        syncFallbackPoll()
+        return
+      }
+      const hiddenMs = hiddenAt !== null ? Date.now() - hiddenAt : 0
+      hiddenAt = null
+      syncFallbackPoll()
+      if (!ws.connected || hiddenMs > 30_000) loadNow()
+    }
+
+    loadNow()
+    syncFallbackPoll()
+
+    const events = [
+      'target_created', 'target_deleted',
+      'task_created', 'task_started', 'task_finished',
+      'task_cancelled', 'task_paused', 'task_resumed',
+    ]
+    const offs = [
+      ...events.map(ev => ws.on(ev, scheduleLoad)),
+      ws.on('reconnected', loadNow),
+      ws.on('open', syncFallbackPoll),
+      ws.on('close', syncFallbackPoll),
+    ]
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      alive = false
+      clearTimeout(timer ?? undefined)
+      clearInterval(fallbackTimer ?? undefined)
+      offs.forEach(off => off())
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [fetchBadges])
 
   const groups: NavGroup[] = [
     { label: 'Command center', items: [{ to: '/', label: 'Overview', Icon: Icons.dashboard }] },

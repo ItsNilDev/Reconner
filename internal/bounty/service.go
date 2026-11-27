@@ -125,6 +125,7 @@ type Service struct {
 	indexState   DetailIndexStatus
 	indexRetry   map[string]time.Time
 	onScopeEvent ScopeEventNotify
+	onScopeNotification func(targetID, typ, severity string)
 }
 
 func NewService(db *database.DB, log *logger.Logger) *Service {
@@ -142,6 +143,13 @@ func NewService(db *database.DB, log *logger.Logger) *Service {
 // scope events are still recorded and still visible in the UI, just without
 // an out-of-band alert or auto-scan.
 func (s *Service) SetScopeEventNotify(fn ScopeEventNotify) { s.onScopeEvent = fn }
+
+// SetScopeNotificationCallback wires an optional callback invoked after a
+// bounty scope-change notification row is persisted so callers can emit
+// real-time WebSocket updates.
+func (s *Service) SetScopeNotificationCallback(fn func(targetID, typ, severity string)) {
+	s.onScopeNotification = fn
+}
 
 func (s *Service) SetHTTPClient(client *http.Client) {
 	if client != nil {

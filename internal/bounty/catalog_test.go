@@ -1210,3 +1210,55 @@ func TestResolveScopeEventWatchOnlyMonitorAndScheduleNudge(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcileProjectInvokesScopeNotificationCallbackAfterInsert(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{
+		Provider:   "hackerone",
+		ExternalID: "scope-notif-1",
+		Handle:     "scopenotif",
+		Name:       "ScopeNotif",
+		Status:     "live",
+		Assets: []Asset{
+			{ExternalID: "a1", Identifier: "one.scopenotif.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+		},
+	}
+	storeTestProgram(t, svc, &p)
+	projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{
+		Name:     "ScopeNotif",
+		AssetIDs: []string{p.Assets[0].ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type call struct {
+		targetID string
+		typ      string
+		severity string
+		rowCount int
+	}
+	var calls []call
+	svc.SetScopeNotificationCallback(func(targetID, typ, severity string) {
+		var cnt int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM notifications WHERE target_id=? AND type=?`, targetID, typ).Scan(&cnt)
+		calls = append(calls, call{targetID: targetID, typ: typ, severity: severity, rowCount: cnt})
+	})
+
+	// Add a new asset upstream so reconcileProject records a scope change and inserts a notification.
+	p.Assets = append(p.Assets, Asset{
+		ExternalID: "a2", Identifier: "two.scopenotif.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true,
+	})
+	storeTestProgram(t, svc, &p)
+
+	if len(calls) != 1 {
+		t.Fatalf("onScopeNotification calls = %d, want 1 (%+v)", len(calls), calls)
+	}
+	got := calls[0]
+	if got.targetID != projectID || got.typ != "bounty_scope_change" || got.severity != "medium" {
+		t.Fatalf("callback args = %+v, want target=%s type=bounty_scope_change severity=medium", got, projectID)
+	}
+	if got.rowCount != 1 {
+		t.Fatalf("notification row count at callback time = %d, want 1 (must fire after INSERT)", got.rowCount)
+	}
+}

@@ -123,6 +123,7 @@ func (h *Handler) Router() http.Handler {
 
 	// Dashboard
 	api.HandleFunc("/dashboard/stats", h.requireAuth(h.handleDashboardStats)).Methods("GET")
+	api.HandleFunc("/dashboard/badges", h.requireAuth(h.handleDashboardBadges)).Methods("GET")
 	api.HandleFunc("/dashboard/charts", h.requireAuth(h.handleDashboardCharts)).Methods("GET")
 
 	// Targets

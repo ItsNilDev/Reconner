@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/recon-platform/internal/scanner"
 )
 
 func TestWatchHTTPServicesFromDatabase(t *testing.T) {
@@ -749,5 +751,71 @@ func TestEmitWatchNewHostsNotificationMetadata(t *testing.T) {
 	}
 	if meta.Total != 1 || meta.TaskID != "round-meta" {
 		t.Errorf("metadata total/task_id = %d/%q, want 1/round-meta", meta.Total, meta.TaskID)
+	}
+}
+
+type scopeLandedRecorder struct {
+	calls []struct {
+		eventKey string
+		summary  string
+		hosts    []string
+	}
+}
+
+func (r *scopeLandedRecorder) NotifyScanStarted(string, string, string)                          {}
+func (r *scopeLandedRecorder) NotifyPhaseFinished(string, string, string, string, string, time.Duration, int, int) {}
+func (r *scopeLandedRecorder) NotifyScanFinished(string, string, string, string, time.Duration, map[string]int) {}
+func (r *scopeLandedRecorder) NotifyNewVuln(string, string, string, string, string, string, string) {}
+func (r *scopeLandedRecorder) NotifyMonitorChange(string, string, string, string, string, string, string, ...string) {}
+func (r *scopeLandedRecorder) NotifyHTTPStatus(string, string, string, string, string, string, string, string) {}
+func (r *scopeLandedRecorder) NotifyProgramScope(string, string, string, string, string, string) {}
+func (r *scopeLandedRecorder) NotifyWatchScanStarted(string, string, string)                     {}
+func (r *scopeLandedRecorder) NotifyWatchScanFinished(string, string, string, string, time.Duration, map[string]int, string) {}
+func (r *scopeLandedRecorder) NotifyNewHosts(string, string, []string, string)                   {}
+func (r *scopeLandedRecorder) NotifyScopeLanded(eventKey, summary string, hosts []string) {
+	r.calls = append(r.calls, struct {
+		eventKey string
+		summary  string
+		hosts    []string
+	}{eventKey: eventKey, summary: summary, hosts: append([]string(nil), hosts...)})
+}
+
+func TestFlushScopeLandingsSkipsRound1BaselineAndSendsRound2(t *testing.T) {
+	s := newTestScheduler(t)
+	rec := &scopeLandedRecorder{}
+	s.SetNotifier(rec)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`INSERT INTO targets(id,domain,watch_only) VALUES('t-flush','flush.test',1)`,
+		`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES('p-flush','hackerone','p-flush','flush','Flush')`,
+		`INSERT INTO project_programs(target_id,program_id) VALUES('t-flush','p-flush')`,
+		`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard) VALUES('a-flush','p-flush','ext-flush','*.flush.test','domain',1)`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	// Round 1 baseline landing -> announced=1, flushScopeLandings sends no alert.
+	scanner.LandWatchScopeHosts(scanner.WithTaskID(ctx, "round-1"), s.db, "t-flush", []string{"one.flush.test"}, nil)
+	s.flushScopeLandings()
+	if len(rec.calls) != 0 {
+		t.Fatalf("Round 1 NotifyScopeLanded calls = %d, want 0", len(rec.calls))
+	}
+
+	// Round 2 incremental landing -> announced=0, flushScopeLandings sends alert.
+	if _, err := s.db.Exec(`INSERT INTO tasks(id,target_id,type,status,priority,modules,total) VALUES('round-1','t-flush','watch_scan','finished',1,'[]',2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE targets SET watch_scope_baselined=1 WHERE id='t-flush'`); err != nil {
+		t.Fatal(err)
+	}
+	scanner.LandWatchScopeHosts(scanner.WithTaskID(ctx, "round-2"), s.db, "t-flush", []string{"one.flush.test", "two.flush.test"}, nil)
+	s.flushScopeLandings()
+	if len(rec.calls) != 1 {
+		t.Fatalf("Round 2 NotifyScopeLanded calls = %d, want 1", len(rec.calls))
+	}
+	if len(rec.calls[0].hosts) != 1 || rec.calls[0].hosts[0] != "two.flush.test" {
+		t.Fatalf("Round 2 NotifyScopeLanded hosts = %v, want [two.flush.test]", rec.calls[0].hosts)
 	}
 }

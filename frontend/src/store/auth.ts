@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { auth as authApi } from '../lib/api'
+import { useStatsStore } from './stats'
 
 interface AuthState {
   user: {id?: number; username: string; role: string; must_change_password?: boolean} | null
@@ -21,7 +22,11 @@ export const useAuthStore = create<AuthState>((set) => ({
       set({ user, loading: false })
     } catch (err) { set({ loading: false }); throw err }
   },
-  logout: async () => { await authApi.logout().catch(() => {}); set({ user: null }) },
+  logout: async () => {
+    await authApi.logout().catch(() => {})
+    useStatsStore.getState().reset()
+    set({ user: null })
+  },
   checkAuth: async () => {
     try { const user = await authApi.me(); set({ user, initialized: true }) }
     catch { set({ user: null, initialized: true }) }

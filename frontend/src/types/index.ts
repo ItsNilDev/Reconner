@@ -148,6 +148,7 @@ export interface Target {
   watch_fail_count?: number
   watch_root_index?: number
   watch_paused?: boolean
+  program_logo_url?: string
 }
 
 export interface Subdomain {

@@ -527,6 +527,34 @@ func (h *Handler) handleRestoreCorpus(w http.ResponseWriter, r *http.Request) {
 	h.writeSuccess(w, map[string]int{"removed": removed})
 }
 
+func (h *Handler) handleDashboardBadges(w http.ResponseWriter, r *http.Request) {
+	uid, isAdmin := h.callerScope(r)
+	var targets, running int
+	if isAdmin {
+		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM targets`).Scan(&targets); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to count targets")
+			return
+		}
+		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM tasks WHERE status = 'running'`).Scan(&running); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to count running tasks")
+			return
+		}
+	} else {
+		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM targets WHERE owner_id = ?`, uid).Scan(&targets); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to count targets")
+			return
+		}
+		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM tasks WHERE status = 'running' AND target_id IN (SELECT id FROM targets WHERE owner_id = ?)`, uid).Scan(&running); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to count running tasks")
+			return
+		}
+	}
+	h.writeSuccess(w, map[string]int{
+		"targets":       targets,
+		"running_tasks": running,
+	})
+}
+
 func (h *Handler) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	stats := models.DashboardStats{}
 
@@ -534,19 +562,80 @@ func (h *Handler) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	// everything under them; an admin sees the whole platform. The `targets` table
 	// scopes by owner_id; every child table scopes by target_id ∈ (owned targets).
 	uid, isAdmin := h.callerScope(r)
+	var ownerArgs []any
+	targetWhere := ""
+	joinedWhere := ""
+	childOwnerClause := ""
+	if !isAdmin {
+		ownerArgs = []any{uid}
+		targetWhere = " WHERE owner_id = ?"
+		joinedWhere = " WHERE tgt.owner_id = ?"
+		childOwnerClause = " AND target_id IN (SELECT id FROM targets WHERE owner_id = ?)"
+	}
 
-	queries := []struct {
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(watch_only, 0) = 1 THEN 1 ELSE 0 END), 0) FROM targets`+targetWhere,
+		ownerArgs...,
+	).Scan(&stats.Targets, &stats.WatchTargets); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load target stats")
+		return
+	}
+
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN s.is_alive = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN COALESCE(tgt.watch_only, 0) = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN s.is_alive = 1 AND COALESCE(tgt.watch_only, 0) = 1 THEN 1 ELSE 0 END), 0)
+		FROM subdomains s LEFT JOIN targets tgt ON tgt.id = s.target_id`+joinedWhere,
+		ownerArgs...,
+	).Scan(&stats.Subdomains, &stats.AliveHosts, &stats.WatchSubdomains, &stats.WatchAliveHosts); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load subdomain stats")
+		return
+	}
+
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN COALESCE(tgt.watch_only, 0) = 1 THEN 1 ELSE 0 END), 0)
+		FROM http_services hs LEFT JOIN targets tgt ON tgt.id = hs.target_id`+joinedWhere,
+		ownerArgs...,
+	).Scan(&stats.HTTPServices, &stats.WatchHTTPServices); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load http service stats")
+		return
+	}
+
+	paramWhere := ""
+	if !isAdmin {
+		paramWhere = " WHERE target_id IN (SELECT id FROM targets WHERE owner_id = ?)"
+	}
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN is_reflected = 1 THEN 1 ELSE 0 END), 0) FROM parameters`+paramWhere,
+		ownerArgs...,
+	).Scan(&stats.Parameters, &stats.ReflectedParameters); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load parameter stats")
+		return
+	}
+
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT
+			COALESCE(SUM(CASE WHEN t.status = 'running' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN t.status = 'finished' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN t.status = 'running' AND COALESCE(tgt.watch_only, 0) = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN t.status = 'failed' AND COALESCE(tgt.watch_only, 0) = 1 THEN 1 ELSE 0 END), 0)
+		FROM tasks t LEFT JOIN targets tgt ON tgt.id = t.target_id`+joinedWhere,
+		ownerArgs...,
+	).Scan(&stats.RunningTasks, &stats.FinishedTasks, &stats.FailedTasks, &stats.PendingTasks, &stats.WatchRunningTasks, &stats.WatchFailedTasks); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "failed to load task stats")
+		return
+	}
+
+	singleQueries := []struct {
 		dest  *int
 		table string
 		where string
 	}{
-		{&stats.Targets, "targets", ""},
-		{&stats.Subdomains, "subdomains", ""},
-		{&stats.AliveHosts, "subdomains", "is_alive = 1"},
-		{&stats.HTTPServices, "http_services", ""},
 		{&stats.JSFiles, "js_files", ""},
-		{&stats.Parameters, "parameters", ""},
-		{&stats.ReflectedParameters, "parameters", "is_reflected = 1"},
 		{&stats.DirectoryFindings, "directory_findings", ""},
 		{&stats.BackupFindings, "backup_findings", ""},
 		// Surfaced/confirmed only — consistent with the per-target finding_count,
@@ -554,76 +643,23 @@ func (h *Handler) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		{&stats.OpenRedirectFindings, "open_redirect_findings", "COALESCE(status,'finding')='finding'"},
 		{&stats.NucleiFindings, "nuclei_findings", "COALESCE(verification,'unverified') != 'rejected'"},
 		{&stats.VulnFindings, "vuln_findings", "COALESCE(status,'finding')='finding'"},
-		{&stats.RunningTasks, "tasks", "status = 'running'"},
-		{&stats.FinishedTasks, "tasks", "status = 'finished'"},
-		{&stats.FailedTasks, "tasks", "status = 'failed'"},
-		{&stats.PendingTasks, "tasks", "status = 'pending'"},
 	}
-
-	for _, q := range queries {
-		conds := []string{}
-		args := []any{}
+	for _, q := range singleQueries {
+		sqlStr := "SELECT COUNT(*) FROM " + q.table + " WHERE 1=1"
 		if q.where != "" {
-			conds = append(conds, q.where)
+			sqlStr += " AND " + q.where
 		}
-		if !isAdmin {
-			if q.table == "targets" {
-				conds = append(conds, "owner_id = ?")
-			} else {
-				conds = append(conds, "target_id IN (SELECT id FROM targets WHERE owner_id = ?)")
-			}
-			args = append(args, uid)
+		sqlStr += childOwnerClause
+		if err := h.db.QueryRowContext(r.Context(), sqlStr, ownerArgs...).Scan(q.dest); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to load finding stats")
+			return
 		}
-		sql := "SELECT COUNT(*) FROM " + q.table
-		if len(conds) > 0 {
-			sql += " WHERE " + strings.Join(conds, " AND ")
-		}
-		h.db.QueryRowContext(r.Context(), sql, args...).Scan(q.dest)
 	}
 
 	// Coverage split. Count the breadth (watch-only) side, then derive the deep
 	// side as total - breadth so the two sides always add up. Tasks are split by
 	// the PROJECT's coverage, not the task type: a manual deep scan on a breadth
 	// project is still breadth work and is labelled "manual" in the UI.
-	watchQueries := []struct {
-		dest  *int
-		table string
-		where string
-	}{
-		{&stats.WatchTargets, "targets", ""},
-		{&stats.WatchSubdomains, "subdomains", ""},
-		{&stats.WatchAliveHosts, "subdomains", "is_alive = 1"},
-		{&stats.WatchHTTPServices, "http_services", ""},
-		{&stats.WatchRunningTasks, "tasks", "status = 'running'"},
-		{&stats.WatchFailedTasks, "tasks", "status = 'failed'"},
-	}
-	for _, q := range watchQueries {
-		// Only targets has a watch_only column. Child tables must scope by
-		// the project instead, through target_id. Applying watch_only to a
-		// child table fails with "no such column" and leaves the stat at 0.
-		var coverageCond string
-		if q.table == "targets" {
-			coverageCond = "watch_only = 1"
-		} else {
-			coverageCond = "target_id IN (SELECT id FROM targets WHERE watch_only = 1)"
-		}
-		conds := []string{coverageCond}
-		args := []any{}
-		if q.where != "" {
-			conds = append(conds, q.where)
-		}
-		if !isAdmin {
-			// Scope to the caller's own targets as well.
-			if q.table == "targets" {
-				conds = append(conds, "owner_id = ?")
-			} else {
-				conds = append(conds, "target_id IN (SELECT id FROM targets WHERE owner_id = ?)")
-			}
-			args = append(args, uid)
-		}
-		sql := "SELECT COUNT(*) FROM " + q.table + " WHERE " + strings.Join(conds, " AND ")
-		h.db.QueryRowContext(r.Context(), sql, args...).Scan(q.dest)
-	}
 	stats.DeepTargets = stats.Targets - stats.WatchTargets
 	stats.DeepSubdomains = stats.Subdomains - stats.WatchSubdomains
 	stats.DeepAliveHosts = stats.AliveHosts - stats.WatchAliveHosts

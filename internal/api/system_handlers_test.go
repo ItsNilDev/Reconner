@@ -17,6 +17,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/mattn/go-sqlite3"
+	"github.com/recon-platform/internal/auth"
+	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/config"
 	"github.com/recon-platform/internal/scheduler"
 )
@@ -350,5 +352,182 @@ func TestIsSQLiteBusy(t *testing.T) {
 		if got := isSQLiteBusy(tc.err); got != tc.want {
 			t.Errorf("%s: isSQLiteBusy(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
 		}
+	}
+}
+
+func TestDashboardBadgesOwnerIsolationAndEmptyDB(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSID, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSID, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readBadges := func(sid string) map[string]int {
+		req := httptest.NewRequest(http.MethodGet, "/api/dashboard/badges", nil)
+		req.AddCookie(&http.Cookie{Name: "recon_session", Value: sid})
+		rec := httptest.NewRecorder()
+		h.requireAuth(h.handleDashboardBadges)(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("badges status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Data map[string]int `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		return env.Data
+	}
+
+	// Empty DB check.
+	if got := readBadges(adminSID); got["targets"] != 0 || got["running_tasks"] != 0 {
+		t.Fatalf("empty DB admin badges = %+v, want 0/0", got)
+	}
+	if got := readBadges(bobSID); got["targets"] != 0 || got["running_tasks"] != 0 {
+		t.Fatalf("empty DB member badges = %+v, want 0/0", got)
+	}
+
+	if _, err := h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t-a','a.example',?), ('t-b1','b1.example',?), ('t-b2','b2.example',?)`, adminID, bob.ID, bob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO tasks (id, target_id, type, status) VALUES
+		('tk-a1','t-a','deep_scan','running'),
+		('tk-a2','t-a','deep_scan','finished'),
+		('tk-b1','t-b1','watch_scan','running'),
+		('tk-b2','t-b2','deep_scan','running'),
+		('tk-b3','t-b2','deep_scan','failed')`); err != nil {
+		t.Fatal(err)
+	}
+
+	adminBadges := readBadges(adminSID)
+	if adminBadges["targets"] != 3 || adminBadges["running_tasks"] != 3 {
+		t.Fatalf("admin badges = %+v, want targets=3 running_tasks=3", adminBadges)
+	}
+	bobBadges := readBadges(bobSID)
+	if bobBadges["targets"] != 2 || bobBadges["running_tasks"] != 2 {
+		t.Fatalf("bob badges = %+v, want targets=2 running_tasks=2", bobBadges)
+	}
+}
+
+func TestDashboardStatsConsolidatedEmptyAndPopulated(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	bob, err := h.auth.CreateUser("bob", "bobpassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroUser, err := h.auth.CreateUser("zero", "zeropassword", auth.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = zeroUser
+	adminSID, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroSID, err := h.auth.Login("zero", "zeropassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSID, err := h.auth.Login("bob", "bobpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readStats := func(sid string) models.DashboardStats {
+		req := httptest.NewRequest(http.MethodGet, "/api/dashboard/stats", nil)
+		req.AddCookie(&http.Cookie{Name: "recon_session", Value: sid})
+		rec := httptest.NewRecorder()
+		h.requireAuth(h.handleDashboardStats)(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("stats status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Data models.DashboardStats `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		return env.Data
+	}
+
+	// Empty DB & zero-target member must succeed without NULL scan errors.
+	if got := readStats(adminSID); got != (models.DashboardStats{}) {
+		t.Fatalf("empty DB stats = %+v, want zero struct", got)
+	}
+	if got := readStats(zeroSID); got != (models.DashboardStats{}) {
+		t.Fatalf("zero-target member stats = %+v, want zero struct", got)
+	}
+
+	if _, err := h.db.Exec(`INSERT INTO targets (id, domain, owner_id, watch_only) VALUES
+		('t-deep','deep.example',?,0),
+		('t-watch','watch.example',?,1),
+		('t-bob','bob.example',?,1)`, adminID, adminID, bob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO subdomains (id, target_id, subdomain, is_alive) VALUES
+		('s1','t-deep','a.deep.example',1),
+		('s2','t-deep','b.deep.example',0),
+		('s3','t-watch','a.watch.example',1),
+		('s4','t-bob','a.bob.example',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO http_services (id, target_id, url, status_code) VALUES
+		('h1','t-deep','https://a.deep.example',200),
+		('h2','t-watch','https://a.watch.example',200),
+		('h3','t-bob','https://a.bob.example',200)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO parameters (id, target_id, url, parameter, is_reflected) VALUES
+		('p1','t-deep','https://a.deep.example','q',1),
+		('p2','t-deep','https://a.deep.example','page',0),
+		('p3','t-bob','https://a.bob.example','id',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO tasks (id, target_id, type, status) VALUES
+		('k1','t-deep','deep_scan','running'),
+		('k2','t-deep','deep_scan','finished'),
+		('k3','t-watch','watch_scan','running'),
+		('k4','t-watch','watch_scan','failed'),
+		('k5','t-bob','watch_scan','pending')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO vuln_findings (id, target_id, type, severity, url, status) VALUES
+		('vf1','t-deep','xss','high','https://a.deep.example/1','finding'),
+		('vf2','t-deep','xss','low','https://a.deep.example/2','candidate')`); err != nil {
+		t.Fatal(err)
+	}
+
+	adminStats := readStats(adminSID)
+	if adminStats.Targets != 3 || adminStats.WatchTargets != 2 || adminStats.DeepTargets != 1 ||
+		adminStats.Subdomains != 4 || adminStats.AliveHosts != 3 || adminStats.WatchSubdomains != 2 || adminStats.DeepSubdomains != 2 ||
+		adminStats.WatchAliveHosts != 2 || adminStats.DeepAliveHosts != 1 ||
+		adminStats.HTTPServices != 3 || adminStats.WatchHTTPServices != 2 || adminStats.DeepHTTPServices != 1 ||
+		adminStats.Parameters != 3 || adminStats.ReflectedParameters != 2 ||
+		adminStats.RunningTasks != 2 || adminStats.FinishedTasks != 1 || adminStats.FailedTasks != 1 || adminStats.PendingTasks != 1 ||
+		adminStats.WatchRunningTasks != 1 || adminStats.DeepRunningTasks != 1 ||
+		adminStats.WatchFailedTasks != 1 || adminStats.DeepFailedTasks != 0 ||
+		adminStats.VulnFindings != 1 {
+		t.Fatalf("unexpected admin stats: %+v", adminStats)
+	}
+
+	bobStats := readStats(bobSID)
+	if bobStats.Targets != 1 || bobStats.WatchTargets != 1 || bobStats.DeepTargets != 0 ||
+		bobStats.Subdomains != 1 || bobStats.AliveHosts != 1 ||
+		bobStats.HTTPServices != 1 || bobStats.Parameters != 1 || bobStats.ReflectedParameters != 1 ||
+		bobStats.PendingTasks != 1 || bobStats.RunningTasks != 0 {
+		t.Fatalf("unexpected bob stats: %+v", bobStats)
+	}
+
+	// Zero-target member remains zero even when other users have data.
+	if got := readStats(zeroSID); got != (models.DashboardStats{}) {
+		t.Fatalf("zero-target member stats with populated DB = %+v, want zero struct", got)
 	}
 }

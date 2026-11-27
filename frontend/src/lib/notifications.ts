@@ -12,13 +12,16 @@ const NOTIFICATIONS_CHANGED = 'recon:notifications-changed'
 
 // Both bell surfaces listen for this event after a mark-read so the badge and
 // the Alerts panel never show different unread counts.
-export function notifyNotificationsChanged(): void {
-  window.dispatchEvent(new Event(NOTIFICATIONS_CHANGED))
+export function notifyNotificationsChanged(source: 'topbar' | 'changelog' = 'changelog'): void {
+  window.dispatchEvent(new CustomEvent(NOTIFICATIONS_CHANGED, { detail: { source } }))
 }
 
-export function onNotificationsChanged(handler: () => void): () => void {
-  window.addEventListener(NOTIFICATIONS_CHANGED, handler)
-  return () => window.removeEventListener(NOTIFICATIONS_CHANGED, handler)
+export function onNotificationsChanged(handler: (source?: string) => void): () => void {
+  const listener = (ev: Event) => {
+    handler((ev as CustomEvent<{ source?: string }>).detail?.source)
+  }
+  window.addEventListener(NOTIFICATIONS_CHANGED, listener)
+  return () => window.removeEventListener(NOTIFICATIONS_CHANGED, listener)
 }
 
 // Shared bell navigation. Both TopBar and the Changes notifications panel use
@@ -54,8 +57,9 @@ export function openNotification(
   n: Notification,
   navigate: (path: string) => void,
   markRead: (ids: string[]) => Promise<unknown>,
+  source: 'topbar' | 'changelog' = 'changelog',
 ): void {
-  if (!n.is_read) void markRead([n.id]).then(notifyNotificationsChanged).catch(() => {})
+  if (!n.is_read) void markRead([n.id]).then(() => notifyNotificationsChanged(source)).catch(() => {})
   if (n.target_id) {
     // A new-host bell carries the discovered names in metadata. Route to the
     // Changes tab filtered to the first host instead of the generic target

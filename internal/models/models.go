@@ -52,6 +52,7 @@ type Target struct {
 	WatchFailCount int        `json:"watch_fail_count" db:"watch_fail_count"`
 	WatchRootIndex int        `json:"watch_root_index" db:"watch_root_index"`
 	WatchPaused    bool       `json:"watch_paused" db:"watch_paused"`
+	ProgramLogoURL string     `json:"program_logo_url,omitempty"`
 }
 
 type ManagedExclusion struct {

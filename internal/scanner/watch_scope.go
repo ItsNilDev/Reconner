@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 // transaction. A DB and a Tx both satisfy it.
 type watchScopeDB interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
@@ -384,32 +386,109 @@ func WildcardRootMatchesWatchScope(entries []WatchScopeEntry, raw string) (strin
 	return "", "", false
 }
 
+func watchScopeLog(logFn LogFunc, level, module, msg string) {
+	if logFn != nil {
+		logFn(level, module, msg)
+	}
+}
+
+// isWatchBaselineRound reports whether a watch scope landing runs as the
+// silent Round-1 baseline for targetID. Returns true only when no durable
+// baseline flag, prior finished watch_scan task, announced watch_hosts row, or
+// prior watch_scope_events landing from another task exists.
+func isWatchBaselineRound(ctx context.Context, db *database.DB, targetID, taskID string) (bool, error) {
+	var baselined int
+	err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(watch_scope_baselined, 0) FROM targets WHERE id = ?`,
+		targetID).Scan(&baselined)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if baselined == 1 {
+		return false, nil
+	}
+
+	var finished int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tasks WHERE target_id = ? AND type = 'watch_scan' AND status = 'finished' AND id <> ?`,
+		targetID, taskID).Scan(&finished); err != nil {
+		return false, err
+	}
+	if finished > 0 {
+		return false, nil
+	}
+
+	var announced int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM watch_hosts WHERE target_id = ? AND announced_at IS NOT NULL`,
+		targetID).Scan(&announced); err != nil {
+		return false, err
+	}
+	if announced > 0 {
+		return false, nil
+	}
+
+	var priorEvents int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM watch_scope_events
+		 WHERE target_id = ?
+		   AND event_type IN ('landed','re_eligible')
+		   AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.task_id'),'') ELSE '' END <> ?`,
+		targetID, taskID).Scan(&priorEvents); err != nil {
+		return false, err
+	}
+	if priorEvents > 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
 func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, hosts []string, logFn LogFunc) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	baseline, err := isWatchBaselineRound(ctx, db, targetID, taskIDFromContext(ctx))
+	if err != nil {
+		watchScopeLog(logFn, "warn", "watch_scope", fmt.Sprintf("Scope landing skipped: baseline check failed: %v", err))
+		return nil
+	}
+	return LandWatchScopeHostsWithBaseline(ctx, db, targetID, hosts, baseline, logFn)
+}
+
+// LandWatchScopeHostsWithBaseline lands eligible watch hosts using an explicit
+// baseline flag. When baseline is true, approved assets are still recorded so
+// Round 2+ will not re-land them, while watch_scope_events rows are written
+// with announced=1 and metadata.baseline=true to suppress Round-1 alerts.
+func LandWatchScopeHostsWithBaseline(ctx context.Context, db *database.DB, targetID string, hosts []string, baseline bool, logFn LogFunc) []string {
 	if len(hosts) == 0 {
 		return nil
 	}
 	entries, hasProgram, err := LoadWatchEligibleScope(ctx, db, targetID)
 	if err != nil {
-		logFn("warn", "watch_scope", fmt.Sprintf("Scope landing skipped: %v", err))
+		watchScopeLog(logFn, "warn", "watch_scope", fmt.Sprintf("Scope landing skipped: %v", err))
 		return nil
 	}
 	if !hasProgram {
-		logFn("info", "watch_scope", "no bounty program linked: scope landing disabled for this project")
+		watchScopeLog(logFn, "info", "watch_scope", "no bounty program linked: scope landing disabled for this project")
 		return nil
 	}
 	if len(entries) == 0 {
-		logFn("info", "watch_scope", "no eligible program assets: nothing landed this round")
+		watchScopeLog(logFn, "info", "watch_scope", "no eligible program assets: nothing landed this round")
 		return nil
 	}
 	excl, err := LoadExclusionsE(ctx, db, targetID)
 	if err != nil {
-		logFn("warn", "watch_scope", fmt.Sprintf("Scope landing skipped: %v", err))
+		watchScopeLog(logFn, "warn", "watch_scope", fmt.Sprintf("Scope landing skipped: %v", err))
 		return nil
 	}
 
+	taskID := taskIDFromContext(ctx)
 	seen := map[string]bool{}
 	var landed []string
 	for _, raw := range hosts {
+		if ctx.Err() != nil {
+			break
+		}
 		host, ok := normalizeWatchHost(raw)
 		if !ok || seen[host.Value] {
 			continue
@@ -422,9 +501,9 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 		if !ok {
 			continue // outside the eligible scope: not added, not notified
 		}
-		changed, err := landWatchHost(ctx, db, targetID, host, entry)
+		changed, err := landWatchHost(ctx, db, targetID, host, entry, taskID, baseline)
 		if err != nil {
-			logFn("warn", "watch_scope", fmt.Sprintf("Failed to land %s: %v", host.Value, err))
+			watchScopeLog(logFn, "warn", "watch_scope", fmt.Sprintf("Failed to land %s: %v", host.Value, err))
 			continue
 		}
 		if changed {
@@ -432,7 +511,7 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 		}
 	}
 	if len(landed) > 0 {
-		logFn("info", "watch_scope", fmt.Sprintf("Landed %d new eligible host(s) as approved scope", len(landed)))
+		watchScopeLog(logFn, "info", "watch_scope", fmt.Sprintf("Landed %d new eligible host(s) as approved scope", len(landed)))
 	}
 	return landed
 }
@@ -443,14 +522,20 @@ func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, 
 // that was landed before and later fell out of scope is re-activated: the
 // out-of-scope flag is cleared, a NEW event row is written and it is announced
 // again.
-func landWatchHost(ctx context.Context, db *database.DB, targetID string, host WatchScopeHost, entry WatchScopeEntry) (bool, error) {
+func landWatchHost(ctx context.Context, db *database.DB, targetID string, host WatchScopeHost, entry WatchScopeEntry, taskID string, baseline bool) (bool, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	assetID, source, metadata, found := lookupWatchAsset(ctx, tx, targetID, host.Value)
+	// Wildcard program assets share entry.AssetID with the "*.domain" row in
+	// assets, so only exact program assets may match by source_id.
+	matchAssetID := ""
+	if !entry.IsWildcard {
+		matchAssetID = entry.AssetID
+	}
+	assetID, source, metadata, found := lookupWatchAsset(ctx, tx, targetID, host.Value, matchAssetID)
 	if found {
 		if source != "watch:scope" {
 			return false, nil // owned by another source (program import): never rewritten
@@ -459,7 +544,7 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 			return false, nil // already known and in scope
 		}
 		// Re-eligible: clear the flag and announce it again with a new event.
-		if err := reactivateWatchAsset(ctx, tx, targetID, assetID, host, entry); err != nil {
+		if err := reactivateWatchAsset(ctx, tx, targetID, assetID, host, entry, taskID, baseline); err != nil {
 			return false, err
 		}
 		return true, tx.Commit()
@@ -471,10 +556,13 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 		"program_id":    entry.ProgramID,
 		"program_asset": entry.AssetID,
 		"out_of_scope":  0,
-		"task_id":       taskIDFromContext(ctx),
+		"task_id":       taskID,
+	}
+	if baseline {
+		meta["baseline"] = true
 	}
 	metaJSON, _ := json.Marshal(meta)
-	if err := insertWatchScopeEvent(ctx, tx, targetID, entry.ProgramID, host.Value, "landed", assetID, metaJSON); err != nil {
+	if err := insertWatchScopeEvent(ctx, tx, targetID, entry.ProgramID, host.Value, "landed", assetID, metaJSON, baseline); err != nil {
 		return false, err
 	}
 	// assets has UNIQUE(target_id, value): a row that already exists is left
@@ -492,12 +580,10 @@ func landWatchHost(ctx context.Context, db *database.DB, targetID string, host W
 
 // lookupWatchAsset finds the assets row for a host.
 //
-// The exact value is tried first, then a case-insensitive match: SQLite
-// compares text with BINARY collation, so "Example.com" and "example.com" can
-// be two rows in the same project. Both paths must be able to REACTIVATE an
-// out-of-scope watch:scope row, otherwise a host that was landed with different
-// casing never comes back into scope.
-func lookupWatchAsset(ctx context.Context, db watchScopeDB, targetID, value string) (id, source, metadata string, found bool) {
+// The exact value is tried first, then a case-insensitive match, then canonical
+// host/source_id matching across non-watch:scope assets so exact program assets
+// imported as mixed-case or scheme/port URLs are never duplicated as watch:scope.
+func lookupWatchAsset(ctx context.Context, db watchScopeDB, targetID, value, entryAssetID string) (id, source, metadata string, found bool) {
 	err := db.QueryRowContext(ctx,
 		`SELECT id, COALESCE(source,''), COALESCE(metadata,'') FROM assets WHERE target_id = ? AND value = ?`,
 		targetID, value).Scan(&id, &source, &metadata)
@@ -511,17 +597,51 @@ func lookupWatchAsset(ctx context.Context, db watchScopeDB, targetID, value stri
 	if err == nil {
 		return id, source, metadata, true
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		host, hostOK := normalizeWatchHost(value)
+		rows, qerr := db.QueryContext(ctx,
+			`SELECT id, COALESCE(source,''), COALESCE(source_id,''), value, COALESCE(metadata,'')
+			 FROM assets WHERE target_id = ? AND COALESCE(source,'') <> 'watch:scope'`,
+			targetID)
+		if qerr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var rowID, rowSource, rowSourceID, rowVal, rowMeta string
+				if scanErr := rows.Scan(&rowID, &rowSource, &rowSourceID, &rowVal, &rowMeta); scanErr != nil {
+					continue
+				}
+				if entryAssetID != "" && rowSourceID == entryAssetID && !strings.Contains(rowVal, "*") {
+					return rowID, rowSource, rowMeta, true
+				}
+				if !hostOK {
+					continue
+				}
+				if rh, ok := normalizeWatchHost(rowVal); ok && rh.Host == host.Host {
+					if rh.Port == "" || rh.Port == "80" || rh.Port == "443" || rh.Port == host.Port {
+						return rowID, rowSource, rowMeta, true
+					}
+				} else if bare, ok := NormalizeWatchScopeBareHost(rowVal); ok && bare == host.Host {
+					if _, port, _ := splitScopeHostPort(rowVal); port == "" || port == "80" || port == "443" || port == host.Port {
+						return rowID, rowSource, rowMeta, true
+					}
+				}
+			}
+		}
+	}
 	return "", "", "", false
 }
 
 // reactivateWatchAsset clears the out-of-scope flag on a landed host and writes
 // a NEW audit event, so the grouped message announces it again.
-func reactivateWatchAsset(ctx context.Context, db watchScopeDB, targetID, assetID string, host WatchScopeHost, entry WatchScopeEntry) error {
+func reactivateWatchAsset(ctx context.Context, db watchScopeDB, targetID, assetID string, host WatchScopeHost, entry WatchScopeEntry, taskID string, baseline bool) error {
 	meta := map[string]any{
 		"program_id":    entry.ProgramID,
 		"program_asset": entry.AssetID,
 		"out_of_scope":  0,
-		"task_id":       taskIDFromContext(ctx),
+		"task_id":       taskID,
+	}
+	if baseline {
+		meta["baseline"] = true
 	}
 	metaJSON, _ := json.Marshal(meta)
 	if _, err := db.ExecContext(ctx,
@@ -529,16 +649,21 @@ func reactivateWatchAsset(ctx context.Context, db watchScopeDB, targetID, assetI
 		string(metaJSON), assetID); err != nil {
 		return err
 	}
-	return insertWatchScopeEvent(ctx, db, targetID, entry.ProgramID, host.Value, "re_eligible", assetID, metaJSON)
+	return insertWatchScopeEvent(ctx, db, targetID, entry.ProgramID, host.Value, "re_eligible", assetID, metaJSON, baseline)
 }
 
 // insertWatchScopeEvent writes the audit row for a landing. announced stays 0
-// until the grouped message has claimed and sent it.
-func insertWatchScopeEvent(ctx context.Context, db watchScopeDB, targetID, programID, identifier, eventType, assetID string, metadata []byte) error {
+// until the grouped message has claimed and sent it, except on Round-1 baseline
+// landings where announced is written as 1 to suppress initial-import alerts.
+func insertWatchScopeEvent(ctx context.Context, db watchScopeDB, targetID, programID, identifier, eventType, assetID string, metadata []byte, baseline bool) error {
+	announced := 0
+	if baseline {
+		announced = 1
+	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO watch_scope_events(id,target_id,program_id,identifier,event_type,asset_id,detected_at,announced,metadata)
-		VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,0,?)`,
-		uuid.New().String(), targetID, programID, identifier, eventType, assetID, string(metadata))
+		VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,?,?)`,
+		uuid.New().String(), targetID, programID, identifier, eventType, assetID, announced, string(metadata))
 	return err
 }
 
@@ -632,7 +757,7 @@ func SweepWatchScopeOutOfScope(ctx context.Context, db *database.DB, targetID st
 				"out_of_scope": 1, "task_id": taskIDFromContext(ctx),
 			})
 			programID, _ := meta["program_id"].(string)
-			_ = insertWatchScopeEvent(ctx, db, targetID, programID, a.value, "out_of_scope", a.id, eventMeta)
+			_ = insertWatchScopeEvent(ctx, db, targetID, programID, a.value, "out_of_scope", a.id, eventMeta, false)
 		}
 	}
 	if marked > 0 {

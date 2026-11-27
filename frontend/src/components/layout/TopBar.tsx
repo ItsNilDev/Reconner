@@ -112,7 +112,7 @@ function GlobalSearch() {
 }
 
 export const TopBar = () => {
-  const [connected, setConnected] = useState(false)
+  const [connected, setConnected] = useState(() => ws.connected)
   const { toasts, removeToast, setMobileNavOpen } = useUIStore()
   const { info: updateInfo, visible: updateVisible, showDetails: showUpdateDetails } = useUpdateCenter()
   const navigate = useNavigate()
@@ -127,14 +127,35 @@ export const TopBar = () => {
   const [bucket, setBucket] = useState<'all' | 'deep' | 'watch' | 'findings'>('all')
   const bellRef = useRef<HTMLDivElement | null>(null)
 
-  useEffect(() => { const i = setInterval(() => setConnected(ws.connected), 2000); return () => clearInterval(i) }, [])
+  useEffect(() => {
+    setConnected(ws.connected)
+    const offOpen = ws.on('open', () => setConnected(true))
+    const offClose = ws.on('close', () => setConnected(false))
+    return () => { offOpen(); offClose() }
+  }, [])
 
   useEffect(() => {
     let alive = true
-    const load = async () => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let fallbackTimer: ReturnType<typeof setInterval> | null = null
+    let inFlight = false
+    let pending = false
+    let controller: AbortController | null = null
+    let hiddenAt: number | null = document.hidden ? Date.now() : null
+
+    const runLoad = async () => {
+      if (!alive) return
+      if (inFlight) {
+        pending = true
+        return
+      }
+      inFlight = true
+      pending = false
+      const ac = new AbortController()
+      controller = ac
       try {
-        const r = await notifApi.list(bucket)
-        if (alive) {
+        const r = await notifApi.list(bucket, ac.signal)
+        if (alive && !ac.signal.aborted) {
           // The server maps each bucket to its stored notification types. The
           // bell shows every row it returns; the Changes feed has its own
           // allow-list for routine diffs.
@@ -142,25 +163,77 @@ export const TopBar = () => {
           setUnread(r.unread || 0)
         }
       } catch {
-        // A failed read must not fabricate an empty bell. Keep the last good
-        // list; the next poll or event will refresh it (review finding B3).
+        // A failed read (or abort on bucket change) must not fabricate an empty bell.
+      } finally {
+        if (controller === ac) controller = null
+        inFlight = false
+        if (alive && pending) {
+          pending = false
+          void runLoad()
+        }
       }
     }
-    load()
-    const t = setInterval(load, 60 * 1000) // poll every minute
-    // Monitoring persists its notification before emitting these events. Task
-    // completion, new findings and written changes are fallbacks for producers
-    // that only persist a bell row, so the bell never misses a round.
+
+    const scheduleLoad = () => {
+      if (!alive) return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        void runLoad()
+      }, 1500)
+    }
+
+    const loadImmediate = () => {
+      if (!alive) return
+      if (timer) { clearTimeout(timer); timer = null }
+      void runLoad()
+    }
+
+    const syncFallbackPoll = () => {
+      const shouldPoll = !ws.connected && !document.hidden
+      if (shouldPoll && !fallbackTimer) {
+        fallbackTimer = setInterval(() => {
+          if (!ws.connected && !document.hidden) void runLoad()
+        }, 60 * 1000)
+      } else if (!shouldPoll && fallbackTimer) {
+        clearInterval(fallbackTimer)
+        fallbackTimer = null
+      }
+    }
+
+    const onVis = () => {
+      if (document.hidden) {
+        hiddenAt = Date.now()
+        syncFallbackPoll()
+        return
+      }
+      const hiddenMs = hiddenAt !== null ? Date.now() - hiddenAt : 0
+      hiddenAt = null
+      syncFallbackPoll()
+      if (!ws.connected || hiddenMs > 30_000) loadImmediate()
+    }
+
+    loadImmediate()
+    syncFallbackPoll()
+
     const offs = [
-      ws.on('notification_created', load),
-      ws.on('task_finished', load),
-      ws.on('new_vuln_finding', load),
-      ws.on('changes_written', load),
-      ws.on('bounty_scope_change', load),
-      ws.on('bounty_catalog_sync', load),
-      onNotificationsChanged(load),
+      ws.on('notification_created', scheduleLoad),
+      ws.on('bounty_scope_change', scheduleLoad),
+      ws.on('new_vuln_finding', scheduleLoad),
+      ws.on('reconnected', loadImmediate),
+      ws.on('open', syncFallbackPoll),
+      ws.on('close', syncFallbackPoll),
+      onNotificationsChanged(src => { if (src !== 'topbar') scheduleLoad() }),
     ]
-    return () => { alive = false; clearInterval(t); offs.forEach(off => off()) }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      alive = false
+      clearTimeout(timer ?? undefined)
+      clearInterval(fallbackTimer ?? undefined)
+      controller?.abort()
+      offs.forEach(off => off())
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [bucket])
 
   // Close the dropdown on an outside click.
@@ -181,7 +254,7 @@ export const TopBar = () => {
       // The server counts unread across all buckets. Use its value, or the
       // badge would return on the next poll with unread items elsewhere.
       setUnread(typeof res?.unread === 'number' ? res.unread : 0)
-      notifyNotificationsChanged()
+      notifyNotificationsChanged('topbar')
     } catch { /* keep the previous read state on failure */ }
   }
 
@@ -191,7 +264,7 @@ export const TopBar = () => {
       setItems(current => current.map(item => item.id === n.id ? { ...item, is_read: true } : item))
       setUnread(current => Math.max(0, current - 1))
     }
-    openNotification(n, navigate, notifApi.markRead)
+    openNotification(n, navigate, notifApi.markRead, 'topbar')
   }
 
   return (

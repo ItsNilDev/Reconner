@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { dashboard, tasks as tasksApi, type DashboardCharts } from '../lib/api'
+import { tasks as tasksApi } from '../lib/api'
+import { ws } from '../lib/websocket'
+import { useStatsStore } from '../store/stats'
 import { Spinner } from '../components/ui'
 import { Icons } from '../components/layout/Sidebar'
 import { cn, timeAgo } from '../lib/utils'
-import type { DashboardStats, Task } from '../types'
+import type { Task } from '../types'
 
 // Small stroke-icons for the hero KPIs that need a distinct glyph from
 // Sidebar's Icons (findings there is a warning triangle — reused for
@@ -157,20 +159,8 @@ const TASK_STATUS_DOT: Record<string, string> = {
 
 // Recent activity — the last handful of scan tasks, newest first. Gives the
 // dashboard a live pulse of "what has the platform been doing lately".
-function RecentActivity() {
+function RecentActivity({ rows }: { rows: Task[] | null }) {
   const nav = useNavigate()
-  const [rows, setRows] = useState<Task[] | null>(null)
-  useEffect(() => {
-    let alive = true
-    const load = () => tasksApi.list().then(r => {
-      if (!alive) return
-      const sorted = [...r].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 8)
-      setRows(sorted)
-    }).catch(() => { if (alive) setRows([]) })
-    load()
-    const i = setInterval(load, 30000)
-    return () => { alive = false; clearInterval(i) }
-  }, [])
   return (
     <div className="card p-5">
       <div className="flex items-center justify-between mb-3">
@@ -202,47 +192,107 @@ function RecentActivity() {
 
 export default function Dashboard() {
   const nav = useNavigate()
-  const [stats, setStats] = useState<DashboardStats | null>(null)
-  const [charts, setCharts] = useState<DashboardCharts | null>(null)
+  const { stats, charts, chartsError, statsError: error, loading, fetchStats } = useStatsStore()
+  const [recentTasks, setRecentTasks] = useState<Task[] | null>(null)
   const [topSort, setTopSort] = useState<'findings' | 'subdomains' | 'alive_hosts'>('findings')
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [chartsError, setChartsError] = useState('')
-  const load = async () => {
-    setError('')
-    try {
-      const [s, cRes] = await Promise.all([
-        dashboard.stats(),
-        dashboard.charts().then(
-          data => ({ data, err: '' }),
-          e => ({ data: null as DashboardCharts | null, err: e instanceof Error ? e.message : 'Could not load charts' }),
-        ),
-      ])
-      setStats(s)
-      if (cRes.err) {
-        setChartsError(cRes.err)
-      } else {
-        setChartsError('')
-        setCharts(cRes.data)
+
+  const load = useCallback(() => {
+    void fetchStats()
+    tasksApi.list({ limit: '8' })
+      .then(r => {
+        const sorted = [...(r || [])].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 8)
+        setRecentTasks(sorted)
+      })
+      .catch(() => { setRecentTasks(prev => prev ?? []) })
+  }, [fetchStats])
+
+  useEffect(() => {
+    let alive = true
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let hiddenAt: number | null = document.hidden ? Date.now() : null
+
+    const runNow = () => {
+      if (!alive) return
+      if (timer) { clearTimeout(timer); timer = null }
+      load()
+    }
+
+    const schedule = () => {
+      if (!alive) return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        if (alive) load()
+      }, 3000)
+    }
+
+    const onVis = () => {
+      if (document.hidden) {
+        hiddenAt = Date.now()
+        return
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load dashboard statistics')
-    } finally { setLoading(false) }
-  }
-  useEffect(() => { load(); const i = setInterval(load, 30000); return () => clearInterval(i) }, [])
-  if (loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-10 h-10"/></div>
+      const hiddenMs = hiddenAt !== null ? Date.now() - hiddenAt : 0
+      hiddenAt = null
+      if (!ws.connected || hiddenMs > 30_000) runNow()
+    }
+
+    runNow()
+
+    const events = [
+      'target_created', 'target_deleted',
+      'task_created', 'task_started', 'task_finished',
+      'task_cancelled', 'task_paused', 'task_resumed',
+      'new_vuln_finding',
+    ]
+    const offs = [
+      ...events.map(ev => ws.on(ev, schedule)),
+      ws.on('reconnected', runNow),
+    ]
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      alive = false
+      clearTimeout(timer ?? undefined)
+      offs.forEach(off => off())
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [load])
+
+  const hasRunning = (stats?.running_tasks ?? 0) > 0
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null
+    const sync = () => {
+      if (timer) { clearInterval(timer); timer = null }
+      if (document.hidden) return
+      if (hasRunning) {
+        timer = setInterval(() => { if (!document.hidden) load() }, 30_000)
+      } else if (!ws.connected) {
+        timer = setInterval(() => { if (!document.hidden && !ws.connected) load() }, 60_000)
+      }
+    }
+    sync()
+    const offOpen = ws.on('open', sync)
+    const offClose = ws.on('close', sync)
+    document.addEventListener('visibilitychange', sync)
+    return () => {
+      clearInterval(timer ?? undefined)
+      offOpen()
+      offClose()
+      document.removeEventListener('visibilitychange', sync)
+    }
+  }, [hasRunning, load])
+
+  if (loading || (!stats && !error)) return <div className="flex items-center justify-center h-64"><Spinner className="w-10 h-10"/></div>
   if (!stats) {
     return (
       <div className="card p-6 max-w-lg mx-auto mt-10 space-y-3 text-center">
         <p className="text-sm font-semibold text-severity-high">Failed to load dashboard</p>
         <p className="text-xs text-text-muted">{error || 'Unable to load dashboard statistics.'}</p>
         <div className="pt-1">
-          <button onClick={() => { setLoading(true); load() }} className="btn-secondary text-xs px-4 py-2">Retry</button>
+          <button onClick={load} className="btn-secondary text-xs px-4 py-2">Retry</button>
         </div>
       </div>
     )
   }
-
   const chartsUnavailable = !charts
   const sev = charts?.severity_breakdown || []
   const totalVulns = sev.reduce((s, d) => s + d.count, 0)
@@ -346,7 +396,7 @@ export default function Dashboard() {
           </div>
         )}
       </div>
-      <RecentActivity />
+      <RecentActivity rows={recentTasks} />
       </div>
 
       {/* Recon detail */}

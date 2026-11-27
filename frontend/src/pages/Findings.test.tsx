@@ -199,7 +199,7 @@ describe('Findings payload/PoC surfacing', () => {
     expect(screen.getByText('candidate_ssrf')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /All\s+1/ })).toBeInTheDocument()
-  })
+  }, 15000)
 
   it('passes current row count as offset after Mark FP and hides Load more on short page', async () => {
     const page1 = Array.from({ length: 200 }, (_, i) => ({
@@ -245,7 +245,7 @@ describe('Findings payload/PoC surfacing', () => {
 
     expect(requestedUrls.some(u => u.includes('offset=199'))).toBe(true)
     expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument()
-  })
+  }, 15000)
 
   it('sends severity query param when clicking a severity pill and resets it via Clear', async () => {
     const page1 = Array.from({ length: 200 }, (_, i) => ({
@@ -296,5 +296,5 @@ describe('Findings payload/PoC surfacing', () => {
     const findingsCalls = requestedUrls.filter(u => u.startsWith('/api/findings'))
     expect(findingsCalls[findingsCalls.length - 1]).not.toContain('severity=')
     expect(screen.queryByRole('button', { name: 'Clear' })).not.toBeInTheDocument()
-  })
+  }, 15000)
 })

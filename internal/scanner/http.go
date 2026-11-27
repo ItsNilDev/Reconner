@@ -462,10 +462,10 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		if probed == 0 {
 			logFn("info", "watch_scope", "HTTP phase produced no result: nothing landed this round")
 		} else {
-			// Landing is a silent audit write now. The host becomes approved
-			// scope, but no bell, feed row, Telegram message or socket event is
-			// produced here; those belong to the new-host emitter after this
-			// phase and to real program scope changes.
+			// Round-1 baseline landings write announced=1 (metadata.baseline=true)
+			// silently; Round-2+ landings write announced=0 audit rows so
+			// flushScopeLandings can emit the grouped scope-landed alert once
+			// the round finishes.
 			LandWatchScopeHosts(ctx, s.db, targetID, probedHosts, logFn)
 		}
 	}

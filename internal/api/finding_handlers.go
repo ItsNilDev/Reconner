@@ -46,20 +46,43 @@ func (h *Handler) handleSetFindingTriage(w http.ResponseWriter, r *http.Request)
 	h.writeSuccess(w, map[string]string{"triage": req.Triage})
 }
 
-func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
+func targetListPagination(r *http.Request, defaultLimit, maxLimit int) (page, limit, offset int) {
 	q := r.URL.Query()
-	page, _ := strconv.Atoi(q.Get("page"))
+	page, _ = strconv.Atoi(q.Get("page"))
 	if page < 1 {
 		page = 1
 	}
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	limit, _ = strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = defaultLimit
 	}
-	offset := (page - 1) * limit
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	offset = (page - 1) * limit
+	if rawOffset := strings.TrimSpace(q.Get("offset")); rawOffset != "" {
+		if parsed, err := strconv.Atoi(rawOffset); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+	return page, limit, offset
+}
+
+func escapeFindingLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + r.Replace(strings.ToLower(s)) + "%"
+}
+
+func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	q := r.URL.Query()
+	page, limit, offset := targetListPagination(r, 200, 500)
 	alive := q.Get("alive")
-	search := q.Get("search")
+	search := strings.TrimSpace(q.Get("search"))
+	if search == "" {
+		search = strings.TrimSpace(q.Get("q"))
+	}
+	newOnly := q.Get("new_only") == "1" || strings.EqualFold(q.Get("new_only"), "true")
 
 	where := " WHERE target_id = ? AND COALESCE(catchall,0) = 0"
 	args := []any{id}
@@ -69,11 +92,27 @@ func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
 	} else if alive == "false" {
 		where += " AND is_alive = 0"
 	}
-
-	if search != "" {
-		where += " AND subdomain LIKE ?"
-		args = append(args, "%"+search+"%")
+	if newOnly {
+		where += " AND created_at >= datetime('now', '-24 hours')"
 	}
+	if search != "" {
+		like := escapeFindingLike(search)
+		where += ` AND (subdomain LIKE ? ESCAPE '\' OR ip LIKE ? ESCAPE '\' OR page_title LIKE ? ESCAPE '\')`
+		args = append(args, like, like, like)
+	}
+
+	dir := "ASC"
+	if strings.EqualFold(strings.TrimSpace(q.Get("dir")), "desc") {
+		dir = "DESC"
+	}
+	orderCol := "subdomain"
+	switch strings.ToLower(strings.TrimSpace(q.Get("sort"))) {
+	case "created":
+		orderCol = "created_at"
+	case "status":
+		orderCol = "COALESCE(status_code, 0)"
+	}
+	orderBy := fmt.Sprintf(" ORDER BY %s %s, id %s", orderCol, dir, dir)
 
 	var total int
 	if err := h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM subdomains"+where, args...).Scan(&total); err != nil {
@@ -84,7 +123,7 @@ func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
 	query := `SELECT id, target_id, subdomain, ip, is_alive, status_code, page_title,
 		has_https, has_http, response_time_ms, technologies, server, framework, cdn, waf,
 		COALESCE(source,'dns'), last_seen, created_at
-		FROM subdomains` + where + " ORDER BY subdomain LIMIT ? OFFSET ?"
+		FROM subdomains` + where + orderBy + " LIMIT ? OFFSET ?"
 	dataArgs := append(append([]any{}, args...), limit, offset)
 
 	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)
@@ -124,17 +163,14 @@ func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	q := r.URL.Query()
-	page, _ := strconv.Atoi(q.Get("page"))
-	if page < 1 {
-		page = 1
+	page, limit, offset := targetListPagination(r, 200, 500)
+	search := strings.TrimSpace(q.Get("search"))
+	if search == "" {
+		search = strings.TrimSpace(q.Get("q"))
 	}
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	offset := (page - 1) * limit
-	search := q.Get("search")
-	statusFilter := q.Get("status")
+	statusFilter := strings.TrimSpace(q.Get("status"))
+	statusClass := strings.TrimSpace(q.Get("status_class"))
+	newOnly := q.Get("new_only") == "1" || strings.EqualFold(q.Get("new_only"), "true")
 
 	// A seed becomes an observed service only after a valid code and a probe
 	// tier are committed with it. Status-zero seeds stay out of this view.
@@ -144,8 +180,8 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 	args := []any{id}
 
 	if search != "" {
-		where += " AND (url LIKE ? OR title LIKE ?)"
-		like := "%" + search + "%"
+		like := escapeFindingLike(search)
+		where += ` AND (url LIKE ? ESCAPE '\' OR title LIKE ? ESCAPE '\')`
 		args = append(args, like, like)
 	}
 
@@ -157,6 +193,38 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 			args = append(args, statusCode)
 		}
 	}
+	switch statusClass {
+	case "2":
+		where += " AND status_code BETWEEN ? AND ?"
+		args = append(args, 200, 299)
+	case "3":
+		where += " AND status_code BETWEEN ? AND ?"
+		args = append(args, 300, 399)
+	case "4":
+		where += " AND status_code BETWEEN ? AND ?"
+		args = append(args, 400, 499)
+	case "5":
+		where += " AND status_code BETWEEN ? AND ?"
+		args = append(args, 500, 599)
+	}
+	if newOnly {
+		where += " AND created_at >= datetime('now', '-24 hours')"
+	}
+
+	dir := "ASC"
+	if strings.EqualFold(strings.TrimSpace(q.Get("dir")), "desc") {
+		dir = "DESC"
+	}
+	orderCol := "url"
+	switch strings.ToLower(strings.TrimSpace(q.Get("sort"))) {
+	case "created":
+		orderCol = "created_at"
+	case "size":
+		orderCol = "content_length"
+	case "status":
+		orderCol = "status_code"
+	}
+	orderBy := fmt.Sprintf(" ORDER BY %s %s, id %s", orderCol, dir, dir)
 
 	var total int
 	if err := h.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM http_services"+where, args...).Scan(&total); err != nil {
@@ -167,7 +235,7 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 	query := `SELECT id, target_id, url, status_code, title, server, content_type,
 		content_length, redirect_url, technologies, response_time_ms, last_seen, created_at,
 		COALESCE(waf,''), COALESCE(cms,'')
-		FROM http_services` + where + " ORDER BY url LIMIT ? OFFSET ?"
+		FROM http_services` + where + orderBy + " LIMIT ? OFFSET ?"
 	dataArgs := append(append([]any{}, args...), limit, offset)
 
 	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)
@@ -265,14 +333,13 @@ func (h *Handler) handleListJSFindings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleListParameters(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	reflected := r.URL.Query().Get("reflected")
-	search := r.URL.Query().Get("search")
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
+	q := r.URL.Query()
+	reflected := q.Get("reflected")
+	search := strings.TrimSpace(q.Get("search"))
+	if search == "" {
+		search = strings.TrimSpace(q.Get("q"))
 	}
-	limit := 200
-	offset := (page - 1) * limit
+	page, limit, offset := targetListPagination(r, 200, 500)
 
 	where := " WHERE target_id = ?"
 	args := []any{id}
@@ -281,8 +348,9 @@ func (h *Handler) handleListParameters(w http.ResponseWriter, r *http.Request) {
 		where += " AND is_reflected = 1"
 	}
 	if search != "" {
-		where += " AND parameter LIKE ?"
-		args = append(args, "%"+search+"%")
+		like := escapeFindingLike(search)
+		where += ` AND (parameter LIKE ? ESCAPE '\' OR url LIKE ? ESCAPE '\')`
+		args = append(args, like, like)
 	}
 
 	var total int
@@ -292,7 +360,7 @@ func (h *Handler) handleListParameters(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `SELECT id, target_id, url, parameter, value, source, is_reflected, created_at
-		FROM parameters` + where + " ORDER BY parameter LIMIT ? OFFSET ?"
+		FROM parameters` + where + " ORDER BY parameter ASC, id ASC LIMIT ? OFFSET ?"
 	dataArgs := append(append([]any{}, args...), limit, offset)
 
 	rows, err := h.db.QueryContext(r.Context(), query, dataArgs...)

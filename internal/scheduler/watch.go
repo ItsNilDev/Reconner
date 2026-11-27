@@ -393,9 +393,21 @@ func (s *Scheduler) insertNotification(targetID, typ, title, body, severity stri
 	if targetID == "" {
 		return
 	}
-	_, _ = s.db.Exec(`INSERT INTO notifications(id,target_id,type,title,body,url,severity,is_read)
+	if _, err := s.db.Exec(`INSERT INTO notifications(id,target_id,type,title,body,url,severity,is_read)
 		VALUES(?,?,?,?,?,?,?,0)`,
-		uuid.NewString(), targetID, typ, title, body, "/targets/"+targetID, severity)
+		uuid.NewString(), targetID, typ, title, body, "/targets/"+targetID, severity); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("insert notification failed", "target_id", targetID, "type", typ, "error", err)
+		}
+		return
+	}
+	if s.hub != nil {
+		s.hub.Broadcast("notification_created", map[string]any{
+			"target_id": targetID,
+			"type":      typ,
+			"severity":  severity,
+		})
+	}
 }
 
 // watchProjectPaused reports whether the operator paused watching.

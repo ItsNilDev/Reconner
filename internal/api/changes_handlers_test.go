@@ -1671,3 +1671,57 @@ func TestChangesVirtualCategoriesStatusTitleContentAndPrefixParsing(t *testing.T
 		}
 	})
 }
+
+func TestListChangesExcludesRound1WatchScopeBaselineAndHandlesMalformedMetadata(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	if _, err := h.db.Exec(`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, adminID); err != nil {
+		t.Fatal(err)
+	}
+	rows := []string{
+		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+		 VALUES ('wse-r1','t1','p1','r1.one.example','landed','a1','{"task_id":"task-r1","baseline":true}','2026-03-01 00:00:00')`,
+		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+		 VALUES ('wse-r2','t1','p1','r2.one.example','landed','a2','{"task_id":"task-r2"}','2026-03-02 00:00:00')`,
+		`INSERT INTO watch_scope_events (id,target_id,program_id,identifier,event_type,asset_id,metadata,detected_at)
+		 VALUES ('wse-bad','t1','p1','bad.one.example','re_eligible','a3','{not-valid-json','2026-03-03 00:00:00')`,
+	}
+	for _, stmt := range rows {
+		if _, err := h.db.Exec(stmt); err != nil {
+			t.Fatalf("insert failed: %v", err)
+		}
+	}
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serveChanges(t, h, sid, "/api/changes?default_view=1", nil, h.handleListChanges)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var env changesEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := map[string]ChangeEntry{}
+	for _, e := range env.Data {
+		got[e.ID] = e
+	}
+	if _, found := got["wse-r1"]; found {
+		t.Errorf("baseline row wse-r1 must be excluded from /api/changes?default_view=1")
+	}
+	r2, ok := got["wse-r2"]
+	if !ok {
+		t.Fatalf("expected round-2 row wse-r2 in /api/changes?default_view=1, got %+v", env.Data)
+	}
+	if r2.TaskID != "task-r2" {
+		t.Errorf("wse-r2 TaskID = %q, want task-r2", r2.TaskID)
+	}
+	bad, ok := got["wse-bad"]
+	if !ok {
+		t.Fatalf("expected malformed-metadata non-baseline row wse-bad, got %+v", env.Data)
+	}
+	if bad.TaskID != "" {
+		t.Errorf("wse-bad TaskID = %q, want empty", bad.TaskID)
+	}
+}

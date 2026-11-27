@@ -33,60 +33,6 @@ async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
   return json as T
 }
 
-// fetchAllPaged walks a {data,total,page,limit} paginated endpoint and returns
-// EVERY row, not just the server's default first page. Several list endpoints
-// (subdomains, http-services) cap the default page at 100 and the plain req()
-// above discards `total`, so a target with hundreds of hosts silently showed
-// only the first 100. This loops at the server's max page size (500) until it
-// has pulled `total` rows.
-async function fetchAllPaged<T>(path: string, extra?: Record<string, string>): Promise<T[]> {
-  const pageSize = 500
-  let page = 1
-  let fetched = 0
-  const all: T[] = []
-  const seen = new Set<string>()
-  for (;;) {
-    const qs = new URLSearchParams({ ...(extra || {}), page: String(page), limit: String(pageSize) })
-    const res = await fetch(`${BASE}${path}?${qs.toString()}`, {
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-    })
-    const text = await res.text()
-    if (!res.ok) {
-      let msg = text
-      try { msg = JSON.parse(text).error || text } catch { /**/ }
-      throw new APIError(res.status, msg)
-    }
-    const json = text ? JSON.parse(text) : {}
-    const data: T[] = (json && Array.isArray(json.data)) ? json.data : []
-    fetched += data.length
-    for (const row of data) {
-      const id = (row as { id?: unknown } | null)?.id
-      if (id === undefined || id === null) {
-        all.push(row)
-        continue
-      }
-      const key = String(id)
-      if (!seen.has(key)) {
-        seen.add(key)
-        all.push(row)
-      }
-    }
-    const total = (json && typeof json.total === 'number') ? json.total : fetched
-    if (data.length === 0 || fetched >= total) break
-    page++
-    if (page > 200) {
-      // Hard safety stop: 200 * 500 = 100k rows. Never truncate silently — a
-      // short Changes/URLs list must at least be visible in the console.
-      if (fetched < total) {
-        console.warn(`[api] ${path}: stopped at ${fetched}/${total} rows (200-page cap)`)
-      }
-      break
-    }
-  }
-  return all
-}
-
 export const auth = {
   login: (username: string, password: string) =>
     req<{message: string}>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
@@ -123,6 +69,7 @@ export interface DashboardCharts {
 }
 
 export const dashboard = {
+  badges: () => req<{ targets: number; running_tasks: number }>('/dashboard/badges'),
   stats: () => req<DashboardStats>('/dashboard/stats'),
   charts: () => req<DashboardCharts>('/dashboard/charts'),
 }
@@ -335,12 +282,23 @@ export interface BountyFavorite {
 }
 
 export const findings = {
-  subdomains: (id: string, p?: Record<string,string>) => fetchAllPaged<Subdomain>(`/targets/${id}/subdomains`, p),
-  httpServices: (id: string) => fetchAllPaged<HTTPService>(`/targets/${id}/http-services`),
+  subdomainsPage: (
+    id: string,
+    params?: Record<string, string | number | boolean | undefined>,
+    signal?: AbortSignal,
+  ) => fetchPage<Subdomain>(`/targets/${id}/subdomains`, params, signal),
+  httpServicesPage: (
+    id: string,
+    params?: Record<string, string | number | boolean | undefined>,
+    signal?: AbortSignal,
+  ) => fetchPage<HTTPService>(`/targets/${id}/http-services`, params, signal),
   jsFiles: (id: string) => req<JSFile[]>(`/targets/${id}/js-files`),
   jsFindings: (id: string) => req<JSFinding[]>(`/targets/${id}/js-findings`),
-  parameters: (id: string, reflectedOnly = true) =>
-    req<Parameter[]>(`/targets/${id}/parameters${reflectedOnly ? '?reflected=true' : ''}`),
+  parametersPage: (
+    id: string,
+    params?: Record<string, string | number | boolean | undefined>,
+    signal?: AbortSignal,
+  ) => fetchPage<Parameter>(`/targets/${id}/parameters`, params, signal),
   directoryFindings: (id: string) => req<DirectoryFinding[]>(`/targets/${id}/directory-findings`),
   adminPanels: (id: string) => req<AdminPanelFinding[]>(`/targets/${id}/admin-panels`),
   backupFindings: (id: string) => req<BackupFinding[]>(`/targets/${id}/backup-findings`),
@@ -420,16 +378,23 @@ export interface PagedResult<T> {
   limit: number
 }
 
-// fetchPage returns one server page with its total. The global Changes view
-// uses this so a filter change or WS event costs one request, not a full walk
-// of every page. The per-target view still uses fetchAllPaged.
-async function fetchPage<T>(path: string, extra?: Record<string, string | number>): Promise<PagedResult<T>> {
-  const params: Record<string, string> = {}
-  for (const [key, value] of Object.entries(extra || {})) params[key] = String(value)
-  const qs = new URLSearchParams(params)
-  const res = await fetch(`${BASE}${path}?${qs.toString()}`, {
+// fetchPage returns one server page with its total.
+async function fetchPage<T>(
+  path: string,
+  extra?: Record<string, string | number | boolean | undefined>,
+  signal?: AbortSignal,
+): Promise<PagedResult<T>> {
+  const qs = new URLSearchParams()
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value !== undefined && value !== '') qs.set(key, String(value))
+    }
+  }
+  const q = qs.toString()
+  const res = await fetch(`${BASE}${path}${q ? '?' + q : ''}`, {
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
+    signal,
   })
   const text = await res.text()
   if (!res.ok) {
@@ -446,13 +411,9 @@ async function fetchPage<T>(path: string, extra?: Record<string, string | number
   }
 }
 
-// Unified Changes feed. The per-target tab loads all pages for one target;
-// the global page fetches one server page at a time and appends on "Load more".
+// Unified Changes feed — fetches one server page at a time.
 export const changes = {
   listPage: (params?: Record<string, string>) => fetchPage<ChangeEntry>('/changes', params),
-  list: (params?: Record<string, string>) => fetchAllPaged<ChangeEntry>('/changes', params),
-  forTarget: (id: string, params?: Record<string, string>) =>
-    fetchAllPaged<ChangeEntry>(`/targets/${id}/changes`, params),
   forTargetPage: (id: string, params?: Record<string, string>) =>
     fetchPage<ChangeEntry>(`/targets/${id}/changes`, params),
   setSeen: (ids: string[], seen: boolean) =>
@@ -645,9 +606,9 @@ export interface Notification {
 export const notifications = {
   // type: 'all' | 'deep' | 'watch' | 'findings' — the bucket maps to a list of
   // stored notification types server-side.
-  list: (type?: string) => {
+  list: (type?: string, signal?: AbortSignal) => {
     const q = type ? '?type=' + encodeURIComponent(type) : ''
-    return req<{ notifications: Notification[]; unread: number }>(`/notifications${q}`)
+    return req<{ notifications: Notification[]; unread: number }>(`/notifications${q}`, { signal })
   },
   markRead: (ids?: string[], type?: string) =>
     req<{ message: string; unread: number }>('/notifications/read', { method: 'POST', body: JSON.stringify({ ids: ids || [], type: type || '' }) }),

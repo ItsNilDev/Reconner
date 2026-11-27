@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -310,5 +311,156 @@ func TestLoadWatchEligibleScopeInfersWildcardWhenFlagZero(t *testing.T) {
 	}
 	if _, ok := byID["a-path-wild"]; ok {
 		t.Fatal("path wildcard https://acme.test/* must not be loaded into watch scope")
+	}
+}
+
+func TestLandWatchScopeHostsRound1BaselineAndRound2Incremental(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "watch-scope-baseline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`INSERT INTO targets(id,domain,watch_only) VALUES('t-base','example.test',1)`,
+		`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES('p-base','hackerone','p-base','acme','Acme')`,
+		`INSERT INTO project_programs(target_id,program_id) VALUES('t-base','p-base')`,
+		`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard) VALUES('a-wild','p-base','ext-wild','*.example.test','domain',1)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	// Round 1: no finished watch_scan task, no watch_scope_baselined -> silent baseline.
+	r1 := LandWatchScopeHosts(WithTaskID(ctx, "round-1"), db, "t-base", []string{"alpha.example.test"}, nil)
+	if len(r1) != 1 || r1[0] != "alpha.example.test" {
+		t.Fatalf("round 1 landed = %v, want [alpha.example.test]", r1)
+	}
+	var assetSource, approval string
+	if err := db.QueryRow(`SELECT source, approval_status FROM assets WHERE target_id='t-base' AND value='alpha.example.test'`).Scan(&assetSource, &approval); err != nil {
+		t.Fatalf("query round 1 asset: %v", err)
+	}
+	if assetSource != "watch:scope" || approval != "approved" {
+		t.Fatalf("round 1 asset source/approval = %q/%q, want watch:scope/approved", assetSource, approval)
+	}
+	var announced int
+	var metaRaw string
+	if err := db.QueryRow(`SELECT announced, COALESCE(metadata,'') FROM watch_scope_events WHERE target_id='t-base' AND identifier='alpha.example.test'`).Scan(&announced, &metaRaw); err != nil {
+		t.Fatalf("query round 1 event: %v", err)
+	}
+	if announced != 1 {
+		t.Fatalf("round 1 announced = %d, want 1", announced)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(metaRaw), &meta); err != nil {
+		t.Fatalf("unmarshal round 1 metadata %q: %v", metaRaw, err)
+	}
+	if baseline, _ := meta["baseline"].(bool); !baseline {
+		t.Fatalf("round 1 metadata.baseline = %v, want true (meta=%s)", meta["baseline"], metaRaw)
+	}
+
+	// Round 2 (after finished watch_scan task or watch_scope_baselined=1): lands new host with announced=0.
+	if _, err := db.Exec(`INSERT INTO tasks(id,target_id,type,status,priority,modules,total) VALUES('round-1','t-base','watch_scan','finished',1,'[]',2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE targets SET watch_scope_baselined=1 WHERE id='t-base'`); err != nil {
+		t.Fatal(err)
+	}
+	r2 := LandWatchScopeHosts(WithTaskID(ctx, "round-2"), db, "t-base", []string{"alpha.example.test", "beta.example.test"}, nil)
+	if len(r2) != 1 || r2[0] != "beta.example.test" {
+		t.Fatalf("round 2 landed = %v, want [beta.example.test]", r2)
+	}
+	var r2Announced int
+	var r2MetaRaw string
+	if err := db.QueryRow(`SELECT announced, COALESCE(metadata,'') FROM watch_scope_events WHERE target_id='t-base' AND identifier='beta.example.test'`).Scan(&r2Announced, &r2MetaRaw); err != nil {
+		t.Fatalf("query round 2 event: %v", err)
+	}
+	if r2Announced != 0 {
+		t.Fatalf("round 2 announced = %d, want 0", r2Announced)
+	}
+	var r2Meta map[string]any
+	if err := json.Unmarshal([]byte(r2MetaRaw), &r2Meta); err != nil {
+		t.Fatalf("unmarshal round 2 metadata %q: %v", r2MetaRaw, err)
+	}
+	if _, hasBaseline := r2Meta["baseline"]; hasBaseline {
+		t.Fatalf("round 2 metadata unexpectedly has baseline=%v", r2Meta["baseline"])
+	}
+}
+
+func TestLookupWatchAssetCanonicalMatching(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "watch-scope-lookup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`INSERT INTO targets(id,domain,watch_only) VALUES('t-canon','example.com',1)`,
+		`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES('p-canon','hackerone','p-canon','canon','Canon')`,
+		`INSERT INTO project_programs(target_id,program_id) VALUES('t-canon','p-canon')`,
+		`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard) VALUES
+			('a-wild','p-canon','ext-wild','*.example.com','domain',1),
+			('a-exact','p-canon','ext-exact','example.com','domain',0)`,
+		`INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status) VALUES
+			('own-1','t-canon','App','https://App.Example.com/','web','url','bounty:hackerone','','approved'),
+			('own-2','t-canon','Apex','https://example.com:443/','web','url','manual','','approved'),
+			('own-3','t-canon','Path','https://path.example.com/api','web','url','manual','','approved')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	landed := LandWatchScopeHostsWithBaseline(ctx, db, "t-canon", []string{
+		"app.example.com",
+		"example.com",
+		"path.example.com",
+	}, false, nil)
+	if len(landed) != 1 || landed[0] != "path.example.com" {
+		t.Fatalf("landed = %v, want only [path.example.com] (canonical matches must not duplicate)", landed)
+	}
+	var watchScopeCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM assets WHERE target_id='t-canon' AND source='watch:scope'`).Scan(&watchScopeCount); err != nil {
+		t.Fatal(err)
+	}
+	if watchScopeCount != 1 {
+		t.Fatalf("watch:scope asset count = %d, want 1", watchScopeCount)
+	}
+}
+
+func TestIsWatchBaselineRoundMalformedJSON(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "watch-scope-json.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`INSERT INTO targets(id,domain,watch_scope_baselined) VALUES('t-json','json.test',0)`,
+		`INSERT INTO watch_scope_events(id,target_id,identifier,event_type,announced,metadata) VALUES
+			('we-bad','t-json','a.json.test','landed',1,'{bad-json'),
+			('we-empty','t-json','b.json.test','out_of_scope',1,'')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	baseline, err := isWatchBaselineRound(ctx, db, "t-json", "round-2")
+	if err != nil {
+		t.Fatalf("isWatchBaselineRound returned error on malformed JSON: %v", err)
+	}
+	if baseline {
+		t.Fatalf("isWatchBaselineRound = true, want false when prior landed event exists")
 	}
 }

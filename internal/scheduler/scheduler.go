@@ -382,6 +382,15 @@ func New(db *database.DB, hub *websocket.Hub, cfg *config.Config, log *logger.Lo
 	s.wpScanner = scanner.NewWordPressScanner(db, cfg, log, bc)
 	s.bountyCatalog = bounty.NewService(db, log)
 	s.bountyCatalog.SetScopeEventNotify(s.notifyBountyScopeEvent)
+	s.bountyCatalog.SetScopeNotificationCallback(func(targetID, typ, severity string) {
+		if s.hub != nil {
+			s.hub.Broadcast("notification_created", map[string]any{
+				"target_id": targetID,
+				"type":      typ,
+				"severity":  severity,
+			})
+		}
+	})
 
 	return s
 }
@@ -395,16 +404,17 @@ func (s *Scheduler) BountyCatalog() *bounty.Service { return s.bountyCatalog }
 // a surfaced finding. Per-chat preferences own alert volume; the scheduler must
 // not silently hide a valid low/medium finding from Telegram.
 func (s *Scheduler) broadcastAndScore(event string, data any) {
-	s.hub.Broadcast(event, data)
-
-	if s.notifier == nil {
-		return
-	}
-	m, ok := data.(map[string]any)
-	if !ok {
-		return
-	}
-	if event == "notification_created" {
+	if event != "new_vuln_finding" {
+		if s.hub != nil {
+			s.hub.Broadcast(event, data)
+		}
+		if s.notifier == nil {
+			return
+		}
+		m, ok := data.(map[string]any)
+		if !ok || event != "notification_created" {
+			return
+		}
 		targetID, _ := m["target_id"].(string)
 		changeType, _ := m["type"].(string)
 		if targetID == "" {
@@ -430,9 +440,6 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		} else {
 			_ = s.db.QueryRow(`SELECT COALESCE(title,''),COALESCE(url,'') FROM notifications
 				WHERE target_id=? AND type=? ORDER BY created_at DESC LIMIT 1`, targetID, changeType).Scan(&title, &rawURL)
-		}
-		if s.notifier == nil {
-			return
 		}
 		// A deep DNS discovery reaches the New hosts channel with the event id
 		// as its outbox key. Replaying the same event cannot enqueue a second
@@ -470,7 +477,12 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		}
 		return
 	}
-	if event != "new_vuln_finding" {
+
+	m, ok := data.(map[string]any)
+	if !ok {
+		if s.hub != nil {
+			s.hub.Broadcast(event, data)
+		}
 		return
 	}
 	targetID, _ := m["target_id"].(string)
@@ -478,6 +490,9 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 	url, _ := m["url"].(string)
 	param, _ := m["parameter"].(string)
 	if targetID == "" {
+		if s.hub != nil {
+			s.hub.Broadcast(event, data)
+		}
 		return
 	}
 
@@ -496,6 +511,9 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 			ORDER BY created_at DESC LIMIT 1`, targetID, vulnType, url, param).Scan(&findingID, &severity)
 	}
 	if err != nil {
+		if s.hub != nil {
+			s.hub.Broadcast(event, data)
+		}
 		return
 	}
 	if err := s.db.QueryRow(`SELECT COALESCE(NULLIF(TRIM(name),''), domain) FROM targets WHERE id=?`, targetID).Scan(&domain); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -503,11 +521,10 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 			s.logger.Warn("finding target display lookup failed", "target_id", targetID, "error", err)
 		}
 	}
-	// A verified finding gets a durable bell row as well as a Telegram alert.
-	// The bell had no subscription to finding events, so without this row the
-	// Findings bucket stayed empty for live detections (B2). Key the row on the
-	// finding id so a repeated broadcast cannot create a duplicate bell entry.
-	_, _ = s.db.Exec(`INSERT INTO notifications
+	// A verified finding gets a durable bell row even without Telegram
+	// configured, persisted before broadcasting so bell fetches see it. Key
+	// the row on the finding id so repeated broadcasts cannot duplicate it.
+	res, insertErr := s.db.Exec(`INSERT INTO notifications
 		(id,target_id,type,title,body,url,severity,is_read,metadata,change_id)
 		SELECT ?,?,?,?,?,?,?,0,'{}',?
 		WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE change_id=? AND type='new_vuln_finding')`,
@@ -515,7 +532,22 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		"Verified finding: "+vulnType,
 		fmt.Sprintf("%s finding on %s", strings.ToUpper(severity), url),
 		"/targets/"+targetID, severity, findingID, findingID)
-	s.notifier.NotifyNewVuln(findingID, targetID, domain, vulnType, severity, url, param)
+	if s.hub != nil {
+		s.hub.Broadcast(event, data)
+		if insertErr == nil {
+			if inserted, _ := res.RowsAffected(); inserted > 0 {
+				s.hub.Broadcast("notification_created", map[string]any{
+					"target_id": targetID,
+					"type":      "new_vuln_finding",
+					"severity":  severity,
+					"change_id": findingID,
+				})
+			}
+		}
+	}
+	if s.notifier != nil {
+		s.notifier.NotifyNewVuln(findingID, targetID, domain, vulnType, severity, url, param)
+	}
 }
 
 // EmitVulnFinding broadcasts a vuln-finding event through the same scoring +
@@ -2847,6 +2879,9 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// lane is saturated.
 	if taskType == watchScanType {
 		s.applyWatchTerminalRules(targetID, finalStatus)
+		if finalStatus == "finished" {
+			_, _ = s.db.Exec(`UPDATE targets SET watch_scope_baselined = 1 WHERE id = ? AND COALESCE(watch_scope_baselined, 0) = 0`, targetID)
+		}
 	}
 	terminalTargetStatus := "idle"
 	if finalStatus == "failed" {
@@ -4244,7 +4279,9 @@ func (s *Scheduler) notifyScanDone(taskID, targetID, domain, taskType, status st
 		// own audit rows, not from a global count.
 		var newHosts, landed int
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE task_id=? AND change_type='new_subdomain'`, taskID).Scan(&newHosts)
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_scope_events WHERE target_id=? AND event_type IN ('landed','re_eligible') AND detected_at>=?`,
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM watch_scope_events
+			WHERE target_id=? AND event_type IN ('landed','re_eligible') AND detected_at>=?
+			AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.baseline') ELSE 0 END, 0) <> 1`,
 			targetID, startedAt.UTC().Format("2006-01-02 15:04:05")).Scan(&landed)
 		stats["new_hosts"] = newHosts
 		stats["landed"] = landed

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { bounty as bountyApi } from '../lib/api'
 import { Badge, Button, EmptyState, Input, Modal, Skeleton } from '../components/ui'
+import { ProgramLogo } from '../components/ui/ProgramLogo'
 import { useAuthStore } from '../store/auth'
 import { useUIStore } from '../store/ui'
 import { cn, timeAgo } from '../lib/utils'
@@ -611,7 +612,7 @@ function ProgramCard({ program:p, favorite, selected, onToggleSelect, onOpen, on
       </button>
     </div>
     <button type="button" onClick={onOpen} className="w-full text-left">
-      <div className="flex items-start gap-3"><div className="w-10 h-10 rounded-xl border border-white/[.07] bg-white/[.03] grid place-items-center shrink-0 overflow-hidden">{p.logo_url?<img src={p.logo_url} alt="" className="w-full h-full object-contain" loading="lazy"/>:<span className="text-sm font-bold text-text-muted">{p.name.slice(0,1).toUpperCase()}</span>}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-1.5 flex-wrap"><h2 className="text-sm font-semibold truncate">{p.name}</h2><span className={cn('text-[9px] px-1.5 py-0.5 rounded border shrink-0',providerTone(p.provider))}>{providerLabel(p.provider)}</span>{p.status && p.status !== 'live' && <span className="text-[9px] px-1.5 py-0.5 rounded border border-white/10 bg-white/5 text-text-muted shrink-0 capitalize">{p.status}</span>}</div><p className="text-[10px] text-text-muted truncate mt-0.5">{p.industry || p.handle}</p></div></div>
+      <div className="flex items-start gap-3"><ProgramLogo src={p.logo_url} name={p.name} size="md" /><div className="min-w-0 flex-1"><div className="flex items-center gap-1.5 flex-wrap"><h2 className="text-sm font-semibold truncate">{p.name}</h2><span className={cn('text-[9px] px-1.5 py-0.5 rounded border shrink-0',providerTone(p.provider))}>{providerLabel(p.provider)}</span>{p.status && p.status !== 'live' && <span className="text-[9px] px-1.5 py-0.5 rounded border border-white/10 bg-white/5 text-text-muted shrink-0 capitalize">{p.status}</span>}</div><p className="text-[10px] text-text-muted truncate mt-0.5">{p.industry || p.handle}</p></div></div>
       <p className="mt-3 text-[11px] text-text-secondary line-clamp-2 min-h-8">{p.description || 'Open the official scope and select assets for a project.'}</p>
       <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-white/[.05]"><Metric value={p.details_loaded?String(p.in_scope_count):'…'} label="assets"/><Metric value={String(p.wildcard_count)} label="wildcards"/><Metric value={reward} label={p.min_reward_cents > 0 ? 'reward range' : 'max reward'}/></div>
       <div className="flex items-center justify-between mt-3 text-[10px] text-text-muted"><span>{p.started_at?`Started ${timeAgo(p.started_at)}`:'Start date unavailable'}</span><span className="text-accent">View scope →</span></div>
