@@ -2,8 +2,12 @@ package scanner
 
 import (
 	"context"
+	"encoding/binary"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -204,5 +208,188 @@ func TestSubdomainRecursionDepthDefault(t *testing.T) {
 	}
 	if d := (&SubdomainScanner{cfg: nil}).subdomainRecursionDepth(); d != 4 {
 		t.Fatalf("nil-cfg recursion depth = %d, want 4", d)
+	}
+}
+
+func startTestDNSServer(t *testing.T, aRecords map[string]string) *net.Resolver {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			pos := 12
+			var labels []string
+			for pos < n {
+				l := int(buf[pos])
+				pos++
+				if l == 0 {
+					break
+				}
+				if pos+l > n {
+					pos = n
+					break
+				}
+				labels = append(labels, strings.ToLower(string(buf[pos:pos+l])))
+				pos += l
+			}
+			if pos+4 > n {
+				continue
+			}
+			qtype := binary.BigEndian.Uint16(buf[pos : pos+2])
+			qEnd := pos + 4
+			qname := strings.Join(labels, ".")
+
+			resp := make([]byte, 0, qEnd+16)
+			resp = append(resp, buf[:qEnd]...)
+			ipStr, ok := aRecords[qname]
+			if !ok {
+				resp[2] = 0x81
+				resp[3] = 0x83 // NXDOMAIN
+				binary.BigEndian.PutUint16(resp[6:8], 0)
+				binary.BigEndian.PutUint16(resp[8:10], 0)
+				binary.BigEndian.PutUint16(resp[10:12], 0)
+				_, _ = pc.WriteTo(resp, addr)
+				continue
+			}
+			resp[2] = 0x81
+			resp[3] = 0x80 // NOERROR
+			binary.BigEndian.PutUint16(resp[8:10], 0)
+			binary.BigEndian.PutUint16(resp[10:12], 0)
+			if qtype == 1 {
+				if ip4 := net.ParseIP(ipStr).To4(); ip4 != nil {
+					binary.BigEndian.PutUint16(resp[6:8], 1)
+					resp = append(resp,
+						0xc0, 0x0c,
+						0x00, 0x01,
+						0x00, 0x01,
+						0x00, 0x00, 0x00, 0x3c,
+						0x00, 0x04,
+					)
+					resp = append(resp, ip4...)
+				} else {
+					binary.BigEndian.PutUint16(resp[6:8], 0)
+				}
+			} else {
+				binary.BigEndian.PutUint16(resp[6:8], 0)
+			}
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+	addr := pc.LocalAddr().String()
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", addr)
+		},
+	}
+}
+
+func TestResolveAllEmptyFoundAndNilConfigDoesNotPanic(t *testing.T) {
+	db, tid := testDB(t)
+	defer db.Close()
+
+	var logs []string
+	logFn := func(level, module, msg string) {
+		logs = append(logs, msg)
+	}
+
+	// Empty found + nil cfg: early return without panic or fallback log.
+	s := &SubdomainScanner{db: db, cfg: nil}
+	var mu sync.Mutex
+	rejected, admitted := s.resolveAll(context.Background(), tid, map[string]bool{}, &mu, nil, logFn)
+	if len(rejected) != 0 || len(admitted) != 0 {
+		t.Fatalf("empty resolveAll = (%v, %v), want empty maps", rejected, admitted)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("empty resolveAll should not log fallback warnings, got %v", logs)
+	}
+
+	// Non-empty found + nil cfg (fallback path): must default workers without panicking.
+	s.resolver = startTestDNSServer(t, map[string]string{
+		"ok.example.test": "203.0.113.20",
+	})
+	found := map[string]bool{"ok.example.test": true}
+	_, admitted = s.resolveAll(context.Background(), tid, found, &mu, nil, logFn)
+	if !admitted["ok.example.test"] {
+		t.Fatalf("expected ok.example.test admitted with nil cfg, admitted=%v", admitted)
+	}
+}
+
+func TestFilterWatchScopeCandidatesStrictWatchScope(t *testing.T) {
+	entries := []WatchScopeEntry{
+		{Identifier: "*.example.com", IsWildcard: true, host: "example.com"},
+		{Identifier: "exact.test", IsWildcard: false, host: "exact.test"},
+	}
+	ctx := WithWatchMode(context.Background(), true)
+	ctx = WithStrictWatchScope(ctx, entries)
+	ctx = WithExclusions(ctx, ParseExclusions("blocked.example.com"))
+
+	found := map[string]bool{
+		"api.example.com":     true, // allowed by *.example.com
+		"example.com":         true, // apex of wildcard: dropped
+		"exact.test":          true, // exact match: kept
+		"sub.exact.test":      true, // descendant of exact-only: dropped
+		"blocked.example.com": true, // excluded by exclude_scope: dropped
+		"other.org":           true, // out of scope: dropped
+	}
+	var mu sync.Mutex
+	dropped := filterWatchScopeCandidates(ctx, found, &mu)
+	if dropped != 4 {
+		t.Fatalf("dropped = %d, want 4 (remaining=%v)", dropped, found)
+	}
+	if len(found) != 2 || !found["api.example.com"] || !found["exact.test"] {
+		t.Fatalf("remaining candidates = %v, want api.example.com and exact.test", found)
+	}
+
+	// Non-watch mode leaves candidates untouched.
+	nonWatchFound := map[string]bool{"other.org": true}
+	if d := filterWatchScopeCandidates(WithStrictWatchScope(context.Background(), entries), nonWatchFound, &mu); d != 0 || !nonWatchFound["other.org"] {
+		t.Fatalf("non-watch mode must not drop candidates: dropped=%d found=%v", d, nonWatchFound)
+	}
+}
+
+func TestResolveAllWatchModeSkipsCIDRExcludedAdmissions(t *testing.T) {
+	db, tid := testDB(t)
+	defer db.Close()
+
+	resolver := startTestDNSServer(t, map[string]string{
+		"allowed.example.test":       "203.0.113.10",
+		"excluded-cidr.example.test": "10.42.0.5",
+	})
+	s := &SubdomainScanner{db: db, cfg: nil, resolver: resolver}
+
+	ctx := WithWatchMode(context.Background(), true)
+	ctx = WithExclusions(ctx, ParseExclusions("10.42.0.0/16"))
+
+	found := map[string]bool{
+		"allowed.example.test":       true,
+		"excluded-cidr.example.test": true,
+	}
+	var mu sync.Mutex
+	_, admitted := s.resolveAll(ctx, tid, found, &mu, nil, func(string, string, string) {})
+
+	if !admitted["allowed.example.test"] {
+		t.Fatalf("allowed.example.test should be admitted, admitted=%v", admitted)
+	}
+	if admitted["excluded-cidr.example.test"] {
+		t.Fatalf("excluded-cidr.example.test resolved to excluded CIDR and must not be admitted")
+	}
+	var countAllowed, countExcluded int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM subdomains WHERE target_id=? AND subdomain='allowed.example.test'`, tid).Scan(&countAllowed)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM subdomains WHERE target_id=? AND subdomain='excluded-cidr.example.test'`, tid).Scan(&countExcluded)
+	if countAllowed != 1 || countExcluded != 0 {
+		t.Fatalf("subdomains DB rows: allowed=%d excluded=%d, want 1 and 0", countAllowed, countExcluded)
 	}
 }

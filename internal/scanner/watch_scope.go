@@ -40,6 +40,17 @@ type WatchScopeEntry struct {
 	host string
 }
 
+// NormalizedHost returns the normalized host of a WatchScopeEntry (for scheduler intersection).
+func (e WatchScopeEntry) NormalizedHost() string { return e.host }
+
+// WithNormalizedHost returns a copy of e with its normalized host replaced,
+// used when intersecting a broader program wildcard with a narrower approved
+// project wildcard.
+func (e WatchScopeEntry) WithNormalizedHost(host string) WatchScopeEntry {
+	e.host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	return e
+}
+
 // WatchScopeHost is a discovered host ready for landing.
 type WatchScopeHost struct {
 	// Value is what gets stored in assets.value: the hostname, or "host:port"
@@ -90,12 +101,12 @@ func LoadWatchEligibleScope(ctx context.Context, db *database.DB, targetID strin
 			// cannot become watch-landed hosts.
 			continue
 		}
-		e.IsWildcard = wildcard == 1
 		host, ok := normalizeScopeIdentifier(e.Identifier)
 		if !ok {
 			skipped = append(skipped, e.Identifier)
 			continue
 		}
+		e.IsWildcard = wildcard == 1 || IsSubdomainWildcardIdentifier(e.Identifier)
 		e.host = host
 		entries = append(entries, e)
 	}
@@ -130,6 +141,55 @@ func normalizeScopeIdentifier(raw string) (string, bool) {
 	}
 	ascii, err := idna.Lookup.ToASCII(host)
 	if err != nil {
+		return "", false
+	}
+	return strings.ToLower(ascii), true
+}
+
+// NormalizeSubdomainWildcardApex parses a subdomain wildcard identifier such as
+// "*.example.com", "https://*.example.com/", or "*.example.com:8443" and returns
+// its normalized ASCII apex ("example.com", true). Rejects exact domains,
+// path-scoped URLs ("https://example.com/*"), mid-domain globs ("sub.*.example.com"),
+// missing-dot globs ("*example.com"), and IP literals.
+func NormalizeSubdomainWildcardApex(raw string) (string, bool) {
+	host, _, ok := splitScopeHostPort(raw)
+	if !ok {
+		return "", false
+	}
+	host = strings.TrimSpace(host)
+	if !strings.HasPrefix(host, "*.") || strings.Contains(host[2:], "*") {
+		return "", false
+	}
+	apex := strings.TrimSuffix(host[2:], ".")
+	if apex == "" || net.ParseIP(apex) != nil {
+		return "", false
+	}
+	ascii, err := idna.Lookup.ToASCII(apex)
+	if err != nil || ascii == "" || net.ParseIP(ascii) != nil {
+		return "", false
+	}
+	return strings.ToLower(ascii), true
+}
+
+// IsSubdomainWildcardIdentifier reports whether raw is a valid subdomain wildcard pattern.
+func IsSubdomainWildcardIdentifier(raw string) bool {
+	_, ok := NormalizeSubdomainWildcardApex(raw)
+	return ok
+}
+
+// NormalizeWatchScopeBareHost parses a bare non-IP host (no non-"/" path, no "*")
+// such as "example.com" or "https://example.com/" and returns its normalized ASCII host.
+func NormalizeWatchScopeBareHost(raw string) (string, bool) {
+	host, _, ok := splitScopeHostPort(raw)
+	if !ok {
+		return "", false
+	}
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" || strings.Contains(host, "*") || net.ParseIP(host) != nil {
+		return "", false
+	}
+	ascii, err := idna.Lookup.ToASCII(host)
+	if err != nil || ascii == "" || net.ParseIP(ascii) != nil {
 		return "", false
 	}
 	return strings.ToLower(ascii), true
@@ -302,6 +362,26 @@ func HostMatchesWatchScope(entries []WatchScopeEntry, raw string) (string, strin
 		return "", "", false
 	}
 	return entry.ProgramID, entry.AssetID, true
+}
+
+// WildcardRootMatchesWatchScope reports whether raw (either "*.<apex>" or any
+// form NormalizeSubdomainWildcardApex accepts) is covered by a wildcard
+// WatchScopeEntry (e.IsWildcard && (e.host == apex || strings.HasSuffix(apex, "."+e.host))).
+func WildcardRootMatchesWatchScope(entries []WatchScopeEntry, raw string) (string, string, bool) {
+	apex, ok := NormalizeSubdomainWildcardApex(raw)
+	if !ok {
+		return "", "", false
+	}
+	for _, e := range entries {
+		if !e.IsWildcard {
+			continue
+		}
+		base := strings.ToLower(strings.TrimSuffix(e.host, "."))
+		if base != "" && (base == apex || strings.HasSuffix(apex, "."+base)) {
+			return e.ProgramID, e.AssetID, true
+		}
+	}
+	return "", "", false
 }
 
 func LandWatchScopeHosts(ctx context.Context, db *database.DB, targetID string, hosts []string, logFn LogFunc) []string {

@@ -254,6 +254,12 @@ func (s *SubdomainScanner) Run(ctx context.Context, targetID, domain string, log
 	}
 	mu.Unlock()
 
+	if watchMode && strictWatchScopeSet(ctx) != nil {
+		if dropped := filterWatchScopeCandidates(ctx, found, &mu); dropped > 0 {
+			logFn("info", "subdomain_enum", fmt.Sprintf("Strict watch-scope filter dropped %d out-of-scope candidate(s) before resolution", dropped))
+		}
+	}
+
 	// Branch wildcard detection (F3): a junk fleet can hide under a wildcard
 	// deeper than the apex — *.git.example.com was the live example, where
 	// hundreds of "asdf-garbage.git." names were admitted wholesale. Every
@@ -1155,6 +1161,25 @@ func (s *SubdomainScanner) admittedSubdomainNames(ctx context.Context, targetID,
 	return out
 }
 
+// filterWatchScopeCandidates removes any candidate outside the strict watch
+// scope (including hostname/suffix exclusions) before branch wildcard probing
+// and DNS resolution.
+func filterWatchScopeCandidates(ctx context.Context, found map[string]bool, mu *sync.Mutex) int {
+	if !watchModeEnabled(ctx) || strictWatchScopeSet(ctx) == nil {
+		return 0
+	}
+	dropped := 0
+	mu.Lock()
+	for name := range found {
+		if !hostInScope(ctx, name) {
+			delete(found, name)
+			dropped++
+		}
+	}
+	mu.Unlock()
+	return dropped
+}
+
 // resolveAll resolves every discovered subdomain concurrently and updates its
 // IP. Names that resolve to a wildcard IP are kept but logged so HTTP probing
 // can later dedupe them by content.
@@ -1165,6 +1190,11 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 		names = append(names, n)
 	}
 	mu.Unlock()
+	rejected := make(map[string]bool)
+	admitted := make(map[string]bool)
+	if len(names) == 0 {
+		return rejected, admitted
+	}
 	sort.Strings(names)
 
 	// Names already stored before this run. A re-scan must NOT re-broadcast every
@@ -1175,8 +1205,6 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 
 	var resolved, cnameWithIP, cnameOnly, wildcardHits, unresolved, transient int
 	var cmu sync.Mutex
-	rejected := make(map[string]bool)
-	admitted := make(map[string]bool)
 	// Admission writes are COLLECTED and flushed in a single transaction after the
 	// resolution pass instead of one autocommit INSERT per name — on a target with
 	// hundreds/thousands of names the per-name commit was a real serial cost. The
@@ -1242,6 +1270,23 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 		return ""
 	}
 
+	watchExcl := ExclusionSet{}
+	if watchModeEnabled(ctx) {
+		watchExcl = exclusionsFromContext(ctx)
+	}
+	excludedByWatchRule := func(name string, ipStrings []string) bool {
+		if watchExcl.Empty() {
+			return false
+		}
+		var parsed []net.IP
+		for _, raw := range ipStrings {
+			if p := net.ParseIP(strings.TrimSpace(raw)); p != nil {
+				parsed = append(parsed, p)
+			}
+		}
+		return watchExcl.ExcludesWithIPs(name, parsed)
+	}
+
 	// classify applies the identical wildcard-aware admission rules to one
 	// name's A/AAAA record set no matter which resolver path produced them —
 	// the batched dnsx pass or per-name Go lookups — so both admit/reject
@@ -1259,6 +1304,12 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 			hasCNAME := cname != "" && !wildcardProfile.isWildcardCNAME(name, cname)
 			if hasCNAME {
 				if aliasIP, live := classifyCNAMEAlias(name, cname, ipsForCNAME, wildcardProfile); live {
+					if !watchExcl.Empty() {
+						checkIPs := append(append([]string(nil), ips...), ipsForCNAME(cname)...)
+						if excludedByWatchRule(name, checkIPs) {
+							return
+						}
+					}
 					cmu.Lock()
 					cnameWithIP++
 					cmu.Unlock()
@@ -1274,6 +1325,9 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 				return
 			}
 			if hasCNAME {
+				if excludedByWatchRule(name, ips) {
+					return
+				}
 				// A dangling target keeps an empty IP and stays in takeover checks.
 				cmu.Lock()
 				cnameOnly++
@@ -1289,6 +1343,9 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 				transient++
 			}
 			cmu.Unlock()
+			return
+		}
+		if excludedByWatchRule(name, ips) {
 			return
 		}
 		cmu.Lock()
@@ -1323,7 +1380,10 @@ func (s *SubdomainScanner) resolveAll(ctx context.Context, targetID string, foun
 	if ipmap == nil {
 		// FALLBACK PATH (tool-free builds, missing dnsx, or a failed tool run):
 		// the legacy per-name Go-resolver pass, admission logic unchanged.
-		workers := s.cfg.Workers.SubdomainEnumeration
+		workers := 0
+		if s.cfg != nil {
+			workers = s.cfg.Workers.SubdomainEnumeration
+		}
 		if workers <= 0 {
 			workers = 20
 		}

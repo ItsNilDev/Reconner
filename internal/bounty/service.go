@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/recon-platform/internal/assets"
 	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/internal/scanner"
 	"github.com/recon-platform/pkg/logger"
 )
 
@@ -186,6 +187,9 @@ func normalizeAssetType(provider, typ, identifier string) string {
 			if !webShaped {
 				return "other"
 			}
+			if scanner.IsSubdomainWildcardIdentifier(id) {
+				return "wildcard"
+			}
 			if strings.HasPrefix(id, "http://") || strings.HasPrefix(id, "https://") {
 				if strings.HasSuffix(strings.Split(id, "?")[0], ".js") {
 					return "js"
@@ -213,7 +217,7 @@ func normalizeAssetType(provider, typ, identifier string) string {
 		}
 	}
 	switch {
-	case strings.Contains(t, "wildcard") || strings.HasPrefix(id, "*.") || strings.Contains(id, "/*"):
+	case strings.Contains(t, "wildcard") || strings.HasPrefix(id, "*.") || scanner.IsSubdomainWildcardIdentifier(id) || strings.Contains(id, "/*"):
 		if !webShaped {
 			return "other"
 		}
@@ -590,7 +594,7 @@ func finalizeProgramAssets(p *Program) {
 	for i := range p.Assets {
 		a := &p.Assets[i]
 		a.AssetType = normalizeAssetType(p.Provider, a.AssetType, a.Identifier)
-		a.IsWildcard = a.AssetType == "wildcard" || strings.HasPrefix(strings.TrimSpace(a.Identifier), "*.")
+		a.IsWildcard = a.AssetType == "wildcard" || strings.HasPrefix(strings.TrimSpace(a.Identifier), "*.") || scanner.IsSubdomainWildcardIdentifier(a.Identifier)
 		if a.InScope && a.EligibleSubmission {
 			p.InScopeCount++
 		}

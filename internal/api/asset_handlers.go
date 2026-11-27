@@ -251,23 +251,29 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if kind == "network" {
-		var watchOnly int
-		if err := tx.QueryRowContext(r.Context(), `SELECT COALESCE(watch_only,0) FROM targets WHERE id=?`, id).Scan(&watchOnly); err != nil {
+	var watchOnly int
+	if err := tx.QueryRowContext(r.Context(), `SELECT COALESCE(watch_only,0) FROM targets WHERE id=?`, id).Scan(&watchOnly); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			h.writeError(w, http.StatusNotFound, "target not found")
-			return
+		} else {
+			h.writeError(w, http.StatusInternalServerError, "failed to add asset")
 		}
-		if watchOnly == 1 {
-			h.writeError(w, http.StatusBadRequest, "this project runs watch rounds; network assets are not supported")
-			return
-		}
+		return
+	}
+	if kind == "network" && watchOnly == 1 {
+		h.writeError(w, http.StatusBadRequest, "this project runs watch rounds; network assets are not supported")
+		return
 	}
 	assetType := normalizeManualAssetType(req.AssetType, value, kind)
+	monitorEnabled := 1
+	if watchOnly == 1 {
+		monitorEnabled = 0
+	}
 	aid := uuid.New().String()
 	if _, err := tx.ExecContext(r.Context(),
 		`INSERT INTO assets (id, target_id, name, value, kind, asset_type, source, approval_status, monitor_enabled, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 'manual', 'approved', 1, CURRENT_TIMESTAMP)`,
-		aid, id, strings.TrimSpace(req.Name), value, kind, assetType); err != nil {
+		 VALUES (?, ?, ?, ?, ?, ?, 'manual', 'approved', ?, CURRENT_TIMESTAMP)`,
+		aid, id, strings.TrimSpace(req.Name), value, kind, assetType, monitorEnabled); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			h.writeError(w, http.StatusConflict, "that asset already exists on this target")
 			return
@@ -279,12 +285,26 @@ func (h *Handler) handleAddAsset(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to update target kind")
 		return
 	}
+	if watchOnly == 1 && kind == "web" {
+		if _, err := tx.ExecContext(r.Context(), `
+			UPDATE targets
+			SET watch_next_run = datetime('now'), updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+			  AND COALESCE(watch_only, 0) = 1
+			  AND COALESCE(watch_paused, 0) = 0
+			  AND watch_next_run IS NOT NULL
+			  AND watch_next_run > datetime('now')
+		`, id); err != nil {
+			h.writeError(w, http.StatusInternalServerError, "failed to update target schedule")
+			return
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "failed to add asset")
 		return
 	}
 	h.hub.Broadcast("target_updated", map[string]string{"id": id, "target_id": id})
-	h.writeSuccess(w, models.Asset{ID: aid, TargetID: id, Name: strings.TrimSpace(req.Name), Value: value, Kind: kind, AssetType: assetType, Source: "manual", ApprovalStatus: "approved", MonitorEnabled: true})
+	h.writeSuccess(w, models.Asset{ID: aid, TargetID: id, Name: strings.TrimSpace(req.Name), Value: value, Kind: kind, AssetType: assetType, Source: "manual", ApprovalStatus: "approved", MonitorEnabled: watchOnly == 0})
 }
 
 func normalizeManualAssetType(explicit, value, kind string) string {
@@ -294,7 +314,7 @@ func normalizeManualAssetType(explicit, value, kind string) string {
 		return t
 	}
 	lower := strings.ToLower(strings.TrimSpace(value))
-	if strings.HasPrefix(lower, "*.") {
+	if strings.HasPrefix(lower, "*.") || scanner.IsSubdomainWildcardIdentifier(value) {
 		return "wildcard"
 	}
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {

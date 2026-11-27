@@ -142,3 +142,173 @@ func TestLoadWatchEligibleScopeSkipsNonWebAssets(t *testing.T) {
 		t.Fatalf("eligible scope=%+v, want only *.acme.test", entries)
 	}
 }
+
+func TestNormalizeSubdomainWildcardApexAndIdentifier(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"*.example.com", "example.com", true},
+		{"*.Example.COM.", "example.com", true},
+		{"https://*.example.com/", "example.com", true},
+		{"http://*.sub.example.com:8443/", "sub.example.com", true},
+		{"*.example.com:8443", "example.com", true},
+		{"*.BÜCHER.example", "xn--bcher-kva.example", true},
+		{"example.com", "", false},
+		{"https://example.com/", "", false},
+		{"https://example.com/*", "", false},
+		{"*.example.com/*", "", false},
+		{"https://*.example.com/api", "", false},
+		{"sub.*.example.com", "", false},
+		{"*.*.example.com", "", false},
+		{"*example.com", "", false},
+		{"*.192.0.2.1", "", false},
+		{"*.[::1]", "", false},
+		{"*.", "", false},
+		{"*..", "", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := NormalizeSubdomainWildcardApex(tc.raw)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("NormalizeSubdomainWildcardApex(%q) = (%q,%v), want (%q,%v)", tc.raw, got, ok, tc.want, tc.ok)
+		}
+		if isWild := IsSubdomainWildcardIdentifier(tc.raw); isWild != tc.ok {
+			t.Errorf("IsSubdomainWildcardIdentifier(%q) = %v, want %v", tc.raw, isWild, tc.ok)
+		}
+	}
+}
+
+func TestNormalizeWatchScopeBareHost(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"example.com", "example.com", true},
+		{"Example.COM.", "example.com", true},
+		{"https://example.com/", "example.com", true},
+		{"https://example.com:8443/", "example.com", true},
+		{"example.com:8443", "example.com", true},
+		{"BÜCHER.example", "xn--bcher-kva.example", true},
+		{"*.example.com", "", false},
+		{"https://*.example.com/", "", false},
+		{"https://example.com/*", "", false},
+		{"https://example.com/api", "", false},
+		{"192.0.2.1", "", false},
+		{"[::1]", "", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := NormalizeWatchScopeBareHost(tc.raw)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("NormalizeWatchScopeBareHost(%q) = (%q,%v), want (%q,%v)", tc.raw, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestWildcardRootMatchesWatchScope(t *testing.T) {
+	entries := []WatchScopeEntry{
+		{ProgramID: "p-wild", AssetID: "a-wild", Identifier: "*.example.com", IsWildcard: true, host: "example.com"},
+		{ProgramID: "p-exact", AssetID: "a-exact", Identifier: "exact.test", IsWildcard: false, host: "exact.test"},
+	}
+	if got := entries[0].NormalizedHost(); got != "example.com" {
+		t.Fatalf("NormalizedHost() = %q, want example.com", got)
+	}
+	if narrowed := entries[0].WithNormalizedHost("Sub.Example.COM."); narrowed.NormalizedHost() != "sub.example.com" || !narrowed.IsWildcard || narrowed.ProgramID != "p-wild" {
+		t.Fatalf("WithNormalizedHost() = %+v, want host=sub.example.com wildcard=true program=p-wild", narrowed)
+	}
+
+	cases := []struct {
+		name    string
+		raw     string
+		wantOK  bool
+		wantPID string
+		wantAID string
+	}{
+		{"exact wildcard", "*.example.com", true, "p-wild", "a-wild"},
+		{"scheme wildcard", "https://*.example.com/", true, "p-wild", "a-wild"},
+		{"nested wildcard", "*.sub.example.com", true, "p-wild", "a-wild"},
+		{"deep nested scheme wildcard", "https://*.deep.sub.example.com:8443/", true, "p-wild", "a-wild"},
+		{"rejects bare apex", "example.com", false, "", ""},
+		{"rejects path wildcard", "https://example.com/*", false, "", ""},
+		{"rejects mid glob", "sub.*.example.com", false, "", ""},
+		{"rejects ip wildcard", "*.192.0.2.1", false, "", ""},
+		{"rejects non-wildcard entry", "*.exact.test", false, "", ""},
+		{"rejects suffix confusion", "*.notexample.com", false, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pid, aid, ok := WildcardRootMatchesWatchScope(entries, tc.raw)
+			if ok != tc.wantOK || pid != tc.wantPID || aid != tc.wantAID {
+				t.Fatalf("WildcardRootMatchesWatchScope(%q) = (%q,%q,%v), want (%q,%q,%v)",
+					tc.raw, pid, aid, ok, tc.wantPID, tc.wantAID, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestLoadWatchEligibleScopeInfersWildcardWhenFlagZero(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "watch-scope-wild.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := db.Exec(`INSERT INTO targets(id,domain) VALUES('target-1','acme.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES('program-1','hackerone','p1','acme','Acme')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO project_programs(target_id,program_id) VALUES('target-1','program-1')`); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		id, identifier, assetType string
+		isWildcard                int
+	}{
+		{"a-wild-bare", "*.acme.test", "domain", 0},
+		{"a-wild-url", "https://*.sub.acme.test/", "url", 0},
+		{"a-exact", "exact.acme.test", "domain", 0},
+		{"a-path-wild", "https://acme.test/*", "url", 0},
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(
+			`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard) VALUES(?,?,?,?,?,?)`,
+			r.id, "program-1", "ext-"+r.id, r.identifier, r.assetType, r.isWildcard,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, linked, err := LoadWatchEligibleScope(ctx, db, "target-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linked {
+		t.Fatal("expected linked=true")
+	}
+	byID := map[string]WatchScopeEntry{}
+	for _, e := range entries {
+		byID[e.AssetID] = e
+	}
+	if len(byID) != 3 {
+		t.Fatalf("expected 3 eligible entries (excluding path wildcard), got %+v", entries)
+	}
+	if e, ok := byID["a-wild-bare"]; !ok || !e.IsWildcard || e.NormalizedHost() != "acme.test" {
+		t.Fatalf("*.acme.test with is_wildcard=0 not recognized as wildcard: %+v", e)
+	}
+	if e, ok := byID["a-wild-url"]; !ok || !e.IsWildcard || e.NormalizedHost() != "sub.acme.test" {
+		t.Fatalf("https://*.sub.acme.test/ with is_wildcard=0 not recognized as wildcard: %+v", e)
+	}
+	if e, ok := byID["a-exact"]; !ok || e.IsWildcard || e.NormalizedHost() != "exact.acme.test" {
+		t.Fatalf("exact.acme.test unexpected entry: %+v", e)
+	}
+	if _, ok := byID["a-path-wild"]; ok {
+		t.Fatal("path wildcard https://acme.test/* must not be loaded into watch scope")
+	}
+}

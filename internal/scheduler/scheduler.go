@@ -1949,15 +1949,17 @@ func (s *Scheduler) validateScopeOverrideE(ctx context.Context, targetID, scopeO
 		return nil
 	}
 	host := scanner.URLHost(value)
-	if scanner.IsWildcardScopePattern(value) {
+	if apex, ok := scanner.NormalizeSubdomainWildcardApex(value); ok {
+		host = apex
+	} else if scanner.IsWildcardScopePattern(value) {
 		if roots := normalizeSubdomainRoots([]string{value}); len(roots) > 0 {
 			host = roots[0]
 		}
 	}
-	var approval, metadata string
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(approval_status,'approved'), COALESCE(metadata,'')
+	var assetType, approval, metadata string
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(asset_type,'domain'), COALESCE(approval_status,'approved'), COALESCE(metadata,'')
 		FROM assets WHERE target_id=? AND value IN (?,?) ORDER BY id LIMIT 1`,
-		targetID, value, host).Scan(&approval, &metadata)
+		targetID, value, host).Scan(&assetType, &approval, &metadata)
 	if err != nil {
 		return fmt.Errorf("scope asset %q no longer exists", scopeOverride)
 	}
@@ -1966,6 +1968,12 @@ func (s *Scheduler) validateScopeOverrideE(ctx context.Context, targetID, scopeO
 	}
 	if assetMarkedOutOfScope(metadata) {
 		return fmt.Errorf("scope asset %q is marked out of scope", scopeOverride)
+	}
+	if isWildcardAssetValue(value, assetType) {
+		if _, ok := state.allowsWildcardRoot(value, assetType); !ok {
+			return fmt.Errorf("scope asset %q is not eligible under current scope", scopeOverride)
+		}
+		return nil
 	}
 	if !state.allowsHost(ctx, host) {
 		return fmt.Errorf("scope asset %q is not eligible under current scope", scopeOverride)
@@ -2120,7 +2128,8 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// used to enumerate only the first asset in a multi-asset target (issue #7).
 	var subdomainRoots []string
 	if !networkTask {
-		subdomainRoots, err = s.loadSubdomainRootsE(ctx, targetID, effectiveScope, scopeOverride, state)
+		wildcardOnly := taskType == watchScanType && state.linked && scopeOverride == ""
+		subdomainRoots, err = s.loadSubdomainRootsForTaskE(ctx, targetID, effectiveScope, scopeOverride, state, wildcardOnly)
 		if err != nil {
 			s.failTaskPreflight(taskID, targetID, err.Error())
 			return
@@ -2171,7 +2180,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		}
 		_, _ = s.db.Exec(`INSERT INTO subdomains (id, target_id, subdomain, source, last_seen)
 			VALUES (?, ?, ?, 'seed', CURRENT_TIMESTAMP)
-			ON CONFLICT(target_id, subdomain) DO NOTHING`, uuid.New().String(), targetID, host)
+			ON CONFLICT(target_id, subdomain) DO UPDATE SET
+				source = CASE WHEN COALESCE(subdomains.source,'dns') = 'vhost' THEN subdomains.source ELSE 'seed' END,
+				catchall = 0,
+				last_seen = CURRENT_TIMESTAMP`, uuid.New().String(), targetID, host)
 	}
 	// Managed assets are authoritative for BOTH full-target and per-asset scans.
 	// Confining every DB-reading module here prevents stale services belonging to
@@ -2295,8 +2307,8 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 		// Program-linked rounds use the strict apex/wildcard boundary before
 		// probing, so a descendant of an exact asset is never requested. Manual
 		// watch projects keep the broad matcher because they have no program.
-		if len(scopeOverride) == 0 && state.linked && len(state.entries) > 0 {
-			ctx = scanner.WithStrictWatchScope(ctx, state.entries)
+		if len(scopeOverride) == 0 && state.linked {
+			ctx = scanner.WithStrictWatchScope(ctx, approvedWatchScopeEntries(state.entries, subdomainRoots))
 		}
 	}
 	// Single-endpoint mode: confine the pipeline to the seeded endpoint URL(s) and
@@ -2390,12 +2402,15 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 			pruned = append(pruned, m)
 		}
 		modules = pruned
-		logFn("info", ModuleSubdomainEnum, "subdomain_enum skipped — no scannable web roots (store and app assets excluded)")
+		skipReason := "no scannable web roots (store and app assets excluded)"
+		if taskType == watchScanType && state.linked && len(seeded) > 0 {
+			skipReason = "exact-domain program scope (no approved wildcard assets)"
+		}
+		logFn("info", ModuleSubdomainEnum, fmt.Sprintf("subdomain_enum skipped — %s", skipReason))
 		// Keep the ledger in sync with the pruned module. Without this, the
 		// phase row stays pending and the terminal backstop rewrites an
 		// otherwise finished task to failed with an invariant error.
-		s.finishTaskPhase(taskID, ModuleSubdomainEnum, "skipped",
-			"no scannable web roots (store and app assets excluded)", 0)
+		s.finishTaskPhase(taskID, ModuleSubdomainEnum, "skipped", skipReason, 0)
 	}
 	// The skipped-module report: a watch round runs two phases, so everything
 	// else in the deep pipeline is SKIPPED. The report is written when the
@@ -2791,7 +2806,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// which used to make an 8h-watchdog timeout LOOK like a completed scan.
 	finalProgress := lastProgress
 	if finalStatus == "finished" {
-		finalProgress = len(modules)
+		finalProgress = s.terminalTaskPhaseCount(taskID)
+		if finalProgress < len(modules) {
+			finalProgress = len(modules)
+		}
 	}
 	if finalStatus == InterruptedStatus {
 		_, _ = s.db.Exec(`UPDATE tasks SET error='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, taskID)
@@ -2971,6 +2989,93 @@ func (st taskScopeState) allowsHost(ctx context.Context, value string) bool {
 	return true
 }
 
+func isWildcardAssetValue(value, assetType string) bool {
+	if scanner.IsSubdomainWildcardIdentifier(value) {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(assetType), "wildcard") {
+		_, ok := scanner.NormalizeWatchScopeBareHost(value)
+		return ok
+	}
+	return false
+}
+
+// allowsWildcardRoot validates a wildcard asset value and returns its normalized
+// DNS apex root. It checks hostname/suffix exclusions without DNS/CIDR lookup
+// (so a CIDR rule in target_exclusions never triggers LookupIP on "*.apex")
+// and verifies linked-program coverage via WildcardRootMatchesWatchScope.
+func (st taskScopeState) allowsWildcardRoot(value, assetType string) (string, bool) {
+	var apex string
+	if a, ok := scanner.NormalizeSubdomainWildcardApex(value); ok {
+		apex = a
+	} else if strings.EqualFold(strings.TrimSpace(assetType), "wildcard") {
+		if bare, ok := scanner.NormalizeWatchScopeBareHost(value); ok {
+			apex = bare
+		}
+	}
+	if apex == "" || !assets.IsScannableWebAsset("domain", apex) {
+		return "", false
+	}
+	if st.exclusions.Excludes("*." + apex) {
+		return "", false
+	}
+	if st.linked {
+		if _, _, ok := scanner.WildcardRootMatchesWatchScope(st.entries, "*."+apex); !ok {
+			return "", false
+		}
+	}
+	return apex, true
+}
+
+// approvedWatchScopeEntries restricts wildcard watch-scope entries to those
+// backed by approved project wildcard roots. Non-wildcard (exact) entries are
+// preserved. If an approved wildcard root is narrower than the covering program
+// wildcard (e.g. approved *.sub.example.com under program *.example.com), the
+// emitted entry is narrowed to the approved apex.
+func approvedWatchScopeEntries(entries []scanner.WatchScopeEntry, approvedWildcardRoots []string) []scanner.WatchScopeEntry {
+	out := make([]scanner.WatchScopeEntry, 0, len(entries))
+	var wildcards []scanner.WatchScopeEntry
+	for _, e := range entries {
+		if !e.IsWildcard {
+			out = append(out, e)
+			continue
+		}
+		wildcards = append(wildcards, e)
+	}
+	seenWildcard := map[string]bool{}
+	for _, rawApex := range approvedWildcardRoots {
+		apex := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rawApex), "."))
+		if apex == "" || seenWildcard[apex] {
+			continue
+		}
+		var exactHit *scanner.WatchScopeEntry
+		var broaderHit *scanner.WatchScopeEntry
+		for i := range wildcards {
+			h := wildcards[i].NormalizedHost()
+			if h == "" {
+				continue
+			}
+			if h == apex {
+				exactHit = &wildcards[i]
+				break
+			}
+			if strings.HasSuffix(apex, "."+h) && broaderHit == nil {
+				broaderHit = &wildcards[i]
+			}
+		}
+		if exactHit != nil {
+			seenWildcard[apex] = true
+			out = append(out, *exactHit)
+		} else if broaderHit != nil {
+			seenWildcard[apex] = true
+			narrowed := broaderHit.WithNormalizedHost(apex)
+			narrowed.Identifier = "*." + apex
+			out = append(out, narrowed)
+		}
+	}
+	return out
+}
+
 // allowsProjectHost adds the positive project scope to allowsHost. Manual
 // projects use approved assets and apex descendants. Linked projects already
 // got an exact/wildcard decision from program eligibility in allowsHost.
@@ -3027,7 +3132,7 @@ func (s *Scheduler) projectHasManagedScope(ctx context.Context, targetID string)
 // ineligible program assets. Watch-landed assets stay in history when they lose
 // eligibility, but they no longer seed a scan.
 func (s *Scheduler) loadProjectWebSeedsE(ctx context.Context, targetID string, state taskScopeState) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(metadata,'') FROM assets WHERE target_id=?
+	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(asset_type,'domain'), COALESCE(metadata,'') FROM assets WHERE target_id=?
 		AND COALESCE(approval_status,'approved')='approved'
 		AND COALESCE(asset_type,'domain') IN ('domain','wildcard','url','page','js','api')
 		ORDER BY created_at ASC,id ASC`, targetID)
@@ -3038,8 +3143,8 @@ func (s *Scheduler) loadProjectWebSeedsE(ctx context.Context, targetID string, s
 	seen := map[string]bool{}
 	out := []string{}
 	for rows.Next() {
-		var v, metadata string
-		if rows.Scan(&v, &metadata) != nil {
+		var v, assetType, metadata string
+		if rows.Scan(&v, &assetType, &metadata) != nil {
 			continue
 		}
 		v = strings.TrimSpace(v)
@@ -3052,7 +3157,11 @@ func (s *Scheduler) loadProjectWebSeedsE(ctx context.Context, targetID string, s
 		if assetMarkedOutOfScope(metadata) {
 			continue
 		}
-		if !state.allowsHost(ctx, v) {
+		if isWildcardAssetValue(v, assetType) {
+			if _, ok := state.allowsWildcardRoot(v, assetType); !ok {
+				continue
+			}
+		} else if !state.allowsHost(ctx, v) {
 			continue
 		}
 		seen[v] = true
@@ -3089,26 +3198,81 @@ func (s *Scheduler) loadSubdomainRoots(ctx context.Context, targetID, fallbackSc
 
 // loadSubdomainRootsE is the error-returning form of loadSubdomainRoots.
 func (s *Scheduler) loadSubdomainRootsE(ctx context.Context, targetID, fallbackScope, scopeOverride string, state taskScopeState) ([]string, error) {
-	if strings.TrimSpace(scopeOverride) != "" {
-		if !state.allowsHost(ctx, scopeOverride) {
+	return s.loadSubdomainRootsForTaskE(ctx, targetID, fallbackScope, scopeOverride, state, false)
+}
+
+// loadSubdomainRootsForTaskE returns DNS enumeration roots for a task. When
+// wildcardOnly is true (program-linked breadth watch rounds), only approved
+// wildcard assets covered by an eligible program wildcard entry are returned
+// and targets.domain fallback is disabled.
+func (s *Scheduler) loadSubdomainRootsForTaskE(ctx context.Context, targetID, fallbackScope, scopeOverride string, state taskScopeState, wildcardOnly bool) ([]string, error) {
+	if trimmed := strings.TrimSpace(scopeOverride); trimmed != "" {
+		if apex, ok := state.allowsWildcardRoot(trimmed, ""); ok {
+			return []string{apex}, nil
+		}
+		if !state.allowsHost(ctx, trimmed) {
+			var assetType string
+			if s.db.QueryRowContext(ctx, `SELECT COALESCE(asset_type,'domain') FROM assets WHERE target_id=? AND value=? AND COALESCE(approval_status,'approved')='approved' ORDER BY id LIMIT 1`, targetID, trimmed).Scan(&assetType) == nil {
+				if apex, ok := state.allowsWildcardRoot(trimmed, assetType); ok {
+					return []string{apex}, nil
+				}
+			}
 			return nil, nil
 		}
-		return normalizeSubdomainRoots([]string{scopeOverride}), nil
+		return normalizeSubdomainRoots([]string{trimmed}), nil
 	}
 
-	var values []string
-	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(metadata,'') FROM assets WHERE target_id=?
+	rows, err := s.db.QueryContext(ctx, `SELECT value, COALESCE(asset_type,'domain'), COALESCE(metadata,'') FROM assets WHERE target_id=?
 		AND COALESCE(approval_status,'approved')='approved'
-		AND COALESCE(asset_type,'domain') IN ('domain','wildcard')
+		AND COALESCE(asset_type,'domain') IN ('domain','wildcard','url','api')
 		ORDER BY created_at ASC, id ASC`, targetID)
 	if err != nil {
 		return nil, err
 	}
+	if wildcardOnly {
+		seen := map[string]bool{}
+		var roots []string
+		for rows.Next() {
+			var value, assetType, metadata string
+			if rows.Scan(&value, &assetType, &metadata) != nil {
+				continue
+			}
+			value = strings.TrimSpace(value)
+			if value == "" || assetMarkedOutOfScope(metadata) {
+				continue
+			}
+			apex, ok := state.allowsWildcardRoot(value, assetType)
+			if !ok || seen[apex] {
+				continue
+			}
+			seen[apex] = true
+			roots = append(roots, apex)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return roots, nil
+	}
+
+	var values []string
 	for rows.Next() {
-		var value, metadata string
-		if rows.Scan(&value, &metadata) == nil && strings.TrimSpace(value) != "" &&
-			assets.IsScannableWebAsset("domain", value) && !assetMarkedOutOfScope(metadata) &&
-			state.allowsHost(ctx, value) {
+		var value, assetType, metadata string
+		if rows.Scan(&value, &assetType, &metadata) != nil {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" || assetMarkedOutOfScope(metadata) {
+			continue
+		}
+		if isWildcardAssetValue(value, assetType) {
+			if apex, ok := state.allowsWildcardRoot(value, assetType); ok {
+				values = append(values, apex)
+			}
+			continue
+		}
+		at := strings.ToLower(strings.TrimSpace(assetType))
+		if (at == "domain" || at == "wildcard") && assets.IsScannableWebAsset("domain", value) && state.allowsHost(ctx, value) {
 			values = append(values, value)
 		}
 	}

@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/recon-platform/internal/scanner"
 )
 
 func TestWatchScanModules(t *testing.T) {
@@ -201,5 +203,203 @@ func TestRecoverWatchTaskAdvancesSchedule(t *testing.T) {
 	}
 	if fails != 1 || next == "2020-01-01 00:00:00" {
 		t.Fatalf("recover: fails=%d next=%q", fails, next)
+	}
+}
+
+func TestWatchLinkedExactDomainSkipsSubdomainEnumUpsertsSeedAndCompletesProgress(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_next_run,watch_paused)
+		VALUES ('w-exact','hey.com',1,'2020-01-01 00:00:00',0)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('w-exact-p','hackerone','w-exact-p','w-exact-p','ExactProg')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('w-exact','w-exact-p',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('w-exact-pa1','w-exact-p','e1','hey.com','domain',0,1,1,1),
+		('w-exact-pa2','w-exact-p','e2','alive.hey.com','domain',0,1,1,1),
+		('w-exact-pa3','w-exact-p','e3','vhost.hey.com','domain',0,1,1,1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status) VALUES
+		('w-exact-a1','w-exact','','hey.com','web','domain','approved'),
+		('w-exact-a2','w-exact','','alive.hey.com','web','domain','approved'),
+		('w-exact-a3','w-exact','','vhost.hey.com','web','domain','approved')`)
+
+	// Pre-existing subdomain rows that would have been dropped by ON CONFLICT DO NOTHING:
+	// 1) hey.com: source='dns', ip='', catchall=1 -> must upgrade to source='seed', catchall=0.
+	// 2) alive.hey.com: source='dns', ip='1.2.3.4', is_alive=1 -> must keep ip/is_alive and upgrade source='seed'.
+	// 3) vhost.hey.com: source='vhost', ip='5.6.7.8', is_alive=1, catchall=1 -> must preserve 'vhost'/ip/is_alive and reset catchall=0.
+	_, _ = s.db.Exec(`INSERT INTO subdomains(id,target_id,subdomain,ip,is_alive,source,catchall) VALUES
+		('sub-1','w-exact','hey.com','',0,'dns',1),
+		('sub-2','w-exact','alive.hey.com','1.2.3.4',1,'dns',0),
+		('sub-3','w-exact','vhost.hey.com','5.6.7.8',1,'vhost',1)`)
+
+	state, err := s.loadTaskScopeState(ctx, "w-exact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.loadSubdomainRootsForTaskE(ctx, "w-exact", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("exact-domain watch roots=%v, want empty", roots)
+	}
+	seeds, err := s.loadProjectWebSeedsE(ctx, "w-exact", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"hey.com", "alive.hey.com", "vhost.hey.com"}; !reflect.DeepEqual(seeds, want) {
+		t.Fatalf("exact-domain seeds=%v, want %v", seeds, want)
+	}
+
+	// Run executeTask with [subdomain_enum, verify] (verify needs no network).
+	task, err := s.CreateTaskTyped("w-exact", []string{ModuleSubdomainEnum, ModuleVerify}, 3, watchScanType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeTask(ctx, task.ID)
+
+	var taskStatus, taskErr string
+	var progress, total int
+	if err := s.db.QueryRow(`SELECT status, COALESCE(error,''), progress, total FROM tasks WHERE id=?`, task.ID).
+		Scan(&taskStatus, &taskErr, &progress, &total); err != nil {
+		t.Fatal(err)
+	}
+	if taskStatus != "finished" || progress != 2 || total != 2 {
+		t.Fatalf("task status=%q err=%q progress=%d/%d, want finished 2/2", taskStatus, taskErr, progress, total)
+	}
+
+	var phaseStatus, phaseReason string
+	if err := s.db.QueryRow(`SELECT status, reason FROM task_phases WHERE task_id=? AND module=?`,
+		task.ID, ModuleSubdomainEnum).Scan(&phaseStatus, &phaseReason); err != nil {
+		t.Fatal(err)
+	}
+	const wantReason = "exact-domain program scope (no approved wildcard assets)"
+	if phaseStatus != "skipped" || phaseReason != wantReason {
+		t.Fatalf("subdomain_enum phase status=%q reason=%q, want skipped / %q", phaseStatus, phaseReason, wantReason)
+	}
+
+	// Verify upgraded seed rows.
+	type subRow struct {
+		source   string
+		ip       string
+		isAlive  int
+		catchall int
+	}
+	checkSub := func(host string, want subRow) {
+		t.Helper()
+		var got subRow
+		if err := s.db.QueryRow(`SELECT source, ip, is_alive, catchall FROM subdomains WHERE target_id='w-exact' AND subdomain=?`, host).
+			Scan(&got.source, &got.ip, &got.isAlive, &got.catchall); err != nil {
+			t.Fatalf("query subdomain %s: %v", host, err)
+		}
+		if got != want {
+			t.Fatalf("subdomain %s = %+v, want %+v", host, got, want)
+		}
+	}
+	checkSub("hey.com", subRow{source: "seed", ip: "", isAlive: 0, catchall: 0})
+	checkSub("alive.hey.com", subRow{source: "seed", ip: "1.2.3.4", isAlive: 1, catchall: 0})
+	checkSub("vhost.hey.com", subRow{source: "vhost", ip: "5.6.7.8", isAlive: 1, catchall: 0})
+}
+
+func TestWatchLinkedPendingWildcardBlockedUntilApproved(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('w-pend','hey.com',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('w-pend-p','hackerone','w-pend-p','w-pend-p','PendProg')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('w-pend','w-pend-p',1)`)
+	// Exact hey.com + pending upstream *.hey.com (NOT yet in assets).
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('w-pend-pa1','w-pend-p','e1','hey.com','domain',0,1,1,1),
+		('w-pend-pa2','w-pend-p','e2','*.hey.com','wildcard',1,1,1,1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status)
+		VALUES ('w-pend-a1','w-pend','','hey.com','web','domain','approved')`)
+
+	state, err := s.loadTaskScopeState(ctx, "w-pend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.loadSubdomainRootsForTaskE(ctx, "w-pend", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("pending wildcard roots=%v, want empty", roots)
+	}
+	approvedEntries := approvedWatchScopeEntries(state.entries, roots)
+	if _, _, ok := scanner.HostMatchesWatchScope(approvedEntries, "sub.hey.com"); ok {
+		t.Fatal("pending wildcard allowed sub.hey.com before approval")
+	}
+	if _, _, ok := scanner.HostMatchesWatchScope(approvedEntries, "hey.com"); !ok {
+		t.Fatal("approved exact host hey.com was dropped from strict watch scope")
+	}
+
+	// Narrower approved wildcard *.sub.hey.com under program *.hey.com must not widen to all of *.hey.com.
+	narrowedEntries := approvedWatchScopeEntries(state.entries, []string{"sub.hey.com"})
+	if _, _, ok := scanner.HostMatchesWatchScope(narrowedEntries, "a.sub.hey.com"); !ok {
+		t.Fatal("narrowed approved wildcard rejected a.sub.hey.com")
+	}
+	if _, _, ok := scanner.HostMatchesWatchScope(narrowedEntries, "other.hey.com"); ok {
+		t.Fatal("narrowed approved wildcard widened to other.hey.com")
+	}
+
+	// Approve *.hey.com in project assets -> roots becomes ["hey.com"] and strict watch scope allows sub.hey.com.
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status)
+		VALUES ('w-pend-a2','w-pend','','*.hey.com','web','wildcard','approved')`)
+	state, err = s.loadTaskScopeState(ctx, "w-pend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err = s.loadSubdomainRootsForTaskE(ctx, "w-pend", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"hey.com"}; !reflect.DeepEqual(roots, want) {
+		t.Fatalf("approved wildcard roots=%v, want %v", roots, want)
+	}
+	approvedEntries = approvedWatchScopeEntries(state.entries, roots)
+	if _, _, ok := scanner.HostMatchesWatchScope(approvedEntries, "sub.hey.com"); !ok {
+		t.Fatal("approved wildcard did not allow sub.hey.com in strict watch scope")
+	}
+}
+
+func TestWatchLinkedMixedScopeOnlyEnumeratesWildcardRoots(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('w-mix','foo.com',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('w-mix-p','hackerone','w-mix-p','w-mix-p','MixProg')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('w-mix','w-mix-p',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('w-mix-pa1','w-mix-p','e1','*.foo.com','wildcard',1,1,1,1),
+		('w-mix-pa2','w-mix-p','e2','bar.com','domain',0,1,1,1),
+		('w-mix-pa3','w-mix-p','e3','https://baz.com/','url',0,1,1,1),
+		('w-mix-pa4','w-mix-p','e4','https://qux.com/*','url',1,1,1,1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status) VALUES
+		('w-mix-a1','w-mix','','*.foo.com','web','wildcard','approved'),
+		('w-mix-a2','w-mix','','bar.com','web','domain','approved'),
+		('w-mix-a3','w-mix','','https://baz.com/','web','url','approved'),
+		('w-mix-a4','w-mix','','https://qux.com/*','web','url','approved')`)
+
+	state, err := s.loadTaskScopeState(ctx, "w-mix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.loadSubdomainRootsForTaskE(ctx, "w-mix", "foo.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"foo.com"}; !reflect.DeepEqual(roots, want) {
+		t.Fatalf("mixed watch roots=%v, want %v", roots, want)
+	}
+	seeds, err := s.loadProjectWebSeedsE(ctx, "w-mix", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"*.foo.com", "bar.com", "https://baz.com/"}; !reflect.DeepEqual(seeds, want) {
+		t.Fatalf("mixed watch seeds=%v, want %v", seeds, want)
 	}
 }

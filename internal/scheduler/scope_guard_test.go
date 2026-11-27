@@ -244,3 +244,207 @@ func TestExecuteTaskBlocksStaleScopeOverrideBeforeIO(t *testing.T) {
 		t.Fatalf("preflight failure wrote inventory: subdomains=%d services=%d", subdomains, services)
 	}
 }
+
+func TestLinkedPureWildcardAllowsRootsSeedsAndOverrideWithCIDRExclusion(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('pw-t','hey.com',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('pw-p','hackerone','pw-p','pw-p','Hey')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('pw-t','pw-p',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('pw-pa1','pw-p','pw-e1','*.hey.com','wildcard',1,1,1,1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status)
+		VALUES ('pw-a1','pw-t','','*.hey.com','web','wildcard','approved')`)
+
+	checkAllowed := func(label string) {
+		t.Helper()
+		state, err := s.loadTaskScopeState(ctx, "pw-t")
+		if err != nil {
+			t.Fatalf("%s: loadTaskScopeState: %v", label, err)
+		}
+		roots, err := s.loadSubdomainRootsForTaskE(ctx, "pw-t", "hey.com", "", state, true)
+		if err != nil {
+			t.Fatalf("%s: loadSubdomainRootsForTaskE(wildcardOnly=true): %v", label, err)
+		}
+		if want := []string{"hey.com"}; !reflect.DeepEqual(roots, want) {
+			t.Fatalf("%s: watch wildcard roots=%v, want %v", label, roots, want)
+		}
+		deepRoots, err := s.loadSubdomainRootsE(ctx, "pw-t", "hey.com", "", state)
+		if err != nil {
+			t.Fatalf("%s: loadSubdomainRootsE: %v", label, err)
+		}
+		if want := []string{"hey.com"}; !reflect.DeepEqual(deepRoots, want) {
+			t.Fatalf("%s: deep roots=%v, want %v", label, deepRoots, want)
+		}
+		seeds, err := s.loadProjectWebSeedsE(ctx, "pw-t", state)
+		if err != nil {
+			t.Fatalf("%s: loadProjectWebSeedsE: %v", label, err)
+		}
+		if want := []string{"*.hey.com"}; !reflect.DeepEqual(seeds, want) {
+			t.Fatalf("%s: web seeds=%v, want %v", label, seeds, want)
+		}
+		if err := s.validateScopeOverrideE(ctx, "pw-t", "*.hey.com", state); err != nil {
+			t.Fatalf("%s: validateScopeOverrideE(*.hey.com) failed: %v", label, err)
+		}
+	}
+
+	checkAllowed("without CIDR exclusion")
+
+	// Adding a CIDR exclusion must NOT trigger LookupIP("*.hey.com") and drop the wildcard root.
+	if _, err := s.db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern)
+		VALUES ('excl-cidr-1','pw-t','manual','','10.0.0.0/8')`); err != nil {
+		t.Fatal(err)
+	}
+	checkAllowed("with CIDR exclusion")
+
+	// An explicit hostname wildcard exclusion must still block the wildcard root.
+	if _, err := s.db.Exec(`INSERT INTO target_exclusions(id,target_id,source,program_id,pattern)
+		VALUES ('excl-host-1','pw-t','manual','','*.hey.com')`); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.loadTaskScopeState(ctx, "pw-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.loadSubdomainRootsForTaskE(ctx, "pw-t", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("excluded wildcard roots=%v, want empty", roots)
+	}
+	if err := s.validateScopeOverrideE(ctx, "pw-t", "*.hey.com", state); err == nil {
+		t.Fatal("excluded wildcard scope override was accepted")
+	}
+}
+
+func TestLinkedWildcardVariantsSchemeURLAndBareIntigriti(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+
+	// Case A: scheme-prefixed https://*.example.com/ stored as asset_type='url'.
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('wv-url','example.com',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('wv-p1','hackerone','wv-p1','wv-p1','SchemeWC')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('wv-url','wv-p1',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('wv-pa1','wv-p1','wv-e1','https://*.example.com/','url',0,1,1,1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status)
+		VALUES ('wv-a1','wv-url','','https://*.example.com/','web','url','approved')`)
+
+	stateURL, err := s.loadTaskScopeState(ctx, "wv-url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootsURL, err := s.loadSubdomainRootsForTaskE(ctx, "wv-url", "example.com", "", stateURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"example.com"}; !reflect.DeepEqual(rootsURL, want) {
+		t.Fatalf("scheme-prefixed url wildcard roots=%v, want %v", rootsURL, want)
+	}
+	if err := s.validateScopeOverrideE(ctx, "wv-url", "https://*.example.com/", stateURL); err != nil {
+		t.Fatalf("validateScopeOverrideE(https://*.example.com/) failed: %v", err)
+	}
+
+	// Case B: Intigriti bare bare.example.com stored as asset_type='wildcard' (is_wildcard=1).
+	for _, q := range []string{
+		`INSERT INTO targets(id,domain,watch_only) VALUES ('wv-bare','bare.example.com',1)`,
+		`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES ('wv-p2','intigriti','wv-p2','wv-p2','BareWC')`,
+		`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('wv-bare','wv-p2',1)`,
+		`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES ('wv-pa2','wv-p2','wv-e2','bare.example.com','wildcard',1,1,1,1)`,
+		`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status) VALUES ('wv-a2','wv-bare','','bare.example.com','web','wildcard','approved')`,
+	} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatalf("seed bare wildcard (%s): %v", q, err)
+		}
+	}
+
+	stateBare, err := s.loadTaskScopeState(ctx, "wv-bare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootsBare, err := s.loadSubdomainRootsForTaskE(ctx, "wv-bare", "bare.example.com", "", stateBare, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"bare.example.com"}; !reflect.DeepEqual(rootsBare, want) {
+		t.Fatalf("bare intigriti wildcard roots=%v, want %v", rootsBare, want)
+	}
+	seedsBare, err := s.loadProjectWebSeedsE(ctx, "wv-bare", stateBare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"bare.example.com"}; !reflect.DeepEqual(seedsBare, want) {
+		t.Fatalf("bare intigriti wildcard seeds=%v, want %v", seedsBare, want)
+	}
+	if err := s.validateScopeOverrideE(ctx, "wv-bare", "bare.example.com", stateBare); err != nil {
+		t.Fatalf("validateScopeOverrideE(bare wildcard bare.example.com) failed: %v", err)
+	}
+}
+
+func TestLinkedSuspendedAndUnlistedWildcardsAreExcludedWhileUnlinkedKeepsDomains(t *testing.T) {
+	s := newTestScheduler(t)
+	ctx := context.Background()
+
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('ls-t','hey.com',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_programs(id,provider,external_id,handle,name)
+		VALUES ('ls-p','hackerone','ls-p','ls-p','Prog')`)
+	_, _ = s.db.Exec(`INSERT INTO project_programs(target_id,program_id,auto_sync) VALUES ('ls-t','ls-p',1)`)
+	_, _ = s.db.Exec(`INSERT INTO bounty_program_assets
+		(id,program_id,external_id,identifier,asset_type,is_wildcard,in_scope,eligible_submission,active) VALUES
+		('ls-pa1','ls-p','ls-e1','*.hey.com','wildcard',1,1,1,1)`)
+	// Approved program wildcard + operator-added unlisted wildcard not in program.
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status) VALUES
+		('ls-a1','ls-t','','*.hey.com','web','wildcard','approved'),
+		('ls-a2','ls-t','','*.rogue.com','web','wildcard','approved')`)
+
+	state, err := s.loadTaskScopeState(ctx, "ls-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := s.loadSubdomainRootsForTaskE(ctx, "ls-t", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"hey.com"}; !reflect.DeepEqual(roots, want) {
+		t.Fatalf("roots with unlisted wildcard=%v, want %v", roots, want)
+	}
+
+	// Suspend *.hey.com -> wildcard roots become empty.
+	_, _ = s.db.Exec(`UPDATE assets SET approval_status='suspended' WHERE id='ls-a1'`)
+	state, err = s.loadTaskScopeState(ctx, "ls-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err = s.loadSubdomainRootsForTaskE(ctx, "ls-t", "hey.com", "", state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("suspended wildcard roots=%v, want empty", roots)
+	}
+
+	// Unlinked manual breadth project still enumerates all approved domain assets.
+	_, _ = s.db.Exec(`INSERT INTO targets(id,domain,watch_only) VALUES ('ul-t','a.example',1)`)
+	_, _ = s.db.Exec(`INSERT INTO assets(id,target_id,name,value,kind,asset_type,approval_status) VALUES
+		('ul-a1','ul-t','','a.example','web','domain','approved'),
+		('ul-a2','ul-t','','b.example','web','domain','approved')`)
+	ulState, err := s.loadTaskScopeState(ctx, "ul-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ulState.linked {
+		t.Fatal("manual project unexpectedly marked linked")
+	}
+	ulRoots, err := s.loadSubdomainRootsForTaskE(ctx, "ul-t", "a.example", "", ulState, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a.example", "b.example"}; !reflect.DeepEqual(ulRoots, want) {
+		t.Fatalf("unlinked manual breadth roots=%v, want %v", ulRoots, want)
+	}
+}

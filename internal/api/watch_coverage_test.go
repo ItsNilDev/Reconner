@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"github.com/recon-platform/internal/models"
 	"github.com/recon-platform/internal/websocket"
 )
 
@@ -207,4 +208,128 @@ func TestPromoteWatchScopeEmptyMetadataOnDeepMonitoredTarget(t *testing.T) {
 	if meta["promoted_to_deep"] != float64(1) || meta["out_of_scope"] != float64(0) {
 		t.Fatalf("metadata=%s, want promoted_to_deep=1 and out_of_scope=0", metadata)
 	}
+}
+
+func addAssetRequest(h *Handler, targetID string, adminID int64, body map[string]any) *httptest.ResponseRecorder {
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/targets/"+targetID+"/assets", bytes.NewReader(raw))
+	req = mux.SetURLVars(req, map[string]string{"id": targetID})
+	req = req.WithContext(context.WithValue(req.Context(), ctxUserIDKey, adminID))
+	rec := httptest.NewRecorder()
+	h.handleAddAsset(rec, req)
+	return rec
+}
+
+func TestHandleAddAssetWatchOnlyWildcardAndScheduleNudge(t *testing.T) {
+	t.Run("unpaused watch target normalizes scheme wildcard and pulls future schedule forward", func(t *testing.T) {
+		h, adminID := newIsoHandler(t)
+		h.hub = websocket.NewHub()
+		if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_paused,watch_next_run)
+			VALUES ('wa-t1','example.com',1,0,datetime('now', '+6 hours'))`); err != nil {
+			t.Fatal(err)
+		}
+		var beforeNext string
+		if err := h.db.QueryRow(`SELECT watch_next_run FROM targets WHERE id='wa-t1'`).Scan(&beforeNext); err != nil {
+			t.Fatal(err)
+		}
+
+		rec := addAssetRequest(h, "wa-t1", adminID, map[string]any{"value": "https://*.example.com/"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Success bool         `json:"success"`
+			Data    models.Asset `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Data.AssetType != "wildcard" || env.Data.MonitorEnabled {
+			t.Fatalf("response asset_type=%q monitor_enabled=%v, want wildcard / false", env.Data.AssetType, env.Data.MonitorEnabled)
+		}
+
+		var assetType string
+		var monitor int
+		if err := h.db.QueryRow(`SELECT asset_type, monitor_enabled FROM assets WHERE target_id='wa-t1' AND value='https://*.example.com/'`).Scan(&assetType, &monitor); err != nil {
+			t.Fatal(err)
+		}
+		if assetType != "wildcard" || monitor != 0 {
+			t.Fatalf("db asset_type=%q monitor_enabled=%d, want wildcard / 0", assetType, monitor)
+		}
+
+		var nudged int
+		var afterNext string
+		if err := h.db.QueryRow(`SELECT COALESCE(watch_next_run,''), CASE WHEN watch_next_run <= datetime('now', '+5 seconds') AND watch_next_run < ? THEN 1 ELSE 0 END FROM targets WHERE id='wa-t1'`, beforeNext).Scan(&afterNext, &nudged); err != nil {
+			t.Fatal(err)
+		}
+		if nudged != 1 {
+			t.Fatalf("future watch_next_run not pulled forward: before=%q after=%q", beforeNext, afterNext)
+		}
+	})
+
+	t.Run("paused watch target keeps pause and future schedule", func(t *testing.T) {
+		h, adminID := newIsoHandler(t)
+		h.hub = websocket.NewHub()
+		if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_paused,watch_next_run)
+			VALUES ('wa-t2','example.com',1,1,'2099-01-01 00:00:00')`); err != nil {
+			t.Fatal(err)
+		}
+		rec := addAssetRequest(h, "wa-t2", adminID, map[string]any{"value": "https://*.paused.example.com/"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var paused int
+		var nextRun string
+		if err := h.db.QueryRow(`SELECT COALESCE(watch_paused,-1), COALESCE(watch_next_run,'') FROM targets WHERE id='wa-t2'`).Scan(&paused, &nextRun); err != nil {
+			t.Fatal(err)
+		}
+		if paused != 1 || nextRun != "2099-01-01 00:00:00" {
+			t.Fatalf("paused target mutated: paused=%d watch_next_run=%q", paused, nextRun)
+		}
+	})
+
+	t.Run("overdue watch target schedule is not demoted", func(t *testing.T) {
+		h, adminID := newIsoHandler(t)
+		h.hub = websocket.NewHub()
+		if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_paused,watch_next_run)
+			VALUES ('wa-t3','example.com',1,0,'2020-01-01 00:00:00')`); err != nil {
+			t.Fatal(err)
+		}
+		rec := addAssetRequest(h, "wa-t3", adminID, map[string]any{"value": "https://*.overdue.example.com/"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var nextRun string
+		if err := h.db.QueryRow(`SELECT COALESCE(watch_next_run,'') FROM targets WHERE id='wa-t3'`).Scan(&nextRun); err != nil {
+			t.Fatal(err)
+		}
+		if nextRun != "2020-01-01 00:00:00" {
+			t.Fatalf("overdue watch_next_run demoted to %q", nextRun)
+		}
+	})
+
+	t.Run("null watch schedule is not woken and missing target returns 404", func(t *testing.T) {
+		h, adminID := newIsoHandler(t)
+		h.hub = websocket.NewHub()
+		if _, err := h.db.Exec(`INSERT INTO targets(id,domain,watch_only,watch_paused,watch_next_run)
+			VALUES ('wa-t4','example.com',1,0,NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		rec := addAssetRequest(h, "wa-t4", adminID, map[string]any{"value": "https://*.nullsched.example.com/"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var isNull int
+		if err := h.db.QueryRow(`SELECT CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END FROM targets WHERE id='wa-t4'`).Scan(&isNull); err != nil {
+			t.Fatal(err)
+		}
+		if isNull != 1 {
+			t.Fatalf("null watch_next_run was unexpectedly populated")
+		}
+
+		missing := addAssetRequest(h, "does-not-exist", adminID, map[string]any{"value": "https://*.missing.example.com/"})
+		if missing.Code != http.StatusNotFound {
+			t.Fatalf("missing target status=%d, want 404", missing.Code)
+		}
+	})
 }

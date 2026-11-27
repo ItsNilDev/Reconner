@@ -995,11 +995,15 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 			}
 			meta := map[string]any{"raw_hash": a.RawHash, "eligible_bounty": bounty == 1, "max_severity": a.MaxSeverity, "instruction": a.Instruction}
 			metaJSON, _ := json.Marshal(meta)
+			assetMonitorEnabled := 1
+			if watchOnly == 1 {
+				assetMonitorEnabled = 0
+			}
 			// The upsert must NOT rewrite a row the watch tier landed
 			// (source='watch:scope'): that row is the operator's landed scope
 			// and keeps its own source, asset_type and metadata. The WHERE on
 			// the conflict clause leaves the landed row untouched.
-			res, err := tx.ExecContext(ctx, `INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status,monitor_enabled,metadata,updated_at) VALUES(?,?,?,?,?,?, 'bounty:catalog',?,'approved',1,?,CURRENT_TIMESTAMP) ON CONFLICT(target_id,value) DO UPDATE SET value=excluded.value,kind=excluded.kind,asset_type=excluded.asset_type,source='bounty:catalog',source_id=excluded.source_id,approval_status='approved',monitor_enabled=1,metadata=excluded.metadata,updated_at=CURRENT_TIMESTAMP WHERE assets.source <> 'watch:scope'`, uuid.New().String(), targetID, a.Identifier, a.Identifier, managedAssetKind(a), a.AssetType, a.ID, string(metaJSON))
+			res, err := tx.ExecContext(ctx, `INSERT INTO assets(id,target_id,name,value,kind,asset_type,source,source_id,approval_status,monitor_enabled,metadata,updated_at) VALUES(?,?,?,?,?,?, 'bounty:catalog',?,'approved',?,?,CURRENT_TIMESTAMP) ON CONFLICT(target_id,value) DO UPDATE SET value=excluded.value,kind=excluded.kind,asset_type=excluded.asset_type,source='bounty:catalog',source_id=excluded.source_id,approval_status='approved',monitor_enabled=excluded.monitor_enabled,metadata=excluded.metadata,updated_at=CURRENT_TIMESTAMP WHERE assets.source <> 'watch:scope'`, uuid.New().String(), targetID, a.Identifier, a.Identifier, managedAssetKind(a), a.AssetType, a.ID, assetMonitorEnabled, string(metaJSON))
 			if err != nil {
 				return err
 			}
@@ -1007,6 +1011,19 @@ func (s *Service) ResolveScopeEvent(ctx context.Context, targetID, eventID, deci
 				return err
 			} else if affected == 0 {
 				if _, err := tx.ExecContext(ctx, `UPDATE assets SET source_id=?, asset_type=CASE WHEN asset_type='subdomain' THEN ? ELSE asset_type END, approval_status='approved', updated_at=CURRENT_TIMESTAMP WHERE target_id=? AND value=? AND source='watch:scope'`, a.ID, a.AssetType, targetID, a.Identifier); err != nil {
+					return err
+				}
+			}
+			if watchOnly == 1 && managedAssetKind(a) == "web" {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE targets
+					SET watch_next_run = datetime('now'), updated_at = CURRENT_TIMESTAMP
+					WHERE id = ?
+					  AND COALESCE(watch_only, 0) = 1
+					  AND COALESCE(watch_paused, 0) = 0
+					  AND watch_next_run IS NOT NULL
+					  AND watch_next_run > datetime('now')
+				`, targetID); err != nil {
 					return err
 				}
 			}

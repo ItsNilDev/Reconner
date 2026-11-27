@@ -156,7 +156,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		}
 	}
 	// Per-asset host scope: only probe hosts belonging to this scoped task.
-	if hostScopeSet(ctx) != nil {
+	if hostScopeSet(ctx) != nil || strictWatchScopeSet(ctx) != nil {
 		kept := hosts[:0]
 		for _, h := range hosts {
 			if hostInScope(ctx, h) {

@@ -1043,3 +1043,170 @@ func TestRejectScopeEventDoesNotReenterHook(t *testing.T) {
 		t.Fatalf("event was not rejected: status=%q err=%v", status, err)
 	}
 }
+
+func TestSchemePrefixedWildcardNormalization(t *testing.T) {
+	svc, db := testCatalog(t)
+	p := Program{
+		Provider:   "hackerone",
+		ExternalID: "scheme-wild-1",
+		Handle:     "schemewild",
+		Name:       "SchemeWild",
+		Status:     "live",
+		Assets: []Asset{
+			{ExternalID: "a1", Identifier: "https://*.example.com/", AssetType: "URL", InScope: true, EligibleSubmission: true, Active: true},
+			{ExternalID: "a2", Identifier: "http://*.sub.example.com:8443/", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+			{ExternalID: "a3", Identifier: "https://exact.example.com/", AssetType: "URL", InScope: true, EligibleSubmission: true, Active: true},
+		},
+	}
+	storeTestProgram(t, svc, &p)
+
+	if p.WildcardCount != 2 {
+		t.Fatalf("WildcardCount = %d, want 2", p.WildcardCount)
+	}
+	for _, tc := range []struct {
+		ident        string
+		wantType     string
+		wantWildcard int
+	}{
+		{"https://*.example.com/", "wildcard", 1},
+		{"http://*.sub.example.com:8443/", "wildcard", 1},
+		{"https://exact.example.com/", "url", 0},
+	} {
+		var assetType string
+		var isWildcard int
+		if err := db.QueryRow(`SELECT asset_type, is_wildcard FROM bounty_program_assets WHERE program_id=? AND identifier=?`, p.ID, tc.ident).Scan(&assetType, &isWildcard); err != nil {
+			t.Fatalf("query %s: %v", tc.ident, err)
+		}
+		if assetType != tc.wantType || isWildcard != tc.wantWildcard {
+			t.Fatalf("%s: got asset_type=%q is_wildcard=%d, want %q / %d", tc.ident, assetType, isWildcard, tc.wantType, tc.wantWildcard)
+		}
+	}
+
+	// Intigriti type 1 (URL/domain) also classifies scheme-prefixed subdomain wildcards
+	// as wildcard without turning path wildcards into subdomain wildcards.
+	if got := normalizeAssetType("intigriti", "intigriti:1", "https://*.example.com/"); got != "wildcard" {
+		t.Fatalf("intigriti:1 scheme wildcard = %q, want wildcard", got)
+	}
+	if got := normalizeAssetType("intigriti", "intigriti:1", "https://example.com/*"); got != "url" {
+		t.Fatalf("intigriti:1 path wildcard = %q, want url", got)
+	}
+}
+
+func TestResolveScopeEventWatchOnlyMonitorAndScheduleNudge(t *testing.T) {
+	cases := []struct {
+		name           string
+		setupSQL       string
+		wantNudged     bool
+		wantNextRun    string // exact expected value when non-empty
+		wantNextNull   bool
+		wantPaused     int
+	}{
+		{
+			name:       "future watch_next_run pulled forward",
+			setupSQL:   `UPDATE targets SET watch_paused=0, watch_next_run=datetime('now', '+6 hours') WHERE id=?`,
+			wantNudged: true,
+			wantPaused: 0,
+		},
+		{
+			name:        "overdue watch_next_run preserved",
+			setupSQL:    `UPDATE targets SET watch_paused=0, watch_next_run='2020-01-01 00:00:00' WHERE id=?`,
+			wantNextRun: "2020-01-01 00:00:00",
+			wantPaused:  0,
+		},
+		{
+			name:         "null watch_next_run not woken",
+			setupSQL:     `UPDATE targets SET watch_paused=0, watch_next_run=NULL WHERE id=?`,
+			wantNextNull: true,
+			wantPaused:   0,
+		},
+		{
+			name:        "paused watch target untouched",
+			setupSQL:    `UPDATE targets SET watch_paused=1, watch_next_run='2099-01-01 00:00:00' WHERE id=?`,
+			wantNextRun: "2099-01-01 00:00:00",
+			wantPaused:  1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, db := testCatalog(t)
+			p := Program{
+				Provider:   "hackerone",
+				ExternalID: "watch-nudge-" + tc.name,
+				Handle:     "watchnudge",
+				Name:       "WatchNudge",
+				Status:     "live",
+				Assets: []Asset{
+					{ExternalID: "s1", Identifier: "exact.nudge.test", AssetType: "DOMAIN", InScope: true, EligibleSubmission: true, Active: true},
+				},
+			}
+			storeTestProgram(t, svc, &p)
+			projectID, err := svc.CreateProject(context.Background(), 0, p.ID, CreateProjectRequest{
+				Name:      "WatchNudge",
+				AssetIDs:  []string{p.Assets[0].ID},
+				WatchOnly: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tc.setupSQL, projectID); err != nil {
+				t.Fatal(err)
+			}
+			var beforeNext string
+			if !tc.wantNextNull {
+				if err := db.QueryRow(`SELECT COALESCE(watch_next_run,'') FROM targets WHERE id=?`, projectID).Scan(&beforeNext); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Add a new wildcard asset upstream and approve the resulting scope event.
+			p.Assets = append(p.Assets, Asset{
+				ExternalID: "s2", Identifier: "*.nudge.test", AssetType: "WILDCARD", InScope: true, EligibleSubmission: true, Active: true,
+			})
+			storeTestProgram(t, svc, &p)
+			var eventID string
+			if err := db.QueryRow(`SELECT id FROM bounty_scope_events WHERE target_id=? AND event_type='added' AND status='pending'`, projectID).Scan(&eventID); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.ResolveScopeEvent(context.Background(), projectID, eventID, "approve"); err != nil {
+				t.Fatal(err)
+			}
+
+			var monitorEnabled int
+			var assetType, approval string
+			if err := db.QueryRow(`SELECT monitor_enabled, asset_type, approval_status FROM assets WHERE target_id=? AND value='*.nudge.test'`, projectID).Scan(&monitorEnabled, &assetType, &approval); err != nil {
+				t.Fatal(err)
+			}
+			if monitorEnabled != 0 || assetType != "wildcard" || approval != "approved" {
+				t.Fatalf("approved asset monitor=%d type=%q approval=%q, want 0 / wildcard / approved", monitorEnabled, assetType, approval)
+			}
+
+			var paused, isNull int
+			var afterNext string
+			if err := db.QueryRow(`SELECT COALESCE(watch_paused,-1), CASE WHEN watch_next_run IS NULL THEN 1 ELSE 0 END, COALESCE(watch_next_run,'') FROM targets WHERE id=?`, projectID).Scan(&paused, &isNull, &afterNext); err != nil {
+				t.Fatal(err)
+			}
+			if paused != tc.wantPaused {
+				t.Fatalf("watch_paused = %d, want %d", paused, tc.wantPaused)
+			}
+			if tc.wantNextNull {
+				if isNull != 1 {
+					t.Fatalf("watch_next_run = %q, want NULL", afterNext)
+				}
+				return
+			}
+			if tc.wantNextRun != "" && afterNext != tc.wantNextRun {
+				t.Fatalf("watch_next_run = %q, want %q", afterNext, tc.wantNextRun)
+			}
+			if tc.wantNudged {
+				var dueNow int
+				if err := db.QueryRow(`SELECT CASE WHEN watch_next_run <= datetime('now', '+5 seconds') AND watch_next_run < ? THEN 1 ELSE 0 END FROM targets WHERE id=?`, beforeNext, projectID).Scan(&dueNow); err != nil {
+					t.Fatal(err)
+				}
+				if dueNow != 1 {
+					t.Fatalf("future watch_next_run was not pulled forward: before=%q after=%q", beforeNext, afterNext)
+				}
+			}
+		})
+	}
+}
