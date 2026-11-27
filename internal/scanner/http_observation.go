@@ -21,22 +21,23 @@ const (
 )
 
 type HTTPObservation struct {
-	TargetID      string
-	TaskID        string
-	URL           string
-	Host          string
-	SubdomainID   string
-	StatusCode    int
-	Title         string
-	Server        string
-	Technologies  string // JSON array
-	RedirectURL   string
-	BodyHash      string
-	ContentType   string
-	ContentLength int
-	Source        string
-	ProbeTier     string
-	Type          string
+	TargetID          string
+	TaskID            string
+	URL               string
+	Host              string
+	SubdomainID       string
+	StatusCode        int
+	Title             string
+	Server            string
+	Technologies      string // JSON array
+	RedirectURL       string
+	BodyHash          string
+	ContentType       string
+	ContentLength     int
+	Source            string
+	ProbeTier         string
+	Type              string
+	PinBaselineStatus bool
 }
 
 type observedChange struct {
@@ -94,6 +95,106 @@ func ValidHTTPStatus(code int) bool {
 	return code >= 100 && code <= 599
 }
 
+// isRedirectStatus reports whether code is a standard HTTP redirect status.
+func isRedirectStatus(code int) bool {
+	return code == 301 || code == 302 || code == 303 || code == 307 || code == 308
+}
+
+// normalizeRedirectTarget canonicalizes a redirect Location/final_url against
+// baseURL for destination-equivalence comparison. It resolves relative and
+// scheme-relative targets, lowercases scheme/host, strips trailing dots, default
+// ports (http:80, https:443), fragments, and query strings (so volatile SSO/OAuth
+// state/nonce/csrf query params do not trigger constant redirect_change noise).
+func normalizeRedirectTarget(baseURL, rawLocation string) string {
+	raw := strings.TrimSpace(rawLocation)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
+			raw = raw[:idx]
+		}
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+	if base := strings.TrimSpace(baseURL); base != "" {
+		if bu, berr := url.Parse(base); berr == nil && bu.Scheme != "" && bu.Host != "" {
+			u = bu.ResolveReference(u)
+		}
+	}
+	if u.Scheme == "" || u.Host == "" {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return strings.ToLower(strings.TrimSpace(u.String()))
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return strings.ToLower(strings.TrimSpace(u.String()))
+	}
+	port := u.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	hostPart := host
+	if port != "" {
+		hostPart = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		hostPart = "[" + host + "]"
+	}
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	return scheme + "://" + hostPart + path
+}
+
+// isEquivalentRedirectStatus reports whether two redirect status codes point to
+// the same destination (or the prior baseline had no recorded target yet, for
+// pre-upgrade compatibility), so 301 <-> 302 edge/CDN alternation is suppressed.
+func isEquivalentRedirectStatus(baseURL string, oldCode, newCode int, oldTarget, newTarget string) bool {
+	if !isRedirectStatus(oldCode) || !isRedirectStatus(newCode) {
+		return false
+	}
+	oldNorm := normalizeRedirectTarget(baseURL, oldTarget)
+	if oldNorm == "" {
+		return true
+	}
+	return oldNorm == normalizeRedirectTarget(baseURL, newTarget)
+}
+
+// isRedirectBoilerplateTitle reports whether title is empty or a standard
+// proxy/CDN redirect boilerplate title (e.g. "301 Moved Permanently", "302 Found").
+func isRedirectBoilerplateTitle(title string) bool {
+	t := strings.ToLower(strings.TrimSpace(title))
+	if t == "" {
+		return true
+	}
+	switch t {
+	case "301 moved permanently",
+		"302 found",
+		"302 moved temporarily",
+		"303 see other",
+		"307 temporary redirect",
+		"308 permanent redirect",
+		"moved permanently",
+		"found",
+		"moved temporarily",
+		"temporary redirect",
+		"permanent redirect",
+		"object moved":
+		return true
+	}
+	for _, pfx := range []string{"301 ", "302 ", "303 ", "307 ", "308 "} {
+		if strings.HasPrefix(t, pfx) {
+			return true
+		}
+	}
+	return false
+}
+
 type observationBaseline struct {
 	status   int
 	title    string
@@ -147,22 +248,100 @@ func readBaseline(ctx context.Context, tx *sql.Tx, targetID, serviceURL, obsType
 	return b, true, nil
 }
 
-func compareObservation(b observationBaseline, obs HTTPObservation) []observedChange {
-	var out []observedChange
-	if ValidHTTPStatus(b.status) && ValidHTTPStatus(obs.StatusCode) && b.status != obs.StatusCode {
-		out = append(out, observedChange{
-			ChangeType: "status_change",
-			OldValue:   fmt.Sprintf("status=%d title=%s", b.status, b.title),
-			NewValue:   fmt.Sprintf("status=%d title=%s", obs.StatusCode, obs.Title),
-			Severity:   "medium",
-			OldStatus:  b.status,
-			NewStatus:  obs.StatusCode,
-			Metadata:   fmt.Sprintf(`{"old_code":%d,"new_code":%d,"source":%q}`, b.status, obs.StatusCode, obs.Type),
-		})
+func (s *HTTPScanner) preloadBaselines(ctx context.Context, targetID, obsType string) map[string]observationBaseline {
+	out := map[string]observationBaseline{}
+	if s == nil || s.db == nil || targetID == "" || obsType == "" {
+		return out
 	}
-	if b.title != obs.Title {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT service_url, status_code, title, server, technologies, redirect_url, body_hash
+		FROM http_observation_baselines
+		WHERE target_id=? AND observation_type=?`,
+		targetID, obsType)
+	if err == nil {
+		for rows.Next() {
+			var serviceURL string
+			var b observationBaseline
+			if rows.Scan(&serviceURL, &b.status, &b.title, &b.server, &b.tech, &b.redirect, &b.bodyHash) == nil && serviceURL != "" {
+				out[serviceURL] = b
+			}
+		}
+		rows.Close()
+	}
+
+	svcRows, err := s.db.QueryContext(ctx, `
+		SELECT url, status_code, COALESCE(title,''), COALESCE(server,''),
+		       COALESCE(technologies,'[]'), COALESCE(redirect_url,''),
+		       COALESCE(source,'probe'), COALESCE(probe_tier,'')
+		FROM http_services
+		WHERE target_id=?`,
+		targetID)
+	if err == nil {
+		for svcRows.Next() {
+			var rawURL, source, tier string
+			var b observationBaseline
+			if svcRows.Scan(&rawURL, &b.status, &b.title, &b.server, &b.tech, &b.redirect, &source, &tier) != nil {
+				continue
+			}
+			serviceURL := NormalizeServiceURL(rawURL)
+			if serviceURL == "" {
+				continue
+			}
+			if _, exists := out[serviceURL]; exists {
+				continue
+			}
+			reliable := source == "probe" && ValidHTTPStatus(b.status)
+			if obsType == ObservationWatch {
+				reliable = reliable && (tier == "watch" || tier == "")
+			} else if obsType == ObservationDeep {
+				reliable = reliable && (tier == "deep" || tier == "")
+			} else if obsType == ObservationMonitor {
+				reliable = reliable && (tier == "deep" || tier == "")
+			}
+			if reliable {
+				out[serviceURL] = b
+			}
+		}
+		svcRows.Close()
+	}
+	return out
+}
+
+func compareObservation(baseURL string, b observationBaseline, obs HTTPObservation) ([]observedChange, int, string) {
+	var out []observedChange
+	effectiveStatus := obs.StatusCode
+	effectiveTitle := obs.Title
+
+	if obs.PinBaselineStatus && ValidHTTPStatus(b.status) {
+		effectiveStatus = b.status
+		if isRedirectBoilerplateTitle(b.title) && isRedirectBoilerplateTitle(obs.Title) {
+			effectiveTitle = b.title
+		}
+	} else if ValidHTTPStatus(b.status) && ValidHTTPStatus(obs.StatusCode) && b.status != obs.StatusCode {
+		if isEquivalentRedirectStatus(baseURL, b.status, obs.StatusCode, b.redirect, obs.RedirectURL) {
+			effectiveStatus = b.status
+			if isRedirectBoilerplateTitle(b.title) && isRedirectBoilerplateTitle(obs.Title) {
+				effectiveTitle = b.title
+			}
+		} else {
+			out = append(out, observedChange{
+				ChangeType: "status_change",
+				OldValue:   fmt.Sprintf("status=%d title=%s", b.status, b.title),
+				NewValue:   fmt.Sprintf("status=%d title=%s", obs.StatusCode, obs.Title),
+				Severity:   "medium",
+				OldStatus:  b.status,
+				NewStatus:  obs.StatusCode,
+				Metadata:   fmt.Sprintf(`{"old_code":%d,"new_code":%d,"source":%q}`, b.status, obs.StatusCode, obs.Type),
+			})
+		}
+	}
+	if ValidHTTPStatus(b.status) && isEquivalentRedirectStatus(baseURL, b.status, effectiveStatus, b.redirect, obs.RedirectURL) &&
+		isRedirectBoilerplateTitle(b.title) && isRedirectBoilerplateTitle(effectiveTitle) {
+		effectiveTitle = b.title
+	}
+	if b.title != effectiveTitle {
 		out = append(out, observedChange{
-			ChangeType: "page_change", OldValue: b.title, NewValue: obs.Title, Severity: "low",
+			ChangeType: "page_change", OldValue: b.title, NewValue: effectiveTitle, Severity: "low",
 			Metadata: fmt.Sprintf(`{"source":%q}`, obs.Type),
 		})
 	}
@@ -174,11 +353,23 @@ func compareObservation(b observationBaseline, obs HTTPObservation) []observedCh
 			Metadata: fmt.Sprintf(`{"source":%q}`, obs.Type),
 		})
 	}
-	if b.redirect != obs.RedirectURL {
-		out = append(out, observedChange{
-			ChangeType: "redirect_change", OldValue: b.redirect, NewValue: obs.RedirectURL, Severity: "low",
-			Metadata: fmt.Sprintf(`{"source":%q}`, obs.Type),
-		})
+	// Silent upgrade backfill: pre-upgrade baselines have empty redirect_url on
+	// 3xx rows. Persist obs.RedirectURL silently without firing redirect_change.
+	silentBackfill := strings.TrimSpace(b.redirect) == "" && isRedirectStatus(b.status) && strings.TrimSpace(obs.RedirectURL) != ""
+	if !silentBackfill {
+		oldNorm := normalizeRedirectTarget(baseURL, b.redirect)
+		newNorm := normalizeRedirectTarget(baseURL, obs.RedirectURL)
+		if oldNorm != newNorm && (oldNorm != "" || newNorm != "" || isRedirectStatus(b.status) != isRedirectStatus(effectiveStatus)) {
+			out = append(out, observedChange{
+				ChangeType: "redirect_change",
+				OldValue:   b.redirect,
+				NewValue:   obs.RedirectURL,
+				Severity:   "low",
+				OldStatus:  b.status,
+				NewStatus:  effectiveStatus,
+				Metadata:   fmt.Sprintf(`{"source":%q}`, obs.Type),
+			})
+		}
 	}
 	if b.bodyHash != "" && obs.BodyHash != "" && b.bodyHash != obs.BodyHash {
 		out = append(out, observedChange{
@@ -186,7 +377,7 @@ func compareObservation(b observationBaseline, obs HTTPObservation) []observedCh
 			Metadata: fmt.Sprintf(`{"source":%q}`, obs.Type),
 		})
 	}
-	return out
+	return out, effectiveStatus, effectiveTitle
 }
 
 // upsertObservationBaseline advances a comparison baseline. An unknown code
@@ -218,32 +409,44 @@ func upsertObservationBaseline(ctx context.Context, exec execContexter, targetID
 // published until commit, so a failed event write cannot advance the baseline
 // on its own. The caller retries the observation if this returns an error.
 func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation) error {
+	_, err := s.recordObservationWithEffectiveStatus(ctx, obs)
+	return err
+}
+
+func (s *HTTPScanner) recordObservationWithEffectiveStatus(ctx context.Context, obs HTTPObservation) (int, error) {
 	serviceURL := NormalizeServiceURL(obs.URL)
 	if obs.TargetID == "" || serviceURL == "" || obs.Type == "" {
-		return fmt.Errorf("incomplete HTTP observation")
+		return 0, fmt.Errorf("incomplete HTTP observation")
 	}
 	if obs.Type != ObservationWatch && obs.Type != ObservationDeep && obs.Type != ObservationMonitor {
-		return fmt.Errorf("unknown HTTP observation type %q", obs.Type)
+		return 0, fmt.Errorf("unknown HTTP observation type %q", obs.Type)
 	}
 	// A status-zero response is not an observation. Never let it replace a
 	// valid baseline or the last good service row.
 	if !ValidHTTPStatus(obs.StatusCode) {
-		return nil
+		return 0, nil
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	baseline, hadBaseline, err := readBaseline(ctx, tx, obs.TargetID, serviceURL, obs.Type)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	changes := []observedChange{}
+	effectiveStatus := obs.StatusCode
+	effectiveTitle := obs.Title
+	effectiveRedirect := obs.RedirectURL
 	if hadBaseline {
-		changes = compareObservation(baseline, obs)
+		if obs.PinBaselineStatus && strings.TrimSpace(obs.RedirectURL) == "" && strings.TrimSpace(baseline.redirect) != "" {
+			obs.RedirectURL = baseline.redirect
+			effectiveRedirect = baseline.redirect
+		}
+		changes, effectiveStatus, effectiveTitle = compareObservation(serviceURL, baseline, obs)
 	}
 
 	var events []observedChange
@@ -265,7 +468,7 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 				c.Severity, c.OldStatus, c.NewStatus)
 		}
 		if err != nil {
-			return fmt.Errorf("write %s event: %w", c.ChangeType, err)
+			return 0, fmt.Errorf("write %s event: %w", c.ChangeType, err)
 		}
 		if c.ChangeType == "status_change" {
 			title := notificationTitle(c.ChangeType)
@@ -279,15 +482,15 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 				VALUES (?,?,?,?,?,?,?,0,?,?,?,?,CURRENT_TIMESTAMP)`,
 				uuid.NewString(), obs.TargetID, c.ChangeType, title, body, serviceURL,
 				c.Severity, c.Metadata, c.ID, c.OldValue, c.NewValue); err != nil {
-				return fmt.Errorf("write %s bell entry: %w", c.ChangeType, err)
+				return 0, fmt.Errorf("write %s bell entry: %w", c.ChangeType, err)
 			}
 		}
 		events = append(events, c)
 	}
 
 	if err = upsertObservationBaseline(ctx, tx, obs.TargetID, serviceURL, obs.Type,
-		obs.StatusCode, obs.Title, obs.Server, obs.Technologies, obs.RedirectURL, obs.BodyHash); err != nil {
-		return fmt.Errorf("update observation baseline: %w", err)
+		effectiveStatus, effectiveTitle, obs.Server, obs.Technologies, effectiveRedirect, obs.BodyHash); err != nil {
+		return 0, fmt.Errorf("update observation baseline: %w", err)
 	}
 
 	source := obs.Source
@@ -307,13 +510,13 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 			subdomain_id=COALESCE(excluded.subdomain_id, http_services.subdomain_id),
 			source=CASE WHEN COALESCE(http_services.source,'')='seed' THEN 'probe' ELSE http_services.source END`,
 		uuid.NewString(), obs.TargetID, nullableString(obs.SubdomainID), serviceURL,
-		obs.StatusCode, obs.Title, obs.Server, obs.ContentType, obs.ContentLength,
-		obs.RedirectURL, obs.Technologies, obs.ProbeTier, source); err != nil {
-		return fmt.Errorf("update service inventory: %w", err)
+		effectiveStatus, effectiveTitle, obs.Server, obs.ContentType, obs.ContentLength,
+		effectiveRedirect, obs.Technologies, obs.ProbeTier, source); err != nil {
+		return 0, fmt.Errorf("update service inventory: %w", err)
 	}
 
 	if err = tx.Commit(); err != nil {
-		return err
+		return 0, err
 	}
 	if len(events) > 0 && s.broadcast != nil {
 		s.broadcast("changes_written", map[string]any{"target_id": obs.TargetID, "count": len(events)})
@@ -328,5 +531,5 @@ func (s *HTTPScanner) recordObservation(ctx context.Context, obs HTTPObservation
 			"old_status": c.OldStatus, "new_status": c.NewStatus, "url": serviceURL,
 		})
 	}
-	return nil
+	return effectiveStatus, nil
 }

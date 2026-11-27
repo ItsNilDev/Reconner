@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CHANGE_TABS,
   categoryForChangeType,
   changeBadgeVariant,
   changeHosts,
   inlineDiffPieces,
   isScopeEvent,
+  parseFormattedStatusTitle,
   parseStatusTransition,
   scopeEventSummary,
 } from './changesModel'
@@ -118,6 +120,64 @@ describe('parseStatusTransition', () => {
 
   it('returns undefined when no code is present', () => {
     expect(parseStatusTransition('title changed', 'new title')).toEqual({ oldCode: undefined, newCode: undefined })
+  })
+
+  it('ignores status=NNN embedded inside raw page titles', () => {
+    expect(parseStatusTransition('API status=200 Live', 'API status=403 Down')).toEqual({
+      oldCode: undefined,
+      newCode: undefined,
+    })
+  })
+})
+
+describe('parseFormattedStatusTitle', () => {
+  it('extracts valid status code and title', () => {
+    expect(parseFormattedStatusTitle('status=200 title=Welcome Home')).toEqual({
+      code: 200,
+      title: 'Welcome Home',
+    })
+  })
+
+  it('handles 1-digit status=0, out-of-range codes, empty titles, and multiline titles', () => {
+    expect(parseFormattedStatusTitle('status=0 title=Offline')).toEqual({
+      code: undefined,
+      title: 'Offline',
+    })
+    expect(parseFormattedStatusTitle('status=999 title=Invalid')).toEqual({
+      code: undefined,
+      title: 'Invalid',
+    })
+    expect(parseFormattedStatusTitle('status=200 title=')).toEqual({
+      code: 200,
+      title: '',
+    })
+    expect(parseFormattedStatusTitle('status=200 title=Line 1\nLine 2 title=extra')).toEqual({
+      code: 200,
+      title: 'Line 1\nLine 2 title=extra',
+    })
+  })
+
+  it('returns null for unformatted strings', () => {
+    expect(parseFormattedStatusTitle('')).toBeNull()
+    expect(parseFormattedStatusTitle('Plain page title')).toBeNull()
+    expect(parseFormattedStatusTitle('2026-01-02 status=200 title=Home')).toBeNull()
+  })
+})
+
+describe('CHANGE_TABS', () => {
+  it('exposes the 7 non-overlapping tabs with categories and tooltips', () => {
+    expect(CHANGE_TABS.map(t => [t.id, t.label, t.category])).toEqual([
+      ['all', 'All', undefined],
+      ['hosts', 'New hosts', 'hosts'],
+      ['status', 'Status & Redirects', 'status'],
+      ['title', 'Titles', 'title'],
+      ['tech', 'Tech', 'tech'],
+      ['scope', 'Scope', 'scope'],
+      ['security_js', 'Scripts & Security', 'security,headers,scripts'],
+    ])
+    for (const tab of CHANGE_TABS.filter(t => t.id !== 'all')) {
+      expect(tab.title).toBeTruthy()
+    }
   })
 })
 

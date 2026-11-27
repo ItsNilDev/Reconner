@@ -1415,3 +1415,259 @@ func TestChangesCategoryHostsAndScope(t *testing.T) {
 		}
 	})
 }
+
+func TestChangesVirtualCategoriesStatusTitleContentAndPrefixParsing(t *testing.T) {
+	h, adminID := newIsoHandler(t)
+	for _, stmt := range []struct {
+		q    string
+		args []any
+	}{
+		{`INSERT INTO targets (id, domain, owner_id) VALUES ('t1','one.example',?)`, []any{adminID}},
+		// Status transitions:
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-status-flip','t1','r1','https://w1.one.example','status_change','status=200 title=Old','status=403 title=New','medium',200,403,'2026-07-01 00:00:01')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-status-same','t1','r1','https://w2.one.example','status_change','status=200 title=A','status=200 title=B','low',200,200,'2026-07-01 00:00:02')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http-both','t1','https://m1.one.example','http_change','status=403 title=Forbidden','status=200 title=OK','high',0,0,'2026-07-01 00:00:03')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http-status-only','t1','https://m2.one.example','http_change','status=200 title=App title=v1','status=500 title=App title=v1','high',200,500,'2026-07-01 00:00:04')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('wc-redirect','t1','r1','https://r1.one.example','redirect_change','https://a.example','https://b.example','medium',301,302,'2026-07-01 00:00:05')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-redirect','t1','https://r2.one.example','redirect_change','https://old.example','https://new.example','medium',0,0,'2026-07-01 00:00:06')`, nil},
+		// Title changes:
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http-title-only','t1','https://t1.one.example','http_change','status=200 title=Alpha','status=200 title=Beta','low',200,200,'2026-07-01 00:00:07')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http-zero-status','t1','https://t2.one.example','http_change','status=0 title=','status=200 title=Home','low',0,200,'2026-07-01 00:00:08')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-http-extra-title','t1','https://t3.one.example','http_change','status=200 title=Foo title=One','status=200 title=Foo title=Two','low',200,200,'2026-07-01 00:00:09')`, nil},
+		{`INSERT INTO watch_round_changes (id,target_id,task_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('wc-page-raw','t1','r1','https://t4.one.example','page_change','Old Watch Title','New Watch Title','low','2026-07-01 00:00:10')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-page-empty-to-text','t1','https://t5.one.example','page_change','','Dashboard','low','2026-07-01 00:00:11')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-page-text-to-empty','t1','https://t6.one.example','page_change','Landing','','low','2026-07-01 00:00:12')`, nil},
+		// Raw page_change whose title embeds "status=NNN " mid-string (must NOT spoof status parsing):
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-page-spoof','t1','https://spoof.one.example','page_change','API status=200 Live','API status=403 Maintenance','low',0,0,'2026-07-01 00:00:13')`, nil},
+		// Body-only identical page_change rows (must NOT match category=title):
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-page-ident-raw','t1','https://id1.one.example','page_change','Same Title','Same Title','low',0,0,'2026-07-01 00:00:14')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,old_status,new_status,detected_at)
+			VALUES ('mc-page-ident-fmt','t1','https://id2.one.example','page_change','status=200 title=Same','status=200 title=Same','low',200,200,'2026-07-01 00:00:15')`, nil},
+		// Content, tech, and alert rows:
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-content','t1','https://c.one.example','content_change','hash=aaa','hash=bbb','low','2026-07-01 00:00:16')`, nil},
+		{`INSERT INTO monitoring_changes (id,target_id,url,change_type,old_value,new_value,severity,detected_at)
+			VALUES ('mc-tech','t1','https://tech.one.example','tech_change','nginx','cloudflare','low','2026-07-01 00:00:17')`, nil},
+		{`INSERT INTO notifications (id,target_id,type,title,body,severity,created_at)
+			VALUES ('n-alert','t1','watch_failed','Round failed','status=200 title=A','high','2026-07-01 00:00:18')`, nil},
+	} {
+		if _, err := h.db.Exec(stmt.q, stmt.args...); err != nil {
+			t.Fatalf("seed %s: %v", stmt.q, err)
+		}
+	}
+
+	sid, err := h.auth.Login("admin", config.DefaultAdminPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantStatus := map[string]bool{
+		"wc-status-flip":      true,
+		"mc-http-both":        true,
+		"mc-http-status-only": true,
+		"wc-redirect":         true,
+		"mc-redirect":         true,
+	}
+	wantTitle := map[string]bool{
+		"mc-http-both":          true,
+		"mc-http-title-only":    true,
+		"mc-http-zero-status":   true,
+		"mc-http-extra-title":   true,
+		"wc-page-raw":           true,
+		"mc-page-empty-to-text": true,
+		"mc-page-text-to-empty": true,
+		"mc-page-spoof":         true,
+	}
+	wantStatusOrTitle := map[string]bool{}
+	for id := range wantStatus {
+		wantStatusOrTitle[id] = true
+	}
+	for id := range wantTitle {
+		wantStatusOrTitle[id] = true
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want map[string]bool
+	}{
+		{
+			name: "category=status",
+			path: "/api/changes?category=status",
+			want: wantStatus,
+		},
+		{
+			name: "category=all,status drops all",
+			path: "/api/changes?category=all,status",
+			want: wantStatus,
+		},
+		{
+			name: "category=title",
+			path: "/api/changes?category=title",
+			want: wantTitle,
+		},
+		{
+			name: "category=content",
+			path: "/api/changes?category=content",
+			want: map[string]bool{"mc-content": true},
+		},
+		{
+			name: "category=status,title OR composition",
+			path: "/api/changes?category=status,title",
+			want: wantStatusOrTitle,
+		},
+		{
+			name: "category=status,title with source=watch AND precedence",
+			path: "/api/changes?category=status,title&source=watch",
+			want: map[string]bool{
+				"wc-status-flip": true,
+				"wc-redirect":    true,
+				"wc-page-raw":    true,
+			},
+		},
+		{
+			name: "category=tech,content mixes standard and virtual categories",
+			path: "/api/changes?category=tech,content",
+			want: map[string]bool{"mc-tech": true, "mc-content": true},
+		},
+		{
+			name: "default_view=1 excludes raw page_change with embedded status=",
+			path: "/api/changes?default_view=1",
+			want: map[string]bool{
+				"wc-status-flip":      true,
+				"mc-http-both":        true,
+				"mc-http-status-only": true,
+			},
+		},
+		{
+			name: "status_only=1 excludes raw page_change with embedded status=",
+			path: "/api/changes?status_only=1",
+			want: map[string]bool{
+				"wc-status-flip":      true,
+				"mc-http-both":        true,
+				"mc-http-status-only": true,
+				"wc-redirect":         true,
+			},
+		},
+		{
+			name: "status_code=403 excludes spoofed title",
+			path: "/api/changes?status_code=403",
+			want: map[string]bool{
+				"wc-status-flip": true,
+				"mc-http-both":   true,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveChanges(t, h, sid, tc.path, nil, h.handleListChanges)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var env changesEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := idsOf(env.Data)
+			if len(got) != len(tc.want) || env.Total != len(tc.want) {
+				t.Fatalf("got ids=%v (total=%d), want %v", got, env.Total, tc.want)
+			}
+			for id := range tc.want {
+				if !got[id] {
+					t.Errorf("missing %q in %v", id, got)
+				}
+			}
+		})
+	}
+
+	// Mark-all-seen with category=title marks only title rows and pairs cleanly with hide_seen=1.
+	t.Run("seen-all with category=title marks only title rows", func(t *testing.T) {
+		rec := postChanges(t, h, sid, "/api/changes/seen-all?category=title", map[string]any{}, h.handleMarkAllChangesSeen)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("seen-all title status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		listRec := serveChanges(t, h, sid, "/api/changes", nil, h.handleListChanges)
+		if listRec.Code != http.StatusOK {
+			t.Fatalf("list status = %d, body = %s", listRec.Code, listRec.Body.String())
+		}
+		var env changesEnvelope
+		if err := json.Unmarshal(listRec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, row := range env.Data {
+			if wantTitle[row.ID] && !row.Seen {
+				t.Errorf("expected title row %s to be marked seen", row.ID)
+			}
+			if !wantTitle[row.ID] && row.Seen {
+				t.Errorf("expected non-title row %s to remain unseen", row.ID)
+			}
+		}
+
+		// category=status,title&hide_seen=1 must return only status rows not already marked seen by title.
+		unreadRec := serveChanges(t, h, sid, "/api/changes?category=status,title&hide_seen=1", nil, h.handleListChanges)
+		if unreadRec.Code != http.StatusOK {
+			t.Fatalf("hide_seen status = %d, body = %s", unreadRec.Code, unreadRec.Body.String())
+		}
+		var unreadEnv changesEnvelope
+		if err := json.Unmarshal(unreadRec.Body.Bytes(), &unreadEnv); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		gotUnread := idsOf(unreadEnv.Data)
+		wantUnread := map[string]bool{
+			"wc-status-flip":      true,
+			"mc-http-status-only": true,
+			"wc-redirect":         true,
+			"mc-redirect":         true,
+		}
+		if len(gotUnread) != len(wantUnread) {
+			t.Fatalf("category=status,title&hide_seen=1 ids=%v, want %v", gotUnread, wantUnread)
+		}
+		for id := range wantUnread {
+			if !gotUnread[id] {
+				t.Errorf("missing unread %q in %v", id, gotUnread)
+			}
+		}
+	})
+
+	// Mark-all-seen with category=status marks remaining status rows and leaves content/tech/alerts unseen.
+	t.Run("seen-all with category=status marks only status rows", func(t *testing.T) {
+		if _, err := h.db.Exec(`DELETE FROM change_seen`); err != nil {
+			t.Fatal(err)
+		}
+		rec := postChanges(t, h, sid, "/api/changes/seen-all?category=status", map[string]any{}, h.handleMarkAllChangesSeen)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("seen-all status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		listRec := serveChanges(t, h, sid, "/api/changes", nil, h.handleListChanges)
+		if listRec.Code != http.StatusOK {
+			t.Fatalf("list status = %d, body = %s", listRec.Code, listRec.Body.String())
+		}
+		var env changesEnvelope
+		if err := json.Unmarshal(listRec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, row := range env.Data {
+			if wantStatus[row.ID] && !row.Seen {
+				t.Errorf("expected status row %s to be marked seen", row.ID)
+			}
+			if !wantStatus[row.ID] && row.Seen {
+				t.Errorf("expected non-status row %s to remain unseen", row.ID)
+			}
+		}
+	})
+}

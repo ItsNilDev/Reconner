@@ -394,3 +394,165 @@ func TestMonitorHashOnlyJSAndCSSChangesDoNotAlertBellOrTelegram(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMonitorProjectAssetsBodyOnlyEmitsContentChangeAndJSUpsertsJSFiles(t *testing.T) {
+	var mu sync.RWMutex
+	pageBody := `<html><head><title>Portal</title></head><body>version 1</body></html>`
+	jsBody := `console.log("v1");`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		pb, jb := pageBody, jsBody
+		mu.RUnlock()
+		if r.URL.Path == "/app.js" {
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(jb))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(pb))
+	}))
+	defer srv.Close()
+
+	db := newMonitorTestDB(t)
+	ctx := context.Background()
+	targetID := uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO targets(id,domain) VALUES(?,?)`, targetID, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	pageAssetID := uuid.NewString()
+	jsAssetID := uuid.NewString()
+	jsURL := srv.URL + "/app.js"
+	if _, err := db.Exec(`INSERT INTO assets(id,target_id,value,kind,asset_type,approval_status,monitor_enabled,metadata)
+		VALUES(?,?,?,?,?,?,1,'{}'),(?,?,?,?,?,?,1,'{}')`,
+		pageAssetID, targetID, srv.URL+"/", "web", "url", "approved",
+		jsAssetID, targetID, jsURL, "web", "js", "approved"); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &MonitorScanner{db: db}
+	logFn := func(string, string, string) {}
+
+	// Pass 1: establish baselines (page metadata + js_files capture).
+	changed, err := s.monitorProjectAssets(ctx, targetID, "", nil, map[string]bool{}, map[string]bool{}, logFn)
+	if err != nil {
+		t.Fatalf("pass 1 failed: %v", err)
+	}
+	if changed != 0 {
+		t.Fatalf("pass 1 changed=%d, want 0", changed)
+	}
+
+	var firstHash, firstBody string
+	if err := db.QueryRow(`SELECT hash, body FROM js_files WHERE target_id=? AND url=?`, targetID, jsURL).Scan(&firstHash, &firstBody); err != nil {
+		t.Fatalf("pass 1 did not upsert js_files row: %v", err)
+	}
+	if firstHash == "" || firstBody != `console.log("v1");` {
+		t.Fatalf("pass 1 js_files mismatch: hash=%q body=%q", firstHash, firstBody)
+	}
+
+	// Pass 2: body-only page change (same status 200 and same title "Portal") + JS content change.
+	mu.Lock()
+	pageBody = `<html><head><title>Portal</title></head><body>version 2 completely updated body</body></html>`
+	jsBody = `console.log("v2");`
+	mu.Unlock()
+
+	changed, err = s.monitorProjectAssets(ctx, targetID, "", nil, map[string]bool{}, map[string]bool{}, logFn)
+	if err != nil {
+		t.Fatalf("pass 2 failed: %v", err)
+	}
+	if changed != 2 {
+		t.Fatalf("pass 2 changed=%d, want 2 (1 content_change + 1 js_change)", changed)
+	}
+
+	// Verify HTML body-only change emitted content_change (NOT page_change).
+	var contentCount, pageCount int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='content_change'`, targetID).Scan(&contentCount)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='page_change'`, targetID).Scan(&pageCount)
+	if contentCount != 1 || pageCount != 0 {
+		t.Fatalf("body-only asset change emitted content_change=%d page_change=%d, want 1/0", contentCount, pageCount)
+	}
+
+	// Verify js_files rolled old_hash/old_body and stored new hash/body for Diff viewer.
+	var newHash, newBody, oldHash, oldBody string
+	if err := db.QueryRow(`SELECT hash, body, old_hash, old_body FROM js_files WHERE target_id=? AND url=?`, targetID, jsURL).Scan(&newHash, &newBody, &oldHash, &oldBody); err != nil {
+		t.Fatalf("pass 2 js_files query failed: %v", err)
+	}
+	if oldHash != firstHash || oldBody != `console.log("v1");` || newHash == firstHash || newBody != `console.log("v2");` {
+		t.Fatalf("js_files diff roll mismatch: old=%q/%q new=%q/%q", oldHash, oldBody, newHash, newBody)
+	}
+}
+
+func TestMonitorRunSuppressesSameDestinationRedirectFlip(t *testing.T) {
+	var mu sync.RWMutex
+	status := http.StatusFound
+	location := "https://other-host.example.test/login?state=aaa"
+	body := `<html><head><title>302 Found</title></head><body>302 Found</body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.RLock()
+		st, loc, b := status, location, body
+		mu.RUnlock()
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Location", loc)
+		w.WriteHeader(st)
+		_, _ = w.Write([]byte(b))
+	}))
+	defer srv.Close()
+
+	db := newMonitorTestDB(t)
+	ctx := context.Background()
+	targetID := uuid.NewString()
+	serviceURL := srv.URL + "/"
+	baselineURL := NormalizeServiceURL(serviceURL)
+	if _, err := db.Exec(`INSERT INTO targets(id,domain) VALUES(?,?)`, targetID, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO http_services(id,target_id,url,status_code,title,source,probe_tier)
+		VALUES(?,?,?,302,'302 Found','probe','deep')`, uuid.NewString(), targetID, serviceURL); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &MonitorScanner{db: db}
+	logFn := func(string, string, string) {}
+
+	// Pass 1: establishes ObservationMonitor baseline (302 -> https://other-host.example.test/login).
+	if err := s.Run(ctx, targetID, logFn); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 2: flips 302 -> 301 to the same normalized destination with boilerplate title.
+	mu.Lock()
+	status = http.StatusMovedPermanently
+	location = "https://OTHER-HOST.EXAMPLE.TEST:443/login?state=bbb#frag"
+	body = `<html><head><title>301 Moved Permanently</title></head><body>301 Moved Permanently</body></html>`
+	mu.Unlock()
+	if err := s.Run(ctx, targetID, logFn); err != nil {
+		t.Fatal(err)
+	}
+
+	var changes int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=?`, targetID).Scan(&changes)
+	if changes != 0 {
+		t.Fatalf("same-destination 302->301 flip in monitor emitted %d changes, want 0", changes)
+	}
+	var baseStatus int
+	var baseRedir string
+	_ = db.QueryRow(`SELECT status_code, redirect_url FROM http_observation_baselines WHERE target_id=? AND service_url=? AND observation_type=?`,
+		targetID, baselineURL, ObservationMonitor).Scan(&baseStatus, &baseRedir)
+	if baseStatus != 302 || baseRedir != "https://other-host.example.test/login" {
+		t.Fatalf("monitor baseline mismatch: status=%d redirect=%q", baseStatus, baseRedir)
+	}
+
+	// Pass 3: flips destination to /app -> MUST emit http_change!
+	mu.Lock()
+	status = http.StatusMovedPermanently
+	location = "https://other-host.example.test/app"
+	mu.Unlock()
+	if err := s.Run(ctx, targetID, logFn); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM monitoring_changes WHERE target_id=? AND change_type='http_change'`, targetID).Scan(&changes)
+	if changes != 1 {
+		t.Fatalf("destination-changed 302->301 emitted %d http_change rows, want 1", changes)
+	}
+}

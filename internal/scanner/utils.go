@@ -34,7 +34,9 @@ func probeURLWithContext(ctx context.Context, rawURL string) *models.HTTPService
 	if err != nil {
 		return nil
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ReconBot/1.0)")
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -53,6 +55,20 @@ func probeURLWithContext(ctx context.Context, rawURL string) *models.HTTPService
 	title := extractTitle(string(body))
 	server := resp.Header.Get("Server")
 	contentType := resp.Header.Get("Content-Type")
+	var redirectURL string
+	if isRedirectStatus(resp.StatusCode) {
+		if loc := strings.TrimSpace(resp.Header.Get("Location")); loc != "" {
+			base := rawURL
+			if resp.Request != nil && resp.Request.URL != nil {
+				base = resp.Request.URL.String()
+			}
+			redirectURL = normalizeRedirectTarget(base, loc)
+		}
+	} else if resp.Request != nil && resp.Request.URL != nil {
+		if finalURL := strings.TrimSpace(resp.Request.URL.String()); finalURL != "" && finalURL != rawURL {
+			redirectURL = finalURL
+		}
+	}
 
 	return &models.HTTPService{
 		URL:           rawURL,
@@ -61,6 +77,7 @@ func probeURLWithContext(ctx context.Context, rawURL string) *models.HTTPService
 		Server:        server,
 		ContentType:   contentType,
 		ContentLength: len(body),
+		RedirectURL:   redirectURL,
 	}
 }
 

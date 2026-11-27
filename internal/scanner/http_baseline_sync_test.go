@@ -73,3 +73,43 @@ func TestStatusZeroDoesNotOverwriteObservationBaseline(t *testing.T) {
 		t.Fatalf("status_change events=%d, want 1", n)
 	}
 }
+
+func TestPreloadBaselinesRespectsTierAndPrefersObservationTable(t *testing.T) {
+	s, db, tid := newObservationTestScanner(t)
+	ctx := context.Background()
+
+	watchURL := "https://watch.example.test/"
+	deepURL := "https://deep.example.test/"
+	seedURL := "https://seed.example.test/"
+	if _, err := db.Exec(`INSERT INTO http_services (id,target_id,url,status_code,title,redirect_url,source,probe_tier) VALUES
+		('s1',?,?,302,'302 Found','https://watch.example.test/login','probe','watch'),
+		('s2',?,?,200,'OK','','probe','deep'),
+		('s3',?,?,0,'','','seed','watch')`,
+		tid, watchURL, tid, deepURL, tid, seedURL); err != nil {
+		t.Fatal(err)
+	}
+	// Explicit watch baseline overrides http_services fallback.
+	if err := upsertObservationBaseline(ctx, db, tid, watchURL, ObservationWatch,
+		301, "301 Moved Permanently", "cloudflare", `["Cloudflare"]`, "https://watch.example.test/login", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	watchMap := s.preloadBaselines(ctx, tid, ObservationWatch)
+	if b, ok := watchMap[watchURL]; !ok || b.status != 301 || b.redirect != "https://watch.example.test/login" {
+		t.Fatalf("watch preload mismatch: ok=%v b=%+v", ok, b)
+	}
+	if _, ok := watchMap[deepURL]; ok {
+		t.Fatalf("watch preload leaked deep-tier http_services row")
+	}
+	if _, ok := watchMap[seedURL]; ok {
+		t.Fatalf("watch preload leaked seed row")
+	}
+
+	deepMap := s.preloadBaselines(ctx, tid, ObservationDeep)
+	if b, ok := deepMap[deepURL]; !ok || b.status != 200 {
+		t.Fatalf("deep preload mismatch: ok=%v b=%+v", ok, b)
+	}
+	if _, ok := deepMap[watchURL]; ok {
+		t.Fatalf("deep preload leaked watch-tier row")
+	}
+}

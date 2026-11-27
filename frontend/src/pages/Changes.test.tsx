@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Changes from './Changes'
 import type { ChangeEntry, WatchRound } from '../types'
-import { parseStatusTransition } from '../components/changes/changesModel'
+import { parseFormattedStatusTitle, parseStatusTransition } from '../components/changes/changesModel'
 
 const changeRows: ChangeEntry[] = [
   {
@@ -46,6 +46,20 @@ const changeRows: ChangeEntry[] = [
     category: 'scripts', severity: 'medium', seen: false,
     old_value: 'hash=aaa', new_value: 'hash=bbb',
     detected_at: '2026-01-01 09:00:00',
+  },
+  {
+    id: 'c6', source: 'monitor', target_id: 't1', target_name: 'alpha.test',
+    task_id: '', url: 'https://alpha.test/portal', change_type: 'http_change',
+    category: 'http', severity: 'info', seen: false,
+    old_value: 'status=200 title=Old Portal', new_value: 'status=200 title=New Portal',
+    detected_at: '2026-01-01 07:00:00',
+  },
+  {
+    id: 'c7', source: 'monitor', target_id: 't2', target_name: 'beta.test',
+    task_id: '', url: 'https://beta.test', change_type: 'tech_change',
+    category: 'tech', severity: 'low', seen: false,
+    old_value: 'nginx', new_value: 'caddy',
+    detected_at: '2026-01-01 06:00:00',
   },
 ]
 
@@ -114,6 +128,24 @@ function mockApi(opts?: { changes?: ChangeEntry[]; rounds?: WatchRound[] }) {
         ? rows.filter(r => cats.some(c => {
           if (c === 'hosts') return r.change_type === 'new_subdomain' || r.change_type === 'new_host'
           if (c === 'scope') return r.source === 'bounty' || r.source === 'watch_scope'
+          if (c === 'status') {
+            if (r.source !== 'watch' && r.source !== 'monitor') return false
+            if (r.change_type === 'redirect_change') return true
+            if (r.change_type !== 'status_change' && r.change_type !== 'http_change' && r.change_type !== 'page_change') return false
+            const parsed = parseStatusTransition(r.old_value || '', r.new_value || '')
+            const oldCode = r.old_status || parsed.oldCode || 0
+            const newCode = r.new_status || parsed.newCode || 0
+            return oldCode >= 100 && oldCode <= 599 && newCode >= 100 && newCode <= 599 && oldCode !== newCode
+          }
+          if (c === 'title') {
+            if (r.source !== 'watch' && r.source !== 'monitor') return false
+            if (r.change_type !== 'http_change' && r.change_type !== 'page_change') return false
+            const fmtOld = parseFormattedStatusTitle(r.old_value || '')
+            const fmtNew = parseFormattedStatusTitle(r.new_value || '')
+            if (fmtOld && fmtNew) return fmtOld.title !== fmtNew.title
+            return r.change_type === 'page_change' && r.old_value !== r.new_value
+          }
+          if (c === 'content') return r.change_type === 'content_change'
           return r.category === c
         }))
         : rows
@@ -154,12 +186,22 @@ describe('global Changes page', () => {
     render(<MemoryRouter><Changes /></MemoryRouter>)
     await waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
-    await user.click(screen.getByRole('button', { name: 'HTTP' }))
+    await user.click(screen.getByRole('button', { name: 'Status & Redirects' }))
     await waitFor(() => expect(screen.queryByText('JAVASCRIPT')).not.toBeInTheDocument())
-    expect(screen.getByText('STATUS CODE')).toBeInTheDocument()
+    expect(screen.getAllByText('STATUS CODE').length).toBeGreaterThan(0)
     expect(screen.queryByText('NEW HOST')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Security & JS' }))
+    await user.click(screen.getByRole('button', { name: 'Titles' }))
+    await waitFor(() => expect(screen.getByText('HTTP / PAGE')).toBeInTheDocument())
+    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
+    expect(document.body.textContent).toContain('Old')
+    expect(document.body.textContent).toContain('New')
+
+    await user.click(screen.getByRole('button', { name: 'Tech' }))
+    await waitFor(() => expect(screen.getByText('TECHNOLOGIES')).toBeInTheDocument())
+    expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Scripts & Security' }))
     await waitFor(() => expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument())
     expect(screen.queryByText('STATUS CODE')).not.toBeInTheDocument()
 

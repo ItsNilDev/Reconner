@@ -1,14 +1,16 @@
 import { diffWordsWithSpace } from 'diff'
 import type { ChangeCategory, ChangeEntry } from '../../types'
 
-export type ChangeTabFilter = 'all' | 'hosts' | 'scope' | 'http' | 'security_js'
+export type ChangeTabFilter = 'all' | 'hosts' | 'status' | 'title' | 'tech' | 'scope' | 'security_js'
 
-export const CHANGE_TABS: { id: ChangeTabFilter; label: string; category?: string }[] = [
+export const CHANGE_TABS: { id: ChangeTabFilter; label: string; category?: string; title?: string }[] = [
   { id: 'all', label: 'All' },
-  { id: 'hosts', label: 'New hosts', category: 'hosts' },
-  { id: 'scope', label: 'Scope', category: 'scope' },
-  { id: 'http', label: 'HTTP', category: 'http,tech' },
-  { id: 'security_js', label: 'Security & JS', category: 'security,headers,scripts' },
+  { id: 'hosts', label: 'New hosts', category: 'hosts', title: 'New subdomains & hosts (breadth + deep)' },
+  { id: 'status', label: 'Status & Redirects', category: 'status', title: 'HTTP status code transitions and redirect destination changes' },
+  { id: 'title', label: 'Titles', category: 'title', title: 'Page title changes across breadth, deep, and monitor scans' },
+  { id: 'tech', label: 'Tech', category: 'tech', title: 'Server and technology stack changes' },
+  { id: 'scope', label: 'Scope', category: 'scope', title: 'Program and watch scope changes' },
+  { id: 'security_js', label: 'Scripts & Security', category: 'security,headers,scripts', title: 'JavaScript, stylesheet, and security header changes' },
 ]
 
 // Exact mirror of changeCategoryExpr in internal/api/changes_handlers.go.
@@ -76,12 +78,20 @@ export const changeBadgeVariant = (c: { severity?: string; change_type?: string 
         : 'info'
 }
 
+export function parseFormattedStatusTitle(value: string): { code?: number; title?: string } | null {
+  const match = /^status=(\d+)\s+title=(.*)$/s.exec(value || '')
+  if (!match) return null
+  const parsed = Number(match[1])
+  const code = Number.isInteger(parsed) && parsed >= 100 && parsed <= 599 ? parsed : undefined
+  return { code, title: match[2] }
+}
+
 export function parseStatusTransition(oldValue: string, newValue: string): { oldCode?: number; newCode?: number } {
-  // Mirror changesStatusCodeExpr in changes_handlers.go: require the exact
-  // "status=NNN " token with a trailing space and an in-range code. Dropping
-  // the older free-text fallback keeps pills aligned with status filters.
+  // Mirror changesStatusCodeExpr in changes_handlers.go: require a leading
+  // "status=NNN " prefix (optionally after a YYYY-MM-DD date prefix) so raw
+  // page titles containing "status=200 " cannot spoof a status transition.
   const pick = (value: string) => {
-    const match = /(?:^|[\s,])status=([1-5]\d{2})\s/.exec(value || '')
+    const match = /^(?:\d{4}-\d{2}-\d{2}\s+)?status=([1-5]\d{2})\s/.exec(value || '')
     if (!match) return undefined
     const code = Number(match[1])
     return Number.isFinite(code) ? code : undefined

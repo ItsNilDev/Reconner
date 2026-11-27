@@ -48,6 +48,7 @@ type httpxOutput struct {
 	ContentType   string   `json:"content_type"`
 	ContentLength int      `json:"content_length"`
 	RedirectURL   string   `json:"final_url"`
+	Location      string   `json:"location"`
 	Technologies  []string `json:"tech"`
 	ResponseTime  string   `json:"response_time"`
 }
@@ -59,6 +60,37 @@ func (o *httpxOutput) subdomain() string {
 	return o.Host
 }
 
+func normalizeHostName(raw string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+}
+
+func uniqueHostVariants(norm, raw string, extras []string) []string {
+	seen := make(map[string]bool, len(extras)+2)
+	out := make([]string, 0, len(extras)+2)
+	add := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	add(norm)
+	add(raw)
+	for _, e := range extras {
+		add(e)
+	}
+	return out
+}
+
+func effectiveRedirectURL(out httpxOutput) string {
+	if redir := strings.TrimSpace(out.RedirectURL); redir != "" {
+		return redir
+	}
+	if loc := strings.TrimSpace(out.Location); loc != "" && isRedirectStatus(out.StatusCode) {
+		return normalizeRedirectTarget(out.URL, loc)
+	}
+	return ""
+}
 func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
 	logFn("info", "http_probe", "Loading subdomains for HTTP probing...")
 
@@ -74,22 +106,32 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	}
 
 	var hosts []string
+	seenNorm := map[string]bool{}
 	hostIPs := map[string][]net.IP{}
+	rawSubdomainsByNorm := map[string][]string{}
 	for rows.Next() {
 		var sub, ip string
 		if err := rows.Scan(&sub, &ip); err != nil {
 			continue
 		}
-		hosts = append(hosts, sub)
+		norm := normalizeHostName(sub)
+		if norm == "" {
+			continue
+		}
+		if !seenNorm[norm] {
+			seenNorm[norm] = true
+			hosts = append(hosts, norm)
+		}
+		rawSubdomainsByNorm[norm] = append(rawSubdomainsByNorm[norm], sub)
 		if parsed := net.ParseIP(ip); parsed != nil {
-			hostIPs[sub] = append(hostIPs[sub], parsed)
+			hostIPs[norm] = append(hostIPs[norm], parsed)
 		} else if ip != "" {
 			// A stored address list is kept as delimited text.
 			for _, part := range strings.FieldsFunc(ip, func(r rune) bool {
 				return r == ',' || r == ' ' || r == ';' || r == '\n'
 			}) {
 				if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
-					hostIPs[sub] = append(hostIPs[sub], parsed)
+					hostIPs[norm] = append(hostIPs[norm], parsed)
 				}
 			}
 		}
@@ -185,7 +227,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 			// watch rate limit, so a watch round stops here instead.
 			return fmt.Errorf("create httpx host list: %w", err)
 		}
-		return s.basicHTTPProbe(ctx, targetID, hosts, logFn)
+		return s.basicHTTPProbeWithVariants(ctx, targetID, hosts, rawSubdomainsByNorm, logFn)
 	}
 	defer os.Remove(tmpFile.Name())
 	if _, err := tmpFile.WriteString(strings.Join(hosts, "\n")); err != nil {
@@ -193,7 +235,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		if watchModeEnabled(ctx) {
 			return fmt.Errorf("write httpx host list: %w", err)
 		}
-		return s.basicHTTPProbe(ctx, targetID, hosts, logFn)
+		return s.basicHTTPProbeWithVariants(ctx, targetID, hosts, rawSubdomainsByNorm, logFn)
 	}
 	tmpFile.Close()
 
@@ -242,6 +284,12 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	}
 	args = append(args, ToolRequestIdentityArgs(ctx, "httpx")...)
 
+	obsType := ObservationDeep
+	if watchMode {
+		obsType = ObservationWatch
+	}
+	preloadedBaselines := s.preloadBaselines(ctx, targetID, obsType)
+
 	var mu sync.Mutex
 	probed := 0
 	corruptLines := 0
@@ -250,6 +298,8 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	// verified and must not become approved scope.
 	var probedHosts []string
 	seenHost := map[string]bool{}
+	pendingConfirm := map[string]httpxOutput{}
+	var pendingConfirmOrder []string
 
 	// A watch round must not confuse a tool outage with a healthy empty result.
 	// recordWatchMisses increments alive_misses, so two failed rounds would flip
@@ -266,27 +316,55 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 				return
 			}
 
-			stored := false
-			if err := s.storeHTTPService(ctx, targetID, out); err != nil {
+			serviceURL := NormalizeServiceURL(out.URL)
+			redir := effectiveRedirectURL(out)
+			rawHost := out.subdomain()
+			normHost := normalizeHostName(rawHost)
+
+			needsConfirm := false
+			if serviceURL != "" && ValidHTTPStatus(out.StatusCode) {
+				if b, ok := preloadedBaselines[serviceURL]; ok &&
+					ValidHTTPStatus(b.status) && b.status != out.StatusCode &&
+					!isEquivalentRedirectStatus(serviceURL, b.status, out.StatusCode, b.redirect, redir) {
+					needsConfirm = true
+				}
+			}
+
+			if needsConfirm {
+				mu.Lock()
+				if _, exists := pendingConfirm[serviceURL]; !exists {
+					pendingConfirmOrder = append(pendingConfirmOrder, serviceURL)
+				}
+				pendingConfirm[serviceURL] = out
+				probed++
+				if watchMode && normHost != "" && !seenHost[normHost] {
+					seenHost[normHost] = true
+					probedHosts = append(probedHosts, normHost)
+				}
+				if probed%20 == 0 {
+					logFn("info", "http_probe", fmt.Sprintf("Probed %d hosts...", probed))
+				}
+				mu.Unlock()
+				return
+			}
+
+			effectiveStatus, err := s.storeHTTPServiceWithOptions(ctx, targetID, out, rawSubdomainsByNorm, false)
+			if err != nil {
 				s.logger.Error("Failed to store HTTP service", "error", err)
-			} else {
-				stored = true
+				return
 			}
 
 			// Only a committed, valid observation advances liveness. A
 			// status-zero response is not proof that the host is alive.
-			if stored && ValidHTTPStatus(out.StatusCode) {
-				if err := s.updateSubdomainAlive(ctx, targetID, out.subdomain(), out.StatusCode, out.Technologies, out.WebServer); err != nil {
+			if ValidHTTPStatus(effectiveStatus) {
+				if err := s.updateSubdomainAliveWithVariants(ctx, targetID, rawHost, rawSubdomainsByNorm[normHost], effectiveStatus, out.Technologies, out.WebServer); err != nil {
 					s.logger.Error("Failed to update subdomain", "error", err)
 				}
 				mu.Lock()
 				probed++
-				if watchMode {
-					host := out.subdomain()
-					if host != "" && !seenHost[host] {
-						seenHost[host] = true
-						probedHosts = append(probedHosts, host)
-					}
+				if watchMode && normHost != "" && !seenHost[normHost] {
+					seenHost[normHost] = true
+					probedHosts = append(probedHosts, normHost)
 				}
 				if probed%20 == 0 {
 					logFn("info", "http_probe", fmt.Sprintf("Probed %d hosts...", probed))
@@ -308,6 +386,35 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		}
 	}
 
+	// Post-httpx same-client confirmation stage: runs after RunWithCallback exits
+	// (releasing Executor.semaphore) so stdout reading is never stalled and the
+	// confirmation pass uses the exact same httpx flags, rate limit, and identity.
+	if len(pendingConfirm) > 0 && ctx.Err() == nil && (!watchMode || probeFailed == nil) {
+		confirmed := s.confirmHTTPXTransitions(ctx, targetID, pendingConfirmOrder, pendingConfirm, args, logFn)
+		for _, serviceURL := range pendingConfirmOrder {
+			first := pendingConfirm[serviceURL]
+			conf, ok := confirmed[serviceURL]
+			isConfirmed := ok && conf.StatusCode == first.StatusCode
+			pinBaseline := !isConfirmed
+			if pinBaseline {
+				logFn("info", "http_probe", fmt.Sprintf("Unconfirmed status transition on %s (%d -> %d); pinning baseline status",
+					serviceURL, preloadedBaselines[serviceURL].status, first.StatusCode))
+			}
+			rawHost := first.subdomain()
+			normHost := normalizeHostName(rawHost)
+			effectiveStatus, err := s.storeHTTPServiceWithOptions(ctx, targetID, first, rawSubdomainsByNorm, pinBaseline)
+			if err != nil {
+				s.logger.Error("Failed to store HTTP service", "error", err)
+				continue
+			}
+			if ValidHTTPStatus(effectiveStatus) {
+				if err := s.updateSubdomainAliveWithVariants(ctx, targetID, rawHost, rawSubdomainsByNorm[normHost], effectiveStatus, first.Technologies, first.WebServer); err != nil {
+					s.logger.Error("Failed to update subdomain", "error", err)
+				}
+			}
+		}
+	}
+
 	// Resilience gate: httpx is the whole scan's front door — every downstream
 	// module (JS, params, crawl, all injection scanners) consumes http_services.
 	// If httpx was missing, errored (e.g. a flag the installed build rejects →
@@ -323,7 +430,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 		if s.exec.IsToolAvailable("httpx") {
 			logFn("warn", "http_probe", "httpx returned no live services — falling back to the native HTTP prober so the scan can proceed.")
 		}
-		if err := s.basicHTTPProbe(ctx, targetID, hosts, logFn); err != nil {
+		if err := s.basicHTTPProbeWithVariants(ctx, targetID, hosts, rawSubdomainsByNorm, logFn); err != nil {
 			return err
 		}
 		var recovered int
@@ -348,7 +455,7 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	// only hosts that came back from the probe are considered. A round with no
 	// HTTP result lands nothing.
 	if watchMode {
-		recordWatchMisses(ctx, s.db, targetID, probedHosts, hosts, logFn)
+		recordWatchMissesWithVariants(ctx, s.db, targetID, probedHosts, hosts, rawSubdomainsByNorm, logFn)
 		if probed == 0 {
 			logFn("info", "watch_scope", "HTTP phase produced no result: nothing landed this round")
 		} else {
@@ -477,13 +584,96 @@ func (s *HTTPScanner) fingerprintHosts(ctx context.Context, targetID string, log
 	}
 }
 
+func (s *HTTPScanner) confirmHTTPXTransitions(ctx context.Context, targetID string, order []string, pending map[string]httpxOutput, baseArgs []string, logFn LogFunc) map[string]httpxOutput {
+	confirmed := map[string]httpxOutput{}
+	if len(order) == 0 || s.exec == nil || !s.exec.IsToolAvailable("httpx") {
+		return confirmed
+	}
+	urls := make([]string, 0, len(order))
+	for _, serviceURL := range order {
+		if out, ok := pending[serviceURL]; ok && strings.TrimSpace(out.URL) != "" {
+			urls = append(urls, strings.TrimSpace(out.URL))
+		}
+	}
+	if len(urls) == 0 {
+		return confirmed
+	}
+	confirmFile, err := os.CreateTemp("", "httpx-confirm-*.txt")
+	if err != nil {
+		logFn("warn", "http_probe", fmt.Sprintf("Failed to create httpx confirmation file: %v", err))
+		return confirmed
+	}
+	defer os.Remove(confirmFile.Name())
+	if _, err := confirmFile.WriteString(strings.Join(urls, "\n")); err != nil {
+		confirmFile.Close()
+		logFn("warn", "http_probe", fmt.Sprintf("Failed to write httpx confirmation file: %v", err))
+		return confirmed
+	}
+	confirmFile.Close()
+
+	confirmArgs := append([]string(nil), baseArgs...)
+	replaced := false
+	for i := 0; i+1 < len(confirmArgs); i++ {
+		if confirmArgs[i] == "-l" {
+			confirmArgs[i+1] = confirmFile.Name()
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		confirmArgs = append([]string{"-l", confirmFile.Name()}, confirmArgs...)
+	}
+
+	logFn("info", "http_probe", fmt.Sprintf("Confirming %d drifted HTTP status transition(s) with httpx...", len(urls)))
+	var mu sync.Mutex
+	if err := s.exec.RunWithCallback(ctx, targetID, func(line string) {
+		var out httpxOutput
+		if err := json.Unmarshal([]byte(line), &out); err != nil {
+			return
+		}
+		serviceURL := NormalizeServiceURL(out.URL)
+		if serviceURL == "" || !ValidHTTPStatus(out.StatusCode) {
+			return
+		}
+		mu.Lock()
+		confirmed[serviceURL] = out
+		mu.Unlock()
+	}, "httpx", confirmArgs...); err != nil && ctx.Err() == nil {
+		logFn("warn", "http_probe", fmt.Sprintf("httpx confirmation error: %v", err))
+	}
+	return confirmed
+}
+
+func (s *HTTPScanner) lookupSubdomainID(ctx context.Context, targetID, rawHost string, rawByNorm map[string][]string) (string, error) {
+	norm := normalizeHostName(rawHost)
+	var extras []string
+	if rawByNorm != nil {
+		extras = rawByNorm[norm]
+	}
+	for _, candidate := range uniqueHostVariants(norm, rawHost, extras) {
+		var subID string
+		err := s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
+			targetID, candidate).Scan(&subID)
+		if err == nil && subID != "" {
+			return subID, nil
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
 func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out httpxOutput) error {
+	_, err := s.storeHTTPServiceWithOptions(ctx, targetID, out, nil, false)
+	return err
+}
+
+func (s *HTTPScanner) storeHTTPServiceWithOptions(ctx context.Context, targetID string, out httpxOutput, rawByNorm map[string][]string, pinBaselineStatus bool) (int, error) {
 	sortedTechs := append([]string(nil), out.Technologies...)
 	sort.Strings(sortedTechs)
 
-	var subID string
-	_ = s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
-		targetID, out.subdomain()).Scan(&subID)
+	subID, _ := s.lookupSubdomainID(ctx, targetID, out.subdomain(), rawByNorm)
 
 	obsType := ObservationDeep
 	tier := "deep"
@@ -491,28 +681,37 @@ func (s *HTTPScanner) storeHTTPService(ctx context.Context, targetID string, out
 		obsType = ObservationWatch
 		tier = "watch"
 	}
-	return s.recordObservation(ctx, HTTPObservation{
-		TargetID:      targetID,
-		TaskID:        taskIDFromContext(ctx),
-		URL:           out.URL,
-		Host:          out.subdomain(),
-		SubdomainID:   subID,
-		StatusCode:    out.StatusCode,
-		Title:         out.Title,
-		Server:        out.WebServer,
-		Technologies:  models.StringSliceToJSON(sortedTechs),
-		RedirectURL:   out.RedirectURL,
-		ContentType:   out.ContentType,
-		ContentLength: out.ContentLength,
-		Source:        "probe",
-		ProbeTier:     tier,
-		Type:          obsType,
+	return s.recordObservationWithEffectiveStatus(ctx, HTTPObservation{
+		TargetID:          targetID,
+		TaskID:            taskIDFromContext(ctx),
+		URL:               out.URL,
+		Host:              out.subdomain(),
+		SubdomainID:       subID,
+		StatusCode:        out.StatusCode,
+		Title:             out.Title,
+		Server:            out.WebServer,
+		Technologies:      models.StringSliceToJSON(sortedTechs),
+		RedirectURL:       effectiveRedirectURL(out),
+		ContentType:       out.ContentType,
+		ContentLength:     out.ContentLength,
+		Source:            "probe",
+		ProbeTier:         tier,
+		Type:              obsType,
+		PinBaselineStatus: pinBaselineStatus,
 	})
 }
 
 func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host string, statusCode int, techs []string, server string) error {
+	return s.updateSubdomainAliveWithVariants(ctx, targetID, host, nil, statusCode, techs, server)
+}
+
+func (s *HTTPScanner) updateSubdomainAliveWithVariants(ctx context.Context, targetID, host string, rawVariants []string, statusCode int, techs []string, server string) error {
 	if IsWildcardScopePattern(host) {
 		return nil
+	}
+	norm := normalizeHostName(host)
+	if norm == "" {
+		norm = host
 	}
 	hasHTTPS := 0
 	hasHTTP := 0
@@ -528,7 +727,7 @@ func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host s
 			url = 'https://' || ? OR url LIKE 'https://' || ? || '/%' OR url LIKE 'https://' || ? || ':%' OR
 			url = 'http://'  || ? OR url LIKE 'http://'  || ? || '/%' OR url LIKE 'http://'  || ? || ':%'
 		)
-	`, targetID, host, host, host, host, host, host)
+	`, targetID, norm, norm, norm, norm, norm, norm)
 
 	var httpsCount, httpCount *int
 	if err := r.Scan(&httpsCount, &httpCount); err != nil && err != sql.ErrNoRows {
@@ -549,20 +748,22 @@ func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host s
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(ctx, `
-		UPDATE subdomains SET
-			is_alive = 1,
-			status_code = ?,
-			technologies = ?,
-			server = ?,
-			has_https = ?,
-			has_http = ?,
-			first_alive_at = COALESCE(first_alive_at, CURRENT_TIMESTAMP),
-			last_alive_at = CURRENT_TIMESTAMP,
-			alive_misses = 0
-		WHERE target_id = ? AND subdomain = ?
-	`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, host); err != nil {
-		return err
+	for _, variant := range uniqueHostVariants(norm, host, rawVariants) {
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE subdomains SET
+				is_alive = 1,
+				status_code = ?,
+				technologies = ?,
+				server = ?,
+				has_https = ?,
+				has_http = ?,
+				first_alive_at = COALESCE(first_alive_at, CURRENT_TIMESTAMP),
+				last_alive_at = CURRENT_TIMESTAMP,
+				alive_misses = 0
+			WHERE target_id = ? AND subdomain = ?
+		`, statusCode, techsJSON, server, hasHTTPS, hasHTTP, targetID, variant); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `
 		INSERT INTO watch_hosts(target_id,host,first_seen_at,first_alive_at,last_alive_at,alive_misses)
@@ -571,7 +772,7 @@ func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host s
 			first_alive_at=COALESCE(watch_hosts.first_alive_at,excluded.first_alive_at),
 			last_alive_at=excluded.last_alive_at,
 			alive_misses=0
-	`, targetID, host); err != nil {
+	`, targetID, norm); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -581,28 +782,44 @@ func (s *HTTPScanner) updateSubdomainAlive(ctx context.Context, targetID, host s
 // produced no HTTP response. A single miss is state only; two consecutive
 // misses flip is_alive off. This keeps a flaky response from toggling the feed.
 func recordWatchMisses(ctx context.Context, db *database.DB, targetID string, probed []string, all []string, logFn LogFunc) {
+	recordWatchMissesWithVariants(ctx, db, targetID, probed, all, nil, logFn)
+}
+
+func recordWatchMissesWithVariants(ctx context.Context, db *database.DB, targetID string, probed []string, all []string, rawByNorm map[string][]string, logFn LogFunc) {
 	if len(all) == 0 {
 		return
 	}
 	seen := make(map[string]bool, len(probed))
 	for _, h := range probed {
-		seen[strings.ToLower(strings.TrimSpace(h))] = true
+		if norm := normalizeHostName(h); norm != "" {
+			seen[norm] = true
+		}
 	}
 	missed := 0
 	for _, raw := range all {
-		host := strings.ToLower(strings.TrimSpace(raw))
-		if host == "" || seen[host] {
+		norm := normalizeHostName(raw)
+		if norm == "" || seen[norm] {
 			continue
 		}
-		res, err := db.ExecContext(ctx, `
-			UPDATE subdomains SET alive_misses=alive_misses+1,
-				is_alive=CASE WHEN alive_misses+1>=2 THEN 0 ELSE is_alive END
-			WHERE target_id=? AND subdomain=?`, targetID, host)
-		if err == nil {
-			if n, _ := res.RowsAffected(); n > 0 {
-				missed++
+		var extras []string
+		if rawByNorm != nil {
+			extras = rawByNorm[norm]
+		}
+		hostMissed := false
+		for _, variant := range uniqueHostVariants(norm, raw, extras) {
+			res, err := db.ExecContext(ctx, `
+				UPDATE subdomains SET alive_misses=alive_misses+1,
+					is_alive=CASE WHEN alive_misses+1>=2 THEN 0 ELSE is_alive END
+				WHERE target_id=? AND subdomain=?`, targetID, variant)
+			if err == nil {
+				if n, _ := res.RowsAffected(); n > 0 {
+					hostMissed = true
+				}
 			}
-			_, _ = db.ExecContext(ctx, `UPDATE watch_hosts SET alive_misses=alive_misses+1 WHERE target_id=? AND host=?`, targetID, host)
+		}
+		if hostMissed {
+			missed++
+			_, _ = db.ExecContext(ctx, `UPDATE watch_hosts SET alive_misses=alive_misses+1 WHERE target_id=? AND host=?`, targetID, norm)
 		}
 	}
 	if missed > 0 {
@@ -611,6 +828,16 @@ func recordWatchMisses(ctx context.Context, db *database.DB, targetID string, pr
 }
 
 func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts []string, logFn LogFunc) error {
+	return s.basicHTTPProbeWithVariants(ctx, targetID, hosts, nil, logFn)
+}
+
+func (s *HTTPScanner) basicHTTPProbeWithVariants(ctx context.Context, targetID string, hosts []string, rawByNorm map[string][]string, logFn LogFunc) error {
+	obsType := ObservationDeep
+	if watchModeEnabled(ctx) {
+		obsType = ObservationWatch
+	}
+	preloadedBaselines := s.preloadBaselines(ctx, targetID, obsType)
+
 	sem := make(chan struct{}, 10)
 	var wg sync.WaitGroup
 
@@ -624,23 +851,41 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			norm := normalizeHostName(h)
+			var variants []string
+			if rawByNorm != nil {
+				variants = rawByNorm[norm]
+			}
 			for _, scheme := range []string{"https", "http"} {
-				url := fmt.Sprintf("%s://%s", scheme, h)
+				rawURL := fmt.Sprintf("%s://%s", scheme, h)
 				// Apply the same host gate to native fallback requests. A
 				// redirect is checked again inside probeURLWithContext.
-				if !urlHostInScope(ctx, url) {
+				if !urlHostInScope(ctx, rawURL) {
 					continue
 				}
-				svc := probeURLWithContext(ctx, url)
+				svc := probeURLWithContext(ctx, rawURL)
 				if svc != nil {
 					svc.ID = uuid.New().String()
 					svc.TargetID = targetID
-					if err := s.storeBasicService(ctx, svc); err != nil {
+					pinBaseline := false
+					if ValidHTTPStatus(svc.StatusCode) {
+						serviceURL := NormalizeServiceURL(svc.URL)
+						if b, ok := preloadedBaselines[serviceURL]; ok &&
+							ValidHTTPStatus(b.status) && b.status != svc.StatusCode &&
+							!isEquivalentRedirectStatus(serviceURL, b.status, svc.StatusCode, b.redirect, svc.RedirectURL) {
+							confirm := probeURLWithContext(ctx, rawURL)
+							if confirm == nil || confirm.StatusCode != svc.StatusCode {
+								pinBaseline = true
+							}
+						}
+					}
+					effectiveStatus, err := s.storeBasicServiceWithOptions(ctx, svc, rawByNorm, pinBaseline)
+					if err != nil {
 						s.logger.Error("Store basic service failed", "error", err)
-					} else if ValidHTTPStatus(svc.StatusCode) {
+					} else if ValidHTTPStatus(effectiveStatus) {
 						// Native fallback shares the committed success path with
 						// the tool probe: inventory and host liveness advance together.
-						if err := s.updateSubdomainAlive(ctx, targetID, h, svc.StatusCode, nil, svc.Server); err != nil {
+						if err := s.updateSubdomainAliveWithVariants(ctx, targetID, h, variants, effectiveStatus, nil, svc.Server); err != nil {
 							s.logger.Error("Update native probe liveness failed", "error", err)
 						}
 					}
@@ -654,14 +899,18 @@ func (s *HTTPScanner) basicHTTPProbe(ctx context.Context, targetID string, hosts
 }
 
 func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPService) error {
+	_, err := s.storeBasicServiceWithOptions(ctx, svc, nil, false)
+	return err
+}
+
+func (s *HTTPScanner) storeBasicServiceWithOptions(ctx context.Context, svc *models.HTTPService, rawByNorm map[string][]string, pinBaselineStatus bool) (int, error) {
 	lookupHost := URLHost(svc.URL)
 	if u, err := url.Parse(strings.TrimSpace(svc.URL)); err == nil && u.Hostname() != "" {
 		lookupHost = strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	}
-	var subID string
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM subdomains WHERE target_id=? AND subdomain=?`,
-		svc.TargetID, lookupHost).Scan(&subID); err != nil && err != sql.ErrNoRows {
-		return err
+	subID, err := s.lookupSubdomainID(ctx, svc.TargetID, lookupHost, rawByNorm)
+	if err != nil {
+		return 0, err
 	}
 	obsType := ObservationDeep
 	tier := "deep"
@@ -669,21 +918,23 @@ func (s *HTTPScanner) storeBasicService(ctx context.Context, svc *models.HTTPSer
 		obsType = ObservationWatch
 		tier = "watch"
 	}
-	return s.recordObservation(ctx, HTTPObservation{
-		TargetID:      svc.TargetID,
-		TaskID:        taskIDFromContext(ctx),
-		URL:           svc.URL,
-		Host:          URLHost(svc.URL),
-		SubdomainID:   subID,
-		Technologies:  "[]",
-		StatusCode:    svc.StatusCode,
-		Title:         svc.Title,
-		Server:        svc.Server,
-		ContentType:   svc.ContentType,
-		ContentLength: svc.ContentLength,
-		Source:        "probe",
-		ProbeTier:     tier,
-		Type:          obsType,
+	return s.recordObservationWithEffectiveStatus(ctx, HTTPObservation{
+		TargetID:          svc.TargetID,
+		TaskID:            taskIDFromContext(ctx),
+		URL:               svc.URL,
+		Host:              URLHost(svc.URL),
+		SubdomainID:       subID,
+		Technologies:      "[]",
+		StatusCode:        svc.StatusCode,
+		Title:             svc.Title,
+		Server:            svc.Server,
+		RedirectURL:       svc.RedirectURL,
+		ContentType:       svc.ContentType,
+		ContentLength:     svc.ContentLength,
+		Source:            "probe",
+		ProbeTier:         tier,
+		Type:              obsType,
+		PinBaselineStatus: pinBaselineStatus,
 	})
 }
 

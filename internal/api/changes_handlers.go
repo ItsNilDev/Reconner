@@ -249,10 +249,10 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	}
 
 	// category accepts a comma list of standard categories plus the virtual
-	// categories "hosts" and "scope". "all" is dropped; all,http means http.
-	// Unknown tokens are ignored. A non-empty value with no valid category
-	// (for example ",,," or "garbage") matches nothing instead of silently
-	// returning every category.
+	// categories "hosts", "scope", "status", "title", and "content". "all" is
+	// dropped; all,http means http. Unknown tokens are ignored. A non-empty
+	// value with no valid category (for example ",,," or "garbage") matches
+	// nothing instead of silently returning every category.
 	if v := q.Get("category"); v != "" {
 		validCategories := map[string]bool{
 			"http": true, "scripts": true, "security": true, "tech": true,
@@ -263,29 +263,35 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		hasAll := false
 		hasHosts := false
 		hasScope := false
+		hasStatus := false
+		hasTitle := false
+		hasContent := false
 		for _, c := range strings.Split(v, ",") {
 			c = strings.TrimSpace(c)
 			if c == "" {
 				continue
 			}
-			if c == "all" {
+			switch c {
+			case "all":
 				hasAll = true
-				continue
-			}
-			if c == "hosts" {
+			case "hosts":
 				hasHosts = true
-				continue
-			}
-			if c == "scope" {
+			case "scope":
 				hasScope = true
-				continue
-			}
-			if validCategories[c] && !seenCat[c] {
-				seenCat[c] = true
-				cats = append(cats, c)
+			case "status":
+				hasStatus = true
+			case "title":
+				hasTitle = true
+			case "content":
+				hasContent = true
+			default:
+				if validCategories[c] && !seenCat[c] {
+					seenCat[c] = true
+					cats = append(cats, c)
+				}
 			}
 		}
-		predicates := make([]string, 0, 3)
+		predicates := make([]string, 0, 6)
 		if len(cats) > 0 {
 			ph := make([]string, len(cats))
 			for i, c := range cats {
@@ -299,6 +305,17 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 		}
 		if hasScope {
 			predicates = append(predicates, `x.source IN ('bounty','watch_scope')`)
+		}
+		if hasStatus {
+			predicates = append(predicates, `(x.source IN ('watch','monitor') AND ((x.change_type IN ('status_change','http_change','page_change') AND x.status_old BETWEEN 100 AND 599 AND x.status_new BETWEEN 100 AND 599 AND x.status_old <> x.status_new) OR x.change_type = 'redirect_change'))`)
+		}
+		if hasTitle {
+			oldFmt := isFormattedStatusTitleExpr("x.old_value")
+			newFmt := isFormattedStatusTitleExpr("x.new_value")
+			predicates = append(predicates, `(x.source IN ('watch','monitor') AND x.change_type IN ('http_change','page_change') AND ((`+oldFmt+` AND `+newFmt+` AND `+extractedTitleExpr("x.old_value")+` <> `+extractedTitleExpr("x.new_value")+`) OR (x.change_type = 'page_change' AND NOT (`+oldFmt+` AND `+newFmt+`) AND x.old_value <> x.new_value)))`)
+		}
+		if hasContent {
+			predicates = append(predicates, `x.change_type = 'content_change'`)
 		}
 		if len(predicates) > 0 {
 			filters = append(filters, `(`+strings.Join(predicates, ` OR `)+`)`)
@@ -406,21 +423,39 @@ func (h *Handler) changesFeedQuery(r *http.Request, forcedTargetID string) (inne
 	return inner, whereSQL, args, filterArgs
 }
 
-// changesStatusCodeExpr parses the "status=NNN " prefix from a value column.
-// Watch writes status_change and deep writes http_change/page_change; those
-// are the only types that carry a status transition. Bell rows are excluded:
-// a notification mirrors a deep change with the same type and repeats the
-// token in its body, so parsing it would duplicate the real change. Other
-// free-text rows (alerts, scope events) are already outside the type list.
+// changesStatusCodeExpr parses the leading "status=NNN" prefix from a value
+// column. Requiring "status=" at position 1 prevents raw page titles like
+// "API status=200 Live" from spoofing a status transition. Watch writes
+// status_change and deep writes http_change/page_change; those are the only
+// types that carry a status transition in text. Bell rows are excluded: a
+// notification mirrors a deep change with the same type and repeats the token
+// in its body, so parsing it would duplicate the real change. Other free-text
+// rows (alerts, scope events) are already outside the type list.
 // No metadata/JSON path is needed.
 func changesStatusCodeExpr(typeCol, sourceCol, numCol, textCol string) string {
 	return `CASE WHEN ` + sourceCol + ` = 'notification' THEN 0
 		WHEN ` + numCol + ` BETWEEN 100 AND 599 THEN ` + numCol + `
 		WHEN ` + typeCol + ` IN ('status_change','http_change','page_change')
-			AND instr(` + textCol + `,'status=') > 0
-			AND substr(` + textCol + `, instr(` + textCol + `,'status=')+10, 1) = ' '
-		THEN CAST(substr(` + textCol + `, instr(` + textCol + `,'status=')+7, 3) AS INTEGER)
+			AND substr(` + textCol + `, 1, 7) = 'status='
+			AND length(substr(` + textCol + `, 8, 3)) = 3
+			AND substr(` + textCol + `, 8, 1) BETWEEN '1' AND '5'
+			AND trim(substr(` + textCol + `, 8, 3), '0123456789') = ''
+			AND (length(` + textCol + `) = 10 OR substr(` + textCol + `, 11, 1) = ' ')
+		THEN CAST(substr(` + textCol + `, 8, 3) AS INTEGER)
 		ELSE 0 END`
+}
+
+// isFormattedStatusTitleExpr matches scalar "status=<digits> title=<text>"
+// strings emitted by MonitorScanner and monitorProjectAssets without REGEXP or
+// subqueries so handleMarkAllChangesSeen can embed the filter safely.
+func isFormattedStatusTitleExpr(col string) string {
+	return `(substr(` + col + `, 1, 7) = 'status=' AND instr(` + col + `,' title=') > 8 AND trim(substr(` + col + `, 8, instr(` + col + `,' title=') - 8), '0123456789') = '')`
+}
+
+// extractedTitleExpr returns the title substring after the first " title="
+// delimiter in a formatted "status=<digits> title=<text>" value.
+func extractedTitleExpr(col string) string {
+	return `substr(` + col + `, instr(` + col + `,' title=') + 7)`
 }
 
 // statusCodeToken accepts exactly three digits in the HTTP range. This matches

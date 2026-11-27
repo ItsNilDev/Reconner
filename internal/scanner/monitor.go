@@ -121,7 +121,7 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		if ctx.Err() != nil {
 			break
 		}
-		newStatus, newTitle, body, hdr, err := s.fetchBodyWithHeaders(ctx, svc.URL, headersFor(svc.URL))
+		newStatus, newTitle, body, hdr, newRedirect, err := s.fetchBodyWithHeaders(ctx, svc.URL, headersFor(svc.URL))
 		if err != nil {
 			continue
 		}
@@ -132,17 +132,20 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 
 		baselineURL := NormalizeServiceURL(svc.URL)
 		var baseStatus int
-		var baseTitle, baseServer, baseNormHash string
+		var baseTitle, baseServer, baseRedirect, baseNormHash string
 		hasBaseline := false
 		err = s.db.QueryRowContext(ctx, `
-			SELECT status_code, COALESCE(title,''), COALESCE(server,''), COALESCE(body_hash,'')
+			SELECT status_code, COALESCE(title,''), COALESCE(server,''), COALESCE(redirect_url,''), COALESCE(body_hash,'')
 			FROM http_observation_baselines
 			WHERE target_id=? AND service_url=? AND observation_type=?`,
-			targetID, baselineURL, ObservationMonitor).Scan(&baseStatus, &baseTitle, &baseServer, &baseNormHash)
+			targetID, baselineURL, ObservationMonitor).Scan(&baseStatus, &baseTitle, &baseServer, &baseRedirect, &baseNormHash)
 		if err == nil {
 			hasBaseline = ValidHTTPStatus(baseStatus)
 			if baseNormHash == "" {
 				baseNormHash = svc.NormHash
+			}
+			if baseRedirect == "" {
+				baseRedirect = svc.RedirectURL
 			}
 		} else if err == sql.ErrNoRows {
 			// Fall back to http_services only when the row is a deep/legacy probe
@@ -152,6 +155,7 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 				baseStatus = svc.StatusCode
 				baseTitle = svc.Title
 				baseServer = svc.Server
+				baseRedirect = svc.RedirectURL
 				baseNormHash = svc.NormHash
 			}
 		} else {
@@ -169,15 +173,36 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 			securityChanges = diffSecuritySnapshots(oldSnap, curSnap)
 			removedHeaders = diffSecurityHeaders(oldSnap.Headers, curSnap.Headers)
 		}
-		statusChanged := hasBaseline && newStatus != baseStatus
-		titleChanged := hasBaseline && newTitle != baseTitle
-		contentChanged := hasBaseline && baseNormHash != "" && newNormHash != baseNormHash
+
+		suppressRedirectFlip := hasBaseline &&
+			ValidHTTPStatus(baseStatus) && ValidHTTPStatus(newStatus) &&
+			baseStatus != newStatus &&
+			isEquivalentRedirectStatus(baselineURL, baseStatus, newStatus, baseRedirect, newRedirect)
+
+		effectiveStatus := newStatus
+		effectiveTitle := newTitle
+		effectiveNormHash := newNormHash
+		if suppressRedirectFlip {
+			effectiveStatus = baseStatus
+		}
+		if hasBaseline && ValidHTTPStatus(baseStatus) &&
+			isEquivalentRedirectStatus(baselineURL, baseStatus, effectiveStatus, baseRedirect, newRedirect) &&
+			isRedirectBoilerplateTitle(baseTitle) && isRedirectBoilerplateTitle(newTitle) {
+			effectiveTitle = baseTitle
+			if baseNormHash != "" {
+				effectiveNormHash = baseNormHash
+			}
+		}
+
+		statusChanged := hasBaseline && effectiveStatus != baseStatus
+		titleChanged := hasBaseline && effectiveTitle != baseTitle
+		contentChanged := hasBaseline && baseNormHash != "" && effectiveNormHash != baseNormHash
 		potentialChange := statusChanged || titleChanged || contentChanged || len(securityChanges) > 0 || len(removedHeaders) > 0
 		if potentialChange {
 			// Confirm only suspicious drift. A one-off 500/WAF challenge, rotating
 			// edge page, or half-written deploy must not mutate the baseline or ring
 			// the bell. Two matching fresh observations are required.
-			confirmStatus, confirmTitle, confirmBody, confirmHeader, confirmErr := s.fetchBodyWithHeaders(ctx, svc.URL, headersFor(svc.URL))
+			confirmStatus, confirmTitle, confirmBody, confirmHeader, confirmRedirect, confirmErr := s.fetchBodyWithHeaders(ctx, svc.URL, headersFor(svc.URL))
 			if confirmErr != nil {
 				continue
 			}
@@ -188,9 +213,8 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 				logFn("info", "monitor", fmt.Sprintf("Ignoring unstable one-off response from %s", svc.URL))
 				continue
 			}
-			body, hdr = confirmBody, confirmHeader
+			body, hdr, newRedirect = confirmBody, confirmHeader, confirmRedirect
 		}
-
 		type pendingChange struct {
 			changeType string
 			oldVal     string
@@ -236,13 +260,13 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 
 		// ── Content / status / title change (normalized) ──
 		if statusChanged || titleChanged || contentChanged {
-			changeDesc := s.describeChange(baseStatus, newStatus, baseTitle, newTitle, baseNormHash, newNormHash)
+			changeDesc := s.describeChange(baseStatus, effectiveStatus, baseTitle, effectiveTitle, baseNormHash, effectiveNormHash)
 			logFn("warn", "monitor", fmt.Sprintf("[CHANGE] %s: %s", svc.URL, changeDesc))
 			if !statusChanged && !titleChanged && contentChanged {
 				pendingChanges = append(pendingChanges, pendingChange{
 					changeType: "content_change",
 					oldVal:     baseNormHash,
-					newVal:     newNormHash,
+					newVal:     effectiveNormHash,
 					severity:   "low",
 				})
 			} else {
@@ -254,7 +278,7 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 				pendingChanges = append(pendingChanges, pendingChange{
 					changeType: "http_change",
 					oldVal:     fmt.Sprintf("status=%d title=%s", baseStatus, baseTitle),
-					newVal:     fmt.Sprintf("status=%d title=%s", newStatus, newTitle),
+					newVal:     fmt.Sprintf("status=%d title=%s", effectiveStatus, effectiveTitle),
 					severity:   sev,
 				})
 			}
@@ -290,6 +314,10 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 		if storeServer == "" {
 			storeServer = strings.TrimSpace(svc.Server)
 		}
+		storeRedirect := newRedirect
+		if storeRedirect == "" && isRedirectStatus(effectiveStatus) {
+			storeRedirect = baseRedirect
+		}
 
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -306,15 +334,15 @@ func (s *MonitorScanner) Run(ctx context.Context, targetID string, logFn LogFunc
 				recorded = append(recorded, rec)
 			}
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, last_seen=CURRENT_TIMESTAMP
+				UPDATE http_services SET status_code=?, title=?, content_length=?, norm_hash=?, security_snapshot=?, server=?, redirect_url=?, last_seen=CURRENT_TIMESTAMP
 				WHERE id=?
-			`, newStatus, newTitle, len(body), newNormHash, curSnap.toJSON(), storeServer, svc.ID); err != nil {
+			`, effectiveStatus, effectiveTitle, len(body), effectiveNormHash, curSnap.toJSON(), storeServer, storeRedirect, svc.ID); err != nil {
 				return fmt.Errorf("update service baseline: %w", err)
 			}
 			// Advance only the monitor baseline; deep and watch probes keep their
 			// own independent baselines in http_observation_baselines.
 			if err := upsertObservationBaseline(ctx, tx, targetID, baselineURL,
-				ObservationMonitor, newStatus, newTitle, monitorServer, svc.Technologies, svc.RedirectURL, newNormHash); err != nil {
+				ObservationMonitor, effectiveStatus, effectiveTitle, monitorServer, svc.Technologies, storeRedirect, effectiveNormHash); err != nil {
 				return fmt.Errorf("sync monitor baseline: %w", err)
 			}
 			return tx.Commit()
@@ -638,11 +666,11 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 			return nil
 		}
 		if isJS {
-			var newHash string
+			var newHash, newBody string
 			var size int
 			for _, candidate := range candidates {
 				var fetchErr error
-				newHash, size, fetchErr = s.fetchHashWithHeaders(ctx, candidate, headersFor(candidate))
+				newHash, size, newBody, fetchErr = s.fetchFileWithBody(ctx, candidate, headersFor(candidate))
 				if fetchErr == nil && newHash != "" {
 					u = candidate
 					break
@@ -652,17 +680,33 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 				continue
 			}
 			if oldHash != "" && oldHash != newHash {
-				confirmHash, _, confirmErr := s.fetchHashWithHeaders(ctx, u, headersFor(u))
+				confirmHash, confirmSize, confirmBody, confirmErr := s.fetchFileWithBody(ctx, u, headersFor(u))
 				if confirmErr != nil || confirmHash != newHash {
 					logFn("info", "monitor", fmt.Sprintf("Ignoring unstable one-off JavaScript response from %s", u))
 					continue
 				}
+				size, newBody = confirmSize, confirmBody
 				if err := s.recordChange(targetID, u, "js_change", oldHash, newHash, classifyChangeSeverity("js_change")); err != nil {
 					logFn("warn", "monitor", fmt.Sprintf("record project js change for %s: %v", u, err))
 					continue
 				}
 				logFn("warn", "monitor", fmt.Sprintf("[PROJECT JS CHANGE] %s", u))
 				changed++
+			}
+			// Upsert into js_files (rolling body -> old_body / hash -> old_hash on hash
+			// change) so clicking Diff on project-asset js_change rows never 404s.
+			if _, err := s.db.ExecContext(ctx, `
+				INSERT INTO js_files (id, target_id, url, size, hash, body, analyzed, last_seen)
+				VALUES (?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+				ON CONFLICT(target_id, url) DO UPDATE SET
+					old_hash = CASE WHEN js_files.hash <> '' AND js_files.hash <> excluded.hash THEN js_files.hash ELSE js_files.old_hash END,
+					old_body = CASE WHEN js_files.hash <> '' AND js_files.hash <> excluded.hash THEN js_files.body ELSE js_files.old_body END,
+					size = excluded.size,
+					hash = excluded.hash,
+					body = CASE WHEN js_files.hash <> excluded.hash OR COALESCE(js_files.body,'') = '' THEN excluded.body ELSE js_files.body END,
+					last_seen = CURRENT_TIMESTAMP
+			`, uuid.NewString(), targetID, u, size, newHash, newBody); err != nil {
+				logFn("warn", "monitor", fmt.Sprintf("upsert project js_files for %s: %v", u, err))
 			}
 			meta["monitor_hash"] = newHash
 			meta["monitor_size"] = size
@@ -673,7 +717,7 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 			var hdr http.Header
 			for _, candidate := range candidates {
 				var fetchErr error
-				status, title, body, hdr, fetchErr = s.fetchBodyWithHeaders(ctx, candidate, headersFor(candidate))
+				status, title, body, hdr, _, fetchErr = s.fetchBodyWithHeaders(ctx, candidate, headersFor(candidate))
 				if fetchErr == nil {
 					u = candidate
 					break
@@ -697,7 +741,7 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 			potentialChange := oldHash != "" && (oldHash != newHash || int(oldStatus) != status || oldTitle != title)
 			potentialChange = potentialChange || len(securityChanges) > 0 || len(removedHeaders) > 0
 			if potentialChange {
-				confirmStatus, confirmTitle, confirmBody, confirmHeader, confirmErr := s.fetchBodyWithHeaders(ctx, u, headersFor(u))
+				confirmStatus, confirmTitle, confirmBody, confirmHeader, _, confirmErr := s.fetchBodyWithHeaders(ctx, u, headersFor(u))
 				if confirmErr != nil {
 					continue
 				}
@@ -735,16 +779,26 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 				}
 			}
 			if oldHash != "" && (oldHash != newHash || int(oldStatus) != status || oldTitle != title) {
-				severity := "low"
-				if int(oldStatus) != status {
-					severity = classifyChangeSeverity("status")
-				}
-				if err := s.recordChange(targetID, u, "page_change", fmt.Sprintf("status=%d title=%s", int(oldStatus), oldTitle), fmt.Sprintf("status=%d title=%s", status, title), severity); err != nil {
-					logFn("warn", "monitor", fmt.Sprintf("record project page change for %s: %v", u, err))
-					recordFailed = true
+				if int(oldStatus) == status && oldTitle == title && oldHash != newHash {
+					if err := s.recordChange(targetID, u, "content_change", oldHash, newHash, "low"); err != nil {
+						logFn("warn", "monitor", fmt.Sprintf("record project content change for %s: %v", u, err))
+						recordFailed = true
+					} else {
+						logFn("warn", "monitor", fmt.Sprintf("[PROJECT CONTENT CHANGE] %s", u))
+						changed++
+					}
 				} else {
-					logFn("warn", "monitor", fmt.Sprintf("[PROJECT PAGE CHANGE] %s", u))
-					changed++
+					severity := "low"
+					if int(oldStatus) != status {
+						severity = classifyChangeSeverity("status")
+					}
+					if err := s.recordChange(targetID, u, "page_change", fmt.Sprintf("status=%d title=%s", int(oldStatus), oldTitle), fmt.Sprintf("status=%d title=%s", status, title), severity); err != nil {
+						logFn("warn", "monitor", fmt.Sprintf("record project page change for %s: %v", u, err))
+						recordFailed = true
+					} else {
+						logFn("warn", "monitor", fmt.Sprintf("[PROJECT PAGE CHANGE] %s", u))
+						changed++
+					}
 				}
 			}
 			if recordFailed {
@@ -773,13 +827,14 @@ func (s *MonitorScanner) monitorProjectAssets(ctx context.Context, targetID, tar
 // fetchBody returns status, title and the raw body for normalized-hash and
 // security-attribute analysis.
 func (s *MonitorScanner) fetchBody(ctx context.Context, url string) (int, string, string, http.Header, error) {
-	return s.fetchBodyWithHeaders(ctx, url, nil)
+	status, title, body, hdr, _, err := s.fetchBodyWithHeaders(ctx, url, nil)
+	return status, title, body, hdr, err
 }
 
-func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, headers map[string]string) (int, string, string, http.Header, error) {
+func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, headers map[string]string) (int, string, string, http.Header, string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return 0, "", "", nil, err
+		return 0, "", "", nil, "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
 	for k, v := range headers {
@@ -790,14 +845,24 @@ func (s *MonitorScanner) fetchBodyWithHeaders(ctx context.Context, url string, h
 	}
 	resp, err := monitorClient.Do(req)
 	if err != nil {
-		return 0, "", "", nil, err
+		return 0, "", "", nil, "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 3*1024*1024))
 	if err != nil {
-		return 0, "", "", nil, err
+		return 0, "", "", nil, "", err
 	}
-	return resp.StatusCode, extractTitle(string(body)), string(body), resp.Header, nil
+	var location string
+	if isRedirectStatus(resp.StatusCode) {
+		if loc := strings.TrimSpace(resp.Header.Get("Location")); loc != "" {
+			base := url
+			if resp.Request != nil && resp.Request.URL != nil {
+				base = resp.Request.URL.String()
+			}
+			location = normalizeRedirectTarget(base, loc)
+		}
+	}
+	return resp.StatusCode, extractTitle(string(body)), string(body), resp.Header, location, nil
 }
 
 type monitorRecordedChange struct {

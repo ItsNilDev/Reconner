@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChangeLog from './ChangeLog'
+import InlineChangeDiff from './InlineChangeDiff'
 import { ws } from '../../lib/websocket'
 import type { ChangeEntry } from '../../types'
 import { parseStatusTransition } from './changesModel'
@@ -235,7 +236,7 @@ describe('ChangeLog default feed', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Daily signals' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('default_view=1'))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Scripts & Security' }))
     await vi.waitFor(() => {
       expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts')
       expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
@@ -262,44 +263,65 @@ describe('ChangeLog filter controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'New hosts' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=hosts'))
 
+    fireEvent.click(screen.getByRole('button', { name: 'Status & Redirects' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=status'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Titles' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=title'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tech' }))
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=tech'))
+
     fireEvent.click(screen.getByRole('button', { name: 'Scope' }))
     await vi.waitFor(() => {
       expect(lastChangesUrl(fetchMock)).toContain('category=scope')
       expect(lastChangesUrl(fetchMock)).not.toContain('hosts')
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'HTTP' }))
-    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=http,tech'))
-
-    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Scripts & Security' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts'))
 
     fireEvent.click(screen.getByRole('button', { name: 'All' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).not.toContain('category='))
   })
 
-  it('sends status-only, class, exact codes, source alerts and search as query params', async () => {
+  it('sends status class, exact codes, source alerts and search as query params', async () => {
     const fetchMock = installFetch()
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Status changes only' }))
-    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_only=1'))
-    expect(screen.getByRole('button', { name: 'Filters · 1' })).toBeInTheDocument()
+    expect(screen.getByText('Status codes')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Status changes only' })).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '4xx' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_class=4'))
-    expect(screen.getByRole('button', { name: 'Filters · 2' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Filters · 1' })).toBeInTheDocument()
 
     fireEvent.change(screen.getByPlaceholderText('200,403'), { target: { value: '200,403' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('status_code=200,403'))
+    expect(screen.getByRole('button', { name: 'Filters · 2' })).toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText('Source'), { target: { value: 'alerts' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=alerts'))
 
     fireEvent.change(screen.getByPlaceholderText('Search changes…'), { target: { value: 'Forbidden' } })
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('q=Forbidden'))
+  })
+
+  it('shows muted status-codes helper note only on non-HTTP tabs', async () => {
+    installFetch()
+    render(<ChangeLog />)
+    await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
+    expect(screen.queryByText('Matches rows carrying HTTP status codes')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tech' }))
+    expect(screen.getByText('Matches rows carrying HTTP status codes')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Status & Redirects' }))
+    expect(screen.queryByText('Matches rows carrying HTTP status codes')).not.toBeInTheDocument()
   })
 
   it('drops invalid status codes instead of truncating them', async () => {
@@ -321,15 +343,15 @@ describe('ChangeLog filter controls', () => {
     render(<ChangeLog />)
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Security & JS' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Scripts & Security' }))
     await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('category=security,headers,scripts'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Filters' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Status changes only' }))
+    fireEvent.click(screen.getByRole('button', { name: '4xx' }))
     fireEvent.click(screen.getByRole('button', { name: 'Mark all read' }))
     await vi.waitFor(() => {
       expect(lastSeenAllUrl(fetchMock)).toContain('category=security,headers,scripts')
-      expect(lastSeenAllUrl(fetchMock)).toContain('status_only=1')
+      expect(lastSeenAllUrl(fetchMock)).toContain('status_class=4')
     })
   })
   it('mark-all-read uses raw search text before the debounce settles', async () => {
@@ -399,9 +421,9 @@ describe('ChangeLog filter controls', () => {
     await vi.waitFor(() => expect(screen.getByText('NEW HOST')).toBeInTheDocument())
     expect(lastChangesUrl(fetchMock)).toContain('default_view=1')
 
-    fireEvent.click(screen.getByRole('button', { name: 'HTTP' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Status & Redirects' }))
     await vi.waitFor(() => {
-      expect(lastChangesUrl(fetchMock)).toContain('category=http,tech')
+      expect(lastChangesUrl(fetchMock)).toContain('category=status')
       expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
     })
 
@@ -410,6 +432,23 @@ describe('ChangeLog filter controls', () => {
     expect(lastChangesUrl(fetchMock)).not.toContain('default_view=1')
     expect(screen.getByRole('button', { name: 'All history' })).toHaveClass('active')
     expect(screen.getByRole('button', { name: 'Daily signals' })).not.toHaveClass('active')
+  })
+
+  it('clears activeEventId and drops event_id when clicking a Row 2 tab', async () => {
+    const fetchMock = installFetch({ rows: [watchHost] })
+    const onClearEventId = vi.fn()
+    render(<MemoryRouter><ChangeLog initialEventId="a1" onClearEventId={onClearEventId} /></MemoryRouter>)
+
+    await vi.waitFor(() => expect(lastChangesUrl(fetchMock)).toContain('event_id=a1'))
+    expect(screen.getByText('Showing focused event')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Titles' }))
+    expect(onClearEventId).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('Showing focused event')).not.toBeInTheDocument()
+    await vi.waitFor(() => {
+      expect(lastChangesUrl(fetchMock)).toContain('category=title')
+      expect(lastChangesUrl(fetchMock)).not.toContain('event_id=')
+    })
   })
 })
 
@@ -467,5 +506,107 @@ describe('ChangeLog scope event renderer', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(document.body.style.overflow).toBe('')
+  })
+})
+
+describe('InlineChangeDiff title and status rendering', () => {
+  it('renders a muted single status pill and inline title diff when status is unchanged', () => {
+    const { container } = render(
+      <InlineChangeDiff
+        changeType="http_change"
+        oldValue="status=200 title=Old Portal"
+        newValue="status=200 title=New Portal"
+      />,
+    )
+    expect(screen.getAllByText('200')).toHaveLength(1)
+    expect(container.textContent).not.toContain('→')
+    expect(container.textContent).toContain('Old')
+    expect(container.textContent).toContain('New')
+    expect(container.textContent).toContain('Portal')
+  })
+
+  it('renders both status pills and inline title diff when status and title both change', () => {
+    const { container } = render(
+      <InlineChangeDiff
+        changeType="http_change"
+        oldValue="status=403 title=Forbidden"
+        newValue="status=200 title=Welcome"
+      />,
+    )
+    expect(screen.getByText('403')).toBeInTheDocument()
+    expect(screen.getByText('200')).toBeInTheDocument()
+    expect(container.textContent).toContain('→')
+    expect(container.textContent).toContain('Forbidden')
+    expect(container.textContent).toContain('Welcome')
+  })
+
+  it('renders status pills only when formatted titles are unchanged', () => {
+    const { container } = render(
+      <InlineChangeDiff
+        changeType="status_change"
+        oldValue="status=403 title=Same"
+        newValue="status=200 title=Same"
+      />,
+    )
+    expect(screen.getByText('403')).toBeInTheDocument()
+    expect(screen.getByText('200')).toBeInTheDocument()
+    expect(container.textContent).not.toContain('Same')
+  })
+
+  it('falls through to inline title diff for raw watch/deep page_change rows', () => {
+    const { container } = render(
+      <InlineChangeDiff
+        changeType="page_change"
+        oldValue="Old Title"
+        newValue="New Title"
+        oldStatus={200}
+        newStatus={200}
+      />,
+    )
+    expect(container.textContent).not.toContain('200')
+    expect(container.textContent).toContain('Old')
+    expect(container.textContent).toContain('New')
+  })
+})
+
+describe('ChangeLog per-item Diff buttons', () => {
+  const cssItem: ChangeEntry = {
+    id: 'css-1', source: 'monitor', target_id: 't1', target_name: 'alpha.test',
+    task_id: '', url: 'https://alpha.test/app.css', change_type: 'css_change',
+    category: 'scripts', severity: 'low', seen: false,
+    old_value: 'oldcsshash', new_value: 'newcsshash',
+    detected_at: '2026-01-06 10:00:00',
+  }
+
+  const jsItemSameCard: ChangeEntry = {
+    id: 'js-1', source: 'monitor', target_id: 't1', target_name: 'alpha.test',
+    task_id: '', url: 'https://alpha.test/app.css', change_type: 'js_change',
+    category: 'scripts', severity: 'medium', seen: false,
+    old_value: 'oldjshash', new_value: 'newjshash',
+    detected_at: '2026-01-06 10:00:00',
+  }
+
+  it('renders exactly one Diff button on a single-item css_change card (no duplicate footer button)', async () => {
+    installFetch({ rows: [cssItem] })
+    render(<MemoryRouter><ChangeLog /></MemoryRouter>)
+
+    fireEvent.click(screen.getByRole('button', { name: 'All history' }))
+    expect(await screen.findByText('STYLESHEET')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Diff' })).toHaveLength(1)
+  })
+
+  it('renders one Diff button per diffable item in both card and Detail drawer', async () => {
+    installFetch({ rows: [cssItem, jsItemSameCard] })
+    render(<MemoryRouter><ChangeLog /></MemoryRouter>)
+
+    fireEvent.click(screen.getByRole('button', { name: 'All history' }))
+    expect(await screen.findByText('STYLESHEET')).toBeInTheDocument()
+    expect(screen.getByText('JAVASCRIPT')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Diff' })).toHaveLength(2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    const dialog = screen.getByRole('dialog')
+    const drawerDiffBtns = Array.from(dialog.querySelectorAll('button')).filter(b => b.textContent === 'Diff')
+    expect(drawerDiffBtns).toHaveLength(2)
   })
 })

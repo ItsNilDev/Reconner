@@ -144,10 +144,10 @@ export const Modal = ({ open, onClose, title, children, footer, width='md', body
   title?: string
   children: React.ReactNode
   footer?: React.ReactNode
-  width?: 'sm'|'md'|'lg'|'xl'
+  width?: 'sm'|'md'|'lg'|'xl'|'2xl'
   bodyClassName?: string
 }) => {
-  const w = { sm:'max-w-sm', md:'max-w-md', lg:'max-w-2xl', xl:'max-w-4xl' }
+  const w = { sm:'max-w-sm', md:'max-w-md', lg:'max-w-2xl', xl:'max-w-4xl', '2xl':'max-w-6xl' }
   const titleID = useId()
   const bodyRef = useRef<HTMLDivElement>(null)
   const onCloseRef = useRef(onClose)

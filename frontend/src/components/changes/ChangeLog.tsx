@@ -14,7 +14,17 @@ import InlineChangeDiff from './InlineChangeDiff'
 import ScopeEventView from './ScopeEventView'
 import { ChangeDiffViewer } from '../targets/ChangeDiffViewer'
 
-type DiffView = { targetId: string; url: string; kind: 'css' | 'js' }
+type DiffView = {
+  targetId: string
+  url: string
+  kind: 'css' | 'js'
+  expectedOldHash?: string
+  expectedNewHash?: string
+}
+
+function isDiffableItem(item: ChangeEntry): boolean {
+  return item.source === 'monitor' && (item.change_type === 'css_change' || item.change_type === 'js_change') && !!item.url
+}
 
 // 'initial' shows a skeleton and resets paging. 'refresh' keeps the current
 // rows on screen and only shows a subtle hint while new data loads.
@@ -63,7 +73,9 @@ const FIELD_LABELS: Record<string, string> = {
   http_change: 'HTTP / page',
   http_service_removed: 'Service removed',
   new_http_service: 'New service',
+  redirect_change: 'Redirect',
   page_change: 'Page',
+  content_change: 'Content',
   js_change: 'JavaScript',
   css_change: 'Stylesheet',
   tech_change: 'Technologies',
@@ -264,7 +276,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   const [customSince, setCustomSince] = useState('')
   const [tabFilter, setTabFilter] = useState<ChangeTabFilter>('all')
   const [filtersOpen, setFiltersOpen] = useState(false)
-  const [statusOnly, setStatusOnly] = useState(false)
   const [statusClasses, setStatusClasses] = useState<Set<string>>(() => new Set<string>())
   const [statusCodes, setStatusCodes] = useState('')
   const debouncedCodes = useDebounced(statusCodes, 300)
@@ -316,9 +327,9 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   // window (A11, review findings #2 and #6).
   const isDefaultView = useCallback((searchText: string, codesText: string) =>
     viewMode === 'signals' && tabFilter === 'all' && !sourceFilter && !severity && !selectedTaskId && !activeEventId &&
-    !searchText.trim() && !statusOnly && statusClasses.size === 0 &&
+    !searchText.trim() && statusClasses.size === 0 &&
     parseStatusCodes(codesText).length === 0,
-    [viewMode, tabFilter, sourceFilter, severity, selectedTaskId, statusOnly, statusClasses, activeEventId])
+    [viewMode, tabFilter, sourceFilter, severity, selectedTaskId, statusClasses, activeEventId])
 
   // Build query params from explicit text values. Reads pass the debounced
   // values, while writes (mark-all-read) pass the raw values so a click before
@@ -336,7 +347,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       if (tabDef?.category) p.category = tabDef.category
       if (sourceFilter) p.source = sourceFilter
     }
-    if (statusOnly) p.status_only = '1'
     if (statusClasses.size) p.status_class = [...statusClasses].join(',')
     const codes = parseStatusCodes(codesText)
     if (codes.length) p.status_code = codes.join(',')
@@ -347,7 +357,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
     const t = targetId || selectedTargetId
     if (t) p.target_id = t
     return p
-  }, [hours, customSince, tabFilter, statusOnly, statusClasses, sourceFilter, severity, selectedTaskId, targetId, selectedTargetId, activeEventId, hideSeen, isDefaultView])
+  }, [hours, customSince, tabFilter, statusClasses, sourceFilter, severity, selectedTaskId, targetId, selectedTargetId, activeEventId, hideSeen, isDefaultView])
   const params = useCallback((): Record<string, string> => buildParams(debouncedQ, debouncedCodes),
     [buildParams, debouncedQ, debouncedCodes])
 
@@ -486,6 +496,12 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   }
 
   const selectTab = (id: ChangeTabFilter) => {
+    if (activeEventId) {
+      handledEventRef.current = ''
+      setActiveEventId('')
+      setDetail(null)
+      onClearEventId?.()
+    }
     setTabFilter(id)
     if (sourceFilter === 'alerts') setSourceFilter('')
     if (id !== 'all') setViewMode('all')
@@ -497,7 +513,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   }
 
   const resetAdvancedFilters = () => {
-    setStatusOnly(false)
     setStatusClasses(new Set<string>())
     setStatusCodes('')
     setSeverity('')
@@ -556,10 +571,8 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
   }
 
   const cards = useMemo(() => groupIntoCards(rows), [rows])
-  const detailDiffItem = detail?.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
   const parsedStatusCodes = useMemo(() => parseStatusCodes(statusCodes), [statusCodes])
   const advancedFilterCount =
-    (statusOnly ? 1 : 0) +
     (statusClasses.size > 0 ? 1 : 0) +
     (parsedStatusCodes.length > 0 ? 1 : 0) +
     (severity ? 1 : 0) +
@@ -671,12 +684,13 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
         </button>
       </div>
 
-      {/* Row 2: 5 mutually-exclusive type pills + Mark all read */}
+      {/* Row 2: 7 mutually-exclusive type pills + Mark all read */}
       <div className="flex flex-wrap items-center gap-1.5 border-y border-white/[.06] py-2">
         {CHANGE_TABS.map(tab => (
           <button
             key={tab.id}
             type="button"
+            title={tab.title}
             onClick={() => selectTab(tab.id)}
             className={cn(
               'rounded-full border px-2.5 py-1 text-[11px] transition',
@@ -700,16 +714,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       {/* Active advanced filter pills */}
       {(advancedFilterCount > 0 || selectedTaskId) && (
         <div className="flex flex-wrap items-center gap-1.5">
-          {statusOnly && (
-            <button
-              type="button"
-              aria-label="Remove status changes only filter"
-              onClick={() => setStatusOnly(false)}
-              className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 text-[11px] text-accent hover:bg-accent/20"
-            >
-              Status changes only <span aria-hidden="true">×</span>
-            </button>
-          )}
           {statusClasses.size > 0 && (
             <button
               type="button"
@@ -774,19 +778,7 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
       {filtersOpen && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5 rounded-xl border border-border bg-surface-2/60 p-3">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">HTTP status</span>
-            <button
-              type="button"
-              onClick={() => setStatusOnly(v => !v)}
-              className={cn(
-                'rounded-full border px-2.5 py-1 text-[11px] transition',
-                statusOnly
-                  ? 'border-accent bg-accent/15 text-accent'
-                  : 'border-border text-text-muted hover:text-text-primary',
-              )}
-            >
-              Status changes only
-            </button>
+            <span className="mr-1 text-[10px] uppercase tracking-wide text-text-muted">Status codes</span>
             {STATUS_CLASS_FILTERS.map(f => (
               <button
                 key={f.id}
@@ -810,6 +802,11 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
               onChange={e => setStatusCodes(e.target.value)}
               title="Exact status codes, comma separated (100-599)"
             />
+            {(tabFilter === 'hosts' || tabFilter === 'tech' || tabFilter === 'scope' || tabFilter === 'security_js') && (
+              <span className="ml-1 text-[10px] text-text-muted">
+                Matches rows carrying HTTP status codes
+              </span>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
@@ -879,7 +876,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
           <Empty message={hideSeen ? 'All changes are marked as seen.' : 'No changes recorded yet.'} />
         ) : (
           cards.map(card => {
-            const diffItem = card.items.find(i => i.source === 'monitor' && (i.change_type === 'css_change' || i.change_type === 'js_change') && !!i.url)
             const href = safeHref(card.url)
             return (
               <div
@@ -944,6 +940,21 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                           <InlineChangeDiff oldValue={item.old_value} newValue={item.new_value} changeType={item.change_type} oldStatus={item.old_status} newStatus={item.new_status} />
                         )}
                         <Badge variant={changeBadgeVariant(item)}>{item.severity}</Badge>
+                        {isDiffableItem(item) && (
+                          <button
+                            type="button"
+                            onClick={() => setDiffView({
+                              targetId: item.target_id || card.target_id,
+                              url: item.url,
+                              kind: item.change_type === 'css_change' ? 'css' : 'js',
+                              expectedOldHash: item.old_value,
+                              expectedNewHash: item.new_value,
+                            })}
+                            className="rounded border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/20"
+                          >
+                            Diff
+                          </button>
+                        )}
                       </div>
                     )
                   })}
@@ -953,19 +964,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                   <button type="button" onClick={() => setDetail(card)} className="text-accent hover:underline">
                     Details
                   </button>
-                  {diffItem && (
-                    <button
-                      type="button"
-                      onClick={() => setDiffView({
-                        targetId: card.target_id,
-                        url: diffItem.url,
-                        kind: diffItem.change_type === 'css_change' ? 'css' : 'js',
-                      })}
-                      className="text-accent hover:underline"
-                    >
-                      Diff
-                    </button>
-                  )}
                   <span className="tabular-nums">{card.items.length} change(s)</span>
                 </div>
               </div>
@@ -1001,19 +999,6 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
               >
                 Open target →
               </Link>
-            )}
-            {detailDiffItem && (
-              <button
-                type="button"
-                onClick={() => setDiffView({
-                  targetId: detail.target_id,
-                  url: detailDiffItem.url,
-                  kind: detailDiffItem.change_type === 'css_change' ? 'css' : 'js',
-                })}
-                className="rounded-lg border border-border px-3 py-1.5 text-xs text-accent hover:border-accent/40 hover:bg-accent/10"
-              >
-                Diff
-              </button>
             )}
             <button
               type="button"
@@ -1055,9 +1040,26 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
                 }
                 return (
                 <div key={`${item.id}-${i}`} className="rounded-lg border border-white/[.06] bg-white/[.02] p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
-                    {fieldLabel(item.change_type)} · {item.severity}
-                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+                      {fieldLabel(item.change_type)} · {item.severity}
+                    </p>
+                    {isDiffableItem(item) && (
+                      <button
+                        type="button"
+                        onClick={() => setDiffView({
+                          targetId: item.target_id || detail.target_id,
+                          url: item.url,
+                          kind: item.change_type === 'css_change' ? 'css' : 'js',
+                          expectedOldHash: item.old_value,
+                          expectedNewHash: item.new_value,
+                        })}
+                        className="rounded border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] text-accent hover:bg-accent/20"
+                      >
+                        Diff
+                      </button>
+                    )}
+                  </div>
                   <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
                     <div>
                       <p className="text-[10px] text-text-muted">Before</p>
@@ -1092,6 +1094,8 @@ export default function ChangeLog({ targetId, compact, initialEventId, initialQu
           targetId={diffView.targetId}
           url={diffView.url}
           kind={diffView.kind}
+          expectedOldHash={diffView.expectedOldHash}
+          expectedNewHash={diffView.expectedNewHash}
           onClose={() => setDiffView(null)}
         />
       )}
