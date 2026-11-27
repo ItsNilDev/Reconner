@@ -389,26 +389,29 @@ func (s *HTTPScanner) Run(ctx context.Context, targetID string, logFn LogFunc) e
 	// Post-httpx same-client confirmation stage: runs after RunWithCallback exits
 	// (releasing Executor.semaphore) so stdout reading is never stalled and the
 	// confirmation pass uses the exact same httpx flags, rate limit, and identity.
-	if len(pendingConfirm) > 0 && ctx.Err() == nil && (!watchMode || probeFailed == nil) {
-		confirmed := s.confirmHTTPXTransitions(ctx, targetID, pendingConfirmOrder, pendingConfirm, args, logFn)
+	if len(pendingConfirm) > 0 && ctx.Err() == nil {
+		var confirmed map[string]httpxOutput
+		if !watchMode || probeFailed == nil {
+			confirmed = s.confirmHTTPXTransitions(ctx, targetID, pendingConfirmOrder, pendingConfirm, args, logFn)
+		}
 		for _, serviceURL := range pendingConfirmOrder {
 			first := pendingConfirm[serviceURL]
+			baselineStatus := preloadedBaselines[serviceURL].status
 			conf, ok := confirmed[serviceURL]
-			isConfirmed := ok && conf.StatusCode == first.StatusCode
-			pinBaseline := !isConfirmed
+			obsToStore, pinBaseline := resolveConfirmedTransition(baselineStatus, first, conf, ok)
 			if pinBaseline {
 				logFn("info", "http_probe", fmt.Sprintf("Unconfirmed status transition on %s (%d -> %d); pinning baseline status",
-					serviceURL, preloadedBaselines[serviceURL].status, first.StatusCode))
+					serviceURL, baselineStatus, first.StatusCode))
 			}
-			rawHost := first.subdomain()
+			rawHost := obsToStore.subdomain()
 			normHost := normalizeHostName(rawHost)
-			effectiveStatus, err := s.storeHTTPServiceWithOptions(ctx, targetID, first, rawSubdomainsByNorm, pinBaseline)
+			effectiveStatus, err := s.storeHTTPServiceWithOptions(ctx, targetID, obsToStore, rawSubdomainsByNorm, pinBaseline)
 			if err != nil {
 				s.logger.Error("Failed to store HTTP service", "error", err)
 				continue
 			}
 			if ValidHTTPStatus(effectiveStatus) {
-				if err := s.updateSubdomainAliveWithVariants(ctx, targetID, rawHost, rawSubdomainsByNorm[normHost], effectiveStatus, first.Technologies, first.WebServer); err != nil {
+				if err := s.updateSubdomainAliveWithVariants(ctx, targetID, rawHost, rawSubdomainsByNorm[normHost], effectiveStatus, obsToStore.Technologies, obsToStore.WebServer); err != nil {
 					s.logger.Error("Failed to update subdomain", "error", err)
 				}
 			}
@@ -644,6 +647,22 @@ func (s *HTTPScanner) confirmHTTPXTransitions(ctx context.Context, targetID stri
 	return confirmed
 }
 
+func resolveConfirmedTransition(baselineStatus int, first, conf httpxOutput, hasConf bool) (httpxOutput, bool) {
+	if hasConf && conf.StatusCode == first.StatusCode {
+		return first, false
+	}
+	if hasConf && ValidHTTPStatus(baselineStatus) && conf.StatusCode == baselineStatus {
+		if conf.Input == "" {
+			conf.Input = first.Input
+		}
+		if conf.Host == "" {
+			conf.Host = first.Host
+		}
+		return conf, false
+	}
+	return first, true
+}
+
 func (s *HTTPScanner) lookupSubdomainID(ctx context.Context, targetID, rawHost string, rawByNorm map[string][]string) (string, error) {
 	norm := normalizeHostName(rawHost)
 	var extras []string
@@ -874,7 +893,11 @@ func (s *HTTPScanner) basicHTTPProbeWithVariants(ctx context.Context, targetID s
 							ValidHTTPStatus(b.status) && b.status != svc.StatusCode &&
 							!isEquivalentRedirectStatus(serviceURL, b.status, svc.StatusCode, b.redirect, svc.RedirectURL) {
 							confirm := probeURLWithContext(ctx, rawURL)
-							if confirm == nil || confirm.StatusCode != svc.StatusCode {
+							if confirm != nil && confirm.StatusCode == b.status {
+								confirm.ID = svc.ID
+								confirm.TargetID = svc.TargetID
+								svc = confirm
+							} else if confirm == nil || confirm.StatusCode != svc.StatusCode {
 								pinBaseline = true
 							}
 						}

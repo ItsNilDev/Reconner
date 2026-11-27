@@ -119,3 +119,31 @@ func TestUpdateSubdomainAliveWithVariantsUpdatesAllCaseAndDotRows(t *testing.T) 
 		t.Fatalf("alive variants=%d, want 2", aliveCount)
 	}
 }
+
+func TestResolveConfirmedTransition(t *testing.T) {
+	first := httpxOutput{
+		URL:        "https://app.example.test/",
+		Input:      "app.example.test",
+		StatusCode: 503,
+		Title:      "503 Service Unavailable",
+	}
+	// Reverted to healthy baseline on confirmation -> return healthy conf (preserving Input) without pinning.
+	reverted, pin := resolveConfirmedTransition(200, first, httpxOutput{
+		URL:        "https://app.example.test/",
+		StatusCode: 200,
+		Title:      "Portal",
+	}, true)
+	if pin || reverted.StatusCode != 200 || reverted.Title != "Portal" || reverted.Input != "app.example.test" {
+		t.Fatalf("reverted=%+v pin=%v, want 200 Portal app.example.test pin=false", reverted, pin)
+	}
+	// Confirmed drift -> return first without pinning.
+	confirmed, pin := resolveConfirmedTransition(200, first, httpxOutput{StatusCode: 503}, true)
+	if pin || confirmed.StatusCode != 503 {
+		t.Fatalf("confirmed=%+v pin=%v, want 503 pin=false", confirmed, pin)
+	}
+	// Missing confirmation (e.g. partial httpx failure) -> return first with pinBaseline=true.
+	partial, pin := resolveConfirmedTransition(200, first, httpxOutput{}, false)
+	if !pin || partial.StatusCode != 503 {
+		t.Fatalf("partial=%+v pin=%v, want 503 pin=true", partial, pin)
+	}
+}

@@ -488,3 +488,38 @@ func TestPinBaselineStatusUpdatesTechWithoutStatusChange(t *testing.T) {
 		t.Fatalf("pinned baseline/inventory mismatch: base=%d/%q svc=%d/%q", baseStatus, baseServer, svcStatus, svcServer)
 	}
 }
+
+func TestPinBaselineStatusPreservesHealthyTitleOnTransientErrorPage(t *testing.T) {
+	s, db, tid := newObservationTestScanner(t)
+	ctx := context.Background()
+	rawURL := "https://portal.example.test/"
+
+	if err := s.recordObservation(ctx, HTTPObservation{
+		TargetID: tid, URL: rawURL, StatusCode: 200, Title: "Portal",
+		Server: "nginx", ProbeTier: "watch", Type: ObservationWatch,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	effStatus, err := s.recordObservationWithEffectiveStatus(ctx, HTTPObservation{
+		TargetID: tid, URL: rawURL, StatusCode: 503, Title: "503 Service Temporarily Unavailable",
+		Server: "nginx", ProbeTier: "watch", Type: ObservationWatch, PinBaselineStatus: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effStatus != 200 {
+		t.Fatalf("effectiveStatus=%d, want 200", effStatus)
+	}
+
+	var changes int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM watch_round_changes WHERE target_id=?`, tid).Scan(&changes)
+	if changes != 0 {
+		t.Fatalf("watch_round_changes count=%d, want 0", changes)
+	}
+	var title string
+	_ = db.QueryRow(`SELECT title FROM http_services WHERE target_id=? AND url=?`, tid, NormalizeServiceURL(rawURL)).Scan(&title)
+	if title != "Portal" {
+		t.Fatalf("http_services.title=%q, want Portal", title)
+	}
+}

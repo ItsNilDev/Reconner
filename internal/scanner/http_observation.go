@@ -314,7 +314,7 @@ func compareObservation(baseURL string, b observationBaseline, obs HTTPObservati
 
 	if obs.PinBaselineStatus && ValidHTTPStatus(b.status) {
 		effectiveStatus = b.status
-		if isRedirectBoilerplateTitle(b.title) && isRedirectBoilerplateTitle(obs.Title) {
+		if b.title != "" || isRedirectBoilerplateTitle(obs.Title) {
 			effectiveTitle = b.title
 		}
 	} else if ValidHTTPStatus(b.status) && ValidHTTPStatus(obs.StatusCode) && b.status != obs.StatusCode {
