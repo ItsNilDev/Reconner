@@ -362,6 +362,10 @@ func TestLandWatchScopeHostsRound1BaselineAndRound2Incremental(t *testing.T) {
 	if baseline, _ := meta["baseline"].(bool); !baseline {
 		t.Fatalf("round 1 metadata.baseline = %v, want true (meta=%s)", meta["baseline"], metaRaw)
 	}
+	var baselined int
+	if err := db.QueryRow(`SELECT watch_scope_baselined FROM targets WHERE id='t-base'`).Scan(&baselined); err != nil || baselined != 1 {
+		t.Fatalf("round 1 durable baseline flag = %d (err=%v), want 1", baselined, err)
+	}
 
 	// Round 2 (after finished watch_scan task or watch_scope_baselined=1): lands new host with announced=0.
 	if _, err := db.Exec(`INSERT INTO tasks(id,target_id,type,status,priority,modules,total) VALUES('round-1','t-base','watch_scan','finished',1,'[]',2)`); err != nil {
@@ -462,5 +466,53 @@ func TestIsWatchBaselineRoundMalformedJSON(t *testing.T) {
 	}
 	if baseline {
 		t.Fatalf("isWatchBaselineRound = true, want false when prior landed event exists")
+	}
+}
+
+func TestWatchBaselineSurvivesSkippedFirstRound(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "watch-scope-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := database.RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`INSERT INTO targets(id,domain,watch_only) VALUES('t-skip','retry.test',1)`,
+		`INSERT INTO bounty_programs(id,provider,external_id,handle,name) VALUES('p-skip','hackerone','p-skip','retry','Retry')`,
+		`INSERT INTO bounty_program_assets(id,program_id,external_id,identifier,asset_type,is_wildcard) VALUES('a-skip','p-skip','ext-skip','*.retry.test','domain',1)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	// Round 1 finishes without a linked program: nothing is landed and the
+	// durable baseline flag must stay clear.
+	if got := LandWatchScopeHosts(WithTaskID(ctx, "skip"), db, "t-skip", []string{"a.retry.test"}, nil); len(got) != 0 {
+		t.Fatalf("skipped round landed %v, want none", got)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks(id,target_id,type,status,priority,modules,total) VALUES('skip','t-skip','watch_scan','finished',1,'[]',1)`); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := isWatchBaselineRound(ctx, db, "t-skip", "next")
+	if err != nil || !baseline {
+		t.Fatalf("isWatchBaselineRound after skipped round = %v (err=%v), want true", baseline, err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO project_programs(target_id,program_id) VALUES('t-skip','p-skip')`); err != nil {
+		t.Fatal(err)
+	}
+	landed := LandWatchScopeHosts(WithTaskID(ctx, "next"), db, "t-skip", []string{"a.retry.test"}, nil)
+	if len(landed) != 1 || landed[0] != "a.retry.test" {
+		t.Fatalf("first linked round landed %v, want [a.retry.test]", landed)
+	}
+	var announced int
+	if err := db.QueryRow(`SELECT announced FROM watch_scope_events WHERE target_id='t-skip' AND identifier='a.retry.test'`).Scan(&announced); err != nil {
+		t.Fatal(err)
+	}
+	if announced != 1 {
+		t.Fatalf("first linked round event announced=%d, want 1 (silent baseline)", announced)
 	}
 }

@@ -394,8 +394,11 @@ func watchScopeLog(logFn LogFunc, level, module, msg string) {
 
 // isWatchBaselineRound reports whether a watch scope landing runs as the
 // silent Round-1 baseline for targetID. Returns true only when no durable
-// baseline flag, prior finished watch_scan task, announced watch_hosts row, or
-// prior watch_scope_events landing from another task exists.
+// baseline flag, announced watch_hosts row, or prior non-baseline
+// watch_scope_events landing from another task exists. The finished-task check
+// is intentionally gone: the migration backfills the flag for upgraded targets,
+// while on new targets a finished round that skipped landing must not turn the
+// genuine first import into an announced change.
 func isWatchBaselineRound(ctx context.Context, db *database.DB, targetID, taskID string) (bool, error) {
 	var baselined int
 	err := db.QueryRowContext(ctx,
@@ -405,16 +408,6 @@ func isWatchBaselineRound(ctx context.Context, db *database.DB, targetID, taskID
 		return false, err
 	}
 	if baselined == 1 {
-		return false, nil
-	}
-
-	var finished int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM tasks WHERE target_id = ? AND type = 'watch_scan' AND status = 'finished' AND id <> ?`,
-		targetID, taskID).Scan(&finished); err != nil {
-		return false, err
-	}
-	if finished > 0 {
 		return false, nil
 	}
 
@@ -433,7 +426,8 @@ func isWatchBaselineRound(ctx context.Context, db *database.DB, targetID, taskID
 		`SELECT COUNT(*) FROM watch_scope_events
 		 WHERE target_id = ?
 		   AND event_type IN ('landed','re_eligible')
-		   AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.task_id'),'') ELSE '' END <> ?`,
+		   AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.task_id'),'') ELSE '' END <> ?
+		   AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.baseline'),0) ELSE 0 END = 0`,
 		targetID, taskID).Scan(&priorEvents); err != nil {
 		return false, err
 	}
@@ -512,6 +506,15 @@ func LandWatchScopeHostsWithBaseline(ctx context.Context, db *database.DB, targe
 	}
 	if len(landed) > 0 {
 		watchScopeLog(logFn, "info", "watch_scope", fmt.Sprintf("Landed %d new eligible host(s) as approved scope", len(landed)))
+	}
+	if baseline && ctx.Err() == nil {
+		// Only a completed Round-1 landing establishes the durable baseline.
+		// A cancelled or error-skipped round leaves the flag clear so the next
+		// round can still land/announce correctly.
+		if _, err := db.ExecContext(ctx, `UPDATE targets SET watch_scope_baselined = 1
+			WHERE id = ? AND COALESCE(watch_scope_baselined, 0) = 0`, targetID); err != nil {
+			watchScopeLog(logFn, "warn", "watch_scope", fmt.Sprintf("Failed to mark baseline complete: %v", err))
+		}
 	}
 	return landed
 }

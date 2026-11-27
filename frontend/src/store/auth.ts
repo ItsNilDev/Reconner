@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { auth as authApi } from '../lib/api'
+import { ws } from '../lib/websocket'
 import { useStatsStore } from './stats'
 
 interface AuthState {
@@ -23,6 +24,10 @@ export const useAuthStore = create<AuthState>((set) => ({
       // /login) must not leave the previous user's dashboard data or in-flight
       // single-flight fetches visible to the new user.
       useStatsStore.getState().reset()
+      // The WS client dedupes connect() while a socket is open/connecting, so a
+      // second login would otherwise keep the previous session's userID. The
+      // hub authorizes each connection at upgrade time; force a fresh socket.
+      ws.disconnect()
       set({ user, loading: false })
     } catch (err) { set({ loading: false }); throw err }
   },

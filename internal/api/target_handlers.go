@@ -195,7 +195,7 @@ func validateProgramLogoURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(trimmed)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Hostname() == "" {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -380,11 +380,9 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "failed to load target exclusions")
 		return
 	}
-	logoMap, err := loadAllTargetProgramLogos(r.Context(), h.db, targetIDs)
-	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, "failed to load target program logos")
-		return
-	}
+	// Logo enrichment is cosmetic: a failure in the auxiliary bounty query
+	// must not make the whole target list unavailable.
+	logoMap, _ := loadAllTargetProgramLogos(r.Context(), h.db, targetIDs)
 	for i := range targets {
 		targets[i].ExcludeScope = manualMap[targets[i].ID]
 		targets[i].ManagedExclusions = managedMap[targets[i].ID]
@@ -593,11 +591,8 @@ func (h *Handler) handleGetTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	t.ExcludeScope = manualExcl
 	t.ManagedExclusions = managedExcl
-	logoURL, err := loadTargetProgramLogo(r.Context(), h.db, id)
-	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, "failed to load target program logo")
-		return
-	}
+	// Cosmetic only: never fail the target detail response over logo lookup.
+	logoURL, _ := loadTargetProgramLogo(r.Context(), h.db, id)
 	t.ProgramLogoURL = logoURL
 
 	t.WatchOnly = watchOnly == 1

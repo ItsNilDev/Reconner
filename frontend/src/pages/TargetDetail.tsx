@@ -106,7 +106,6 @@ const PAGE = 200
 const SERVER_PAGE_SIZE = 200
 const LOAD_ALL_CHUNK = 500
 const LOAD_ALL_CONFIRM_THRESHOLD = 5000
-const WS_REFRESH_WINDOW_CAP = 2500
 
 const isServerPagedTab = (t: string) => t === 'subdomains' || t === 'http' || t === 'params'
 
@@ -581,6 +580,10 @@ export default function TargetDetail() {
   const loadedCountRef = useRef(0)
   const loadingAllRef = useRef(false)
   const loadingMoreRef = useRef(false)
+  // Server-side cursor actually consumed by page requests. Using data.length
+  // instead would stall paging when newly inserted rows sort ahead of the
+  // already loaded window and get deduplicated away.
+  const serverOffsetRef = useRef(0)
   const queryStateRef = useRef({
     tab,
     search: debouncedSearch,
@@ -629,6 +632,7 @@ export default function TargetDetail() {
     setReflectedOnly(false)
     setSort({ key: null, dir: 'desc' })
     setServerTotal(0)
+    serverOffsetRef.current = 0
     setLoadingMore(false)
     loadingMoreRef.current = false
     setLoadingAll(false)
@@ -1032,6 +1036,7 @@ export default function TargetDetail() {
         setDataError('')
         setData(res.data || [])
         setServerTotal(res.total || 0)
+        serverOffsetRef.current = (res.data || []).length
         setVisibleCount(PAGE)
       } catch (e) {
         if (isAbortError(e) || controller.signal.aborted) return
@@ -1098,7 +1103,7 @@ export default function TargetDetail() {
     const seq = requestSeqRef.current
     const requestTarget = id
     const requestTab = tab
-    const offset = loadedCountRef.current
+    const offset = serverOffsetRef.current
     const q = queryStateRef.current
     // A WS refresh started before this append must not finish afterwards and
     // replace the appended rows with its older page-1/window snapshot.
@@ -1126,6 +1131,9 @@ export default function TargetDetail() {
       }
       setData(prev => mergeUniqueById(prev, res.data || []))
       setServerTotal(res.total || 0)
+      // Advance by the raw rows the server returned, not by the number that
+      // survived client-side dedup.
+      serverOffsetRef.current = offset + (res.data || []).length
     } catch (e) {
       if (isAbortError(e) || controller.signal.aborted) return
       addToast('error', e instanceof Error ? e.message : 'Failed to load more rows')
@@ -1167,7 +1175,7 @@ export default function TargetDetail() {
     loadingAllRef.current = true
     setLoadingAll(true)
 
-    let nextOffset = loadedCountRef.current
+    let nextOffset = serverOffsetRef.current
     try {
       while (!controller.signal.aborted) {
         const res = await fetchServerTabPage(
@@ -1189,6 +1197,7 @@ export default function TargetDetail() {
         setData(prev => mergeUniqueById(prev, chunk))
         setServerTotal(total)
         nextOffset += chunk.length
+        serverOffsetRef.current = nextOffset
         if (chunk.length === 0 || nextOffset >= total || chunk.length < LOAD_ALL_CHUNK) {
           break
         }
@@ -1206,7 +1215,7 @@ export default function TargetDetail() {
     }
   }
 
-  const refreshFromWS = async (reason: 'progress' | 'finished') => {
+  const refreshFromWS = async (_reason: 'progress' | 'finished') => {
     const requestTarget = activeIdRef.current
     const q = queryStateRef.current
     const requestTab = q.tab
@@ -1221,10 +1230,11 @@ export default function TargetDetail() {
     }
     const currentCount = loadedCountRef.current
     if (currentCount > SERVER_PAGE_SIZE) {
-      if (reason === 'progress' || currentCount > WS_REFRESH_WINDOW_CAP) {
-        setStaleAvailable(true)
-        return
-      }
+      // A window refresh replaces page-1 data and silently drops rows the
+      // operator appended. Offer the non-destructive banner instead; its
+      // Refresh button runs loadTab, which is an explicit user action.
+      setStaleAvailable(true)
+      return
     }
     // Separate AbortController for WS background refresh (never aborts Load all).
     wsRefreshAbortRef.current?.abort()
@@ -1232,63 +1242,27 @@ export default function TargetDetail() {
     wsRefreshAbortRef.current = controller
     const seq = requestSeqRef.current
     try {
-      if (currentCount <= SERVER_PAGE_SIZE) {
-        const res = await fetchServerTabPage(
-          requestTarget,
-          requestTab,
-          buildServerParams(requestTab, q, { page: 1, limit: SERVER_PAGE_SIZE }),
-          controller.signal,
-        )
-        if (
-          controller.signal.aborted ||
-          loadingMoreRef.current ||
-          loadingAllRef.current ||
-          seq !== requestSeqRef.current ||
-          requestTab !== activeTabRef.current ||
-          requestTarget !== activeIdRef.current
-        ) {
-          return
-        }
-        setDataError('')
-        setData(res.data || [])
-        setServerTotal(res.total || 0)
-        setStaleAvailable(false)
-      } else {
-        const targetWindow = Math.min(currentCount, WS_REFRESH_WINDOW_CAP)
-        const windowRows: unknown[] = []
-        let latestTotal = 0
-        let nextOffset = 0
-        while (nextOffset < targetWindow && !controller.signal.aborted) {
-          const chunkLimit = Math.min(LOAD_ALL_CHUNK, targetWindow - nextOffset)
-          const res = await fetchServerTabPage(
-            requestTarget,
-            requestTab,
-            buildServerParams(requestTab, q, { offset: nextOffset, limit: chunkLimit }),
-            controller.signal,
-          )
-          if (
-            controller.signal.aborted ||
-            seq !== requestSeqRef.current ||
-            requestTab !== activeTabRef.current ||
-            requestTarget !== activeIdRef.current
-          ) {
-            return
-          }
-          const chunk = res.data || []
-          latestTotal = res.total || 0
-          windowRows.push(...chunk)
-          nextOffset += chunk.length
-          if (chunk.length === 0 || nextOffset >= latestTotal || chunk.length < chunkLimit) {
-            break
-          }
-        }
-        if (!controller.signal.aborted && !loadingAllRef.current && !loadingMoreRef.current) {
-          setDataError('')
-          setData(mergeUniqueById([], windowRows))
-          setServerTotal(latestTotal)
-          setStaleAvailable(false)
-        }
+      const res = await fetchServerTabPage(
+        requestTarget,
+        requestTab,
+        buildServerParams(requestTab, q, { page: 1, limit: SERVER_PAGE_SIZE }),
+        controller.signal,
+      )
+      if (
+        controller.signal.aborted ||
+        loadingMoreRef.current ||
+        loadingAllRef.current ||
+        seq !== requestSeqRef.current ||
+        requestTab !== activeTabRef.current ||
+        requestTarget !== activeIdRef.current
+      ) {
+        return
       }
+      setDataError('')
+      setData(res.data || [])
+      setServerTotal(res.total || 0)
+      serverOffsetRef.current = (res.data || []).length
+      setStaleAvailable(false)
     } catch (e) {
       if (isAbortError(e) || controller.signal.aborted) return
     } finally {

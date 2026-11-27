@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAuthStore } from './auth'
 import { useStatsStore } from './stats'
+import { ws } from '../lib/websocket'
 import type { DashboardStats } from '../types'
 
 function response(data: unknown, status = 200) {
@@ -43,6 +44,7 @@ describe('auth store', () => {
   })
 
   it('resets dashboard data on login so a second user never sees stale stats', async () => {
+    const disconnect = vi.spyOn(ws, 'disconnect')
     useStatsStore.setState({
       badges: { targets: 42, running_tasks: 7 },
       stats: { targets: 42 } as DashboardStats,
@@ -63,6 +65,10 @@ describe('auth store', () => {
       charts: null,
       statsError: '',
     })
+    // A second login must also drop the old user's WS connection; the hub
+    // authorizes by the userID captured at upgrade time.
+    expect(disconnect).toHaveBeenCalledOnce()
+    disconnect.mockRestore()
   })
 
   it('does not leave loading stuck when login fails', async () => {

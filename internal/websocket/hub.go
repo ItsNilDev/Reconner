@@ -127,6 +127,10 @@ func (h *Hub) Run() {
 
 		case env := <-h.broadcast:
 			h.mu.RLock()
+			// Never mutate the map while ranging over it: dropping a slow
+			// client here used to RUnlock/Lock mid-iteration, which can race
+			// with register/unregister and crash with a concurrent map write.
+			var slow []*Client
 			for client := range h.clients {
 				if env.ownerID != 0 && !client.isAdmin && client.userID != env.ownerID {
 					continue
@@ -137,8 +141,13 @@ func (h *Hub) Run() {
 				select {
 				case client.send <- env.data:
 				default:
-					h.mu.RUnlock()
-					h.mu.Lock()
+					slow = append(slow, client)
+				}
+			}
+			h.mu.RUnlock()
+			if len(slow) > 0 {
+				h.mu.Lock()
+				for _, client := range slow {
 					delete(h.clients, client)
 					client.mu.Lock()
 					if !client.closed {
@@ -146,11 +155,9 @@ func (h *Hub) Run() {
 						close(client.send)
 					}
 					client.mu.Unlock()
-					h.mu.Unlock()
-					h.mu.RLock()
 				}
+				h.mu.Unlock()
 			}
-			h.mu.RUnlock()
 
 		case <-ticker.C:
 			ping, _ := json.Marshal(Message{Type: "ping"})

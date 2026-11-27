@@ -532,6 +532,9 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		"Verified finding: "+vulnType,
 		fmt.Sprintf("%s finding on %s", strings.ToUpper(severity), url),
 		"/targets/"+targetID, severity, findingID, findingID)
+	if insertErr != nil && s.logger != nil {
+		s.logger.Warn("finding notification insert failed", "finding_id", findingID, "error", insertErr)
+	}
 	if s.hub != nil {
 		s.hub.Broadcast(event, data)
 		if insertErr == nil {
@@ -2878,10 +2881,10 @@ func (s *Scheduler) executeTask(parentCtx context.Context, taskID string) {
 	// a row are tolerated. The timestamp is always written, even when the watch
 	// lane is saturated.
 	if taskType == watchScanType {
+		// The durable baseline flag is owned by the successful Round-1 landing
+		// in scanner.LandWatchScopeHostsWithBaseline. Latching it here on any
+		// finished round would hide a skipped/partial baseline forever.
 		s.applyWatchTerminalRules(targetID, finalStatus)
-		if finalStatus == "finished" {
-			_, _ = s.db.Exec(`UPDATE targets SET watch_scope_baselined = 1 WHERE id = ? AND COALESCE(watch_scope_baselined, 0) = 0`, targetID)
-		}
 	}
 	terminalTargetStatus := "idle"
 	if finalStatus == "failed" {

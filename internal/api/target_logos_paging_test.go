@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/recon-platform/internal/config"
@@ -36,7 +37,7 @@ func TestTargetListSubdomainsHTTPServicesParametersPagingAndFilters(t *testing.T
 		}
 		created := "2020-01-01 00:00:00"
 		if i == 204 {
-			created = "2099-01-01 00:00:00"
+			created = time.Now().UTC().Add(-time.Hour).Format("2006-01-02 15:04:05")
 		}
 		alive := 1
 		status := 200
@@ -213,6 +214,7 @@ func TestTargetProgramLogoSelectionAndValidation(t *testing.T) {
 		('bp-rel','bugcrowd','e2','rel','Rel','/assets/relative.png'),
 		('bp-js','bugcrowd','e3','js','JS','javascript:alert(1)'),
 		('bp-emptyhost','bugcrowd','e4','empty','Empty','https://'),
+		('bp-portonly','bugcrowd','e6','port','Port','https://:8080/logo.png'),
 		('bp-valid2','yeswehack','e5','two','Two','https://cdn.example.com/two.png')`); err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +223,8 @@ func TestTargetProgramLogoSelectionAndValidation(t *testing.T) {
 		('t-two','bp-rel','2026-01-01 00:00:00'),
 		('t-two','bp-js','2026-01-01 00:00:01'),
 		('t-two','bp-emptyhost','2026-01-01 00:00:02'),
-		('t-two','bp-valid2','2026-01-01 00:00:03')`); err != nil {
+		('t-two','bp-portonly','2026-01-01 00:00:03'),
+		('t-two','bp-valid2','2026-01-01 00:00:04')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -284,6 +287,8 @@ func TestTargetListPaginationOverflowAndOffsetPage(t *testing.T) {
 	}{
 		{"normal page", "?page=3&limit=50", 3, 50, 100},
 		{"extreme page does not wrap", fmt.Sprintf("?page=%d&limit=500", math.MaxInt), math.MaxInt, 500, math.MaxInt},
+		{"offset without page reports actual page", "?offset=200&limit=200", 2, 200, 200},
+		{"explicit page wins over offset", "?offset=200&page=1&limit=200", 1, 200, 200},
 		{"negative offset ignored", "?offset=-5&page=2&limit=200", 2, 200, 200},
 	}
 	for _, tc := range cases {

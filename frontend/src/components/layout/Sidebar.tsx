@@ -115,6 +115,7 @@ export const Sidebar = () => {
     const offs = [
       ...events.map(ev => ws.on(ev, scheduleLoad)),
       ws.on('reconnected', loadNow),
+      ws.on('open', loadNow),
       ws.on('open', syncFallbackPoll),
       ws.on('close', syncFallbackPoll),
     ]

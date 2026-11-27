@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { tasks as tasksApi } from '../lib/api'
 import { ws } from '../lib/websocket'
@@ -195,15 +195,18 @@ export default function Dashboard() {
   const { stats, charts, chartsError, statsError: error, loading, fetchStats } = useStatsStore()
   const [recentTasks, setRecentTasks] = useState<Task[] | null>(null)
   const [topSort, setTopSort] = useState<'findings' | 'subdomains' | 'alive_hosts'>('findings')
+  const tasksSeqRef = useRef(0)
 
   const load = useCallback(() => {
     void fetchStats()
+    const seq = ++tasksSeqRef.current
     tasksApi.list({ limit: '8' })
       .then(r => {
+        if (seq !== tasksSeqRef.current) return
         const sorted = [...(r || [])].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 8)
         setRecentTasks(sorted)
       })
-      .catch(() => { setRecentTasks(prev => prev ?? []) })
+      .catch(() => { if (seq === tasksSeqRef.current) setRecentTasks(prev => prev ?? []) })
   }, [fetchStats])
 
   useEffect(() => {
@@ -247,6 +250,9 @@ export default function Dashboard() {
     const offs = [
       ...events.map(ev => ws.on(ev, schedule)),
       ws.on('reconnected', runNow),
+      // The first successful handshake only emits 'open'; reload here so
+      // events missed during a failed initial connection are recovered.
+      ws.on('open', runNow),
     ]
     document.addEventListener('visibilitychange', onVis)
     return () => {

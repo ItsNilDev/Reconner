@@ -816,11 +816,23 @@ func (s *Service) reconcileProject(ctx context.Context, targetID, programID stri
 	}
 	if added+removed+modified+ruleAdded+ruleRemoved > 0 {
 		body := fmt.Sprintf("%s scope changed: %d added, %d removed, %d modified, %d rules added, %d rules withdrawn. New assets require approval; removed assets were suspended.", p.Name, added, removed, modified, ruleAdded, ruleRemoved)
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity) VALUES(?,?,?,?,?,?,?)`, uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium"); err != nil {
+		// Two paths can reconcile the same project (detail refresh and the
+		// "missing program" sweep). Key the bell on the resulting scope hash so
+		// a concurrent/duplicate reconcile cannot create a second row or event.
+		meta := mustJSON(map[string]any{"program_id": programID, "scope_hash": p.ScopeHash})
+		res, err := s.db.ExecContext(ctx, `INSERT INTO notifications(id,target_id,type,title,body,url,severity,metadata)
+			SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS (
+				SELECT 1 FROM notifications WHERE target_id=? AND type='bounty_scope_change'
+				  AND json_valid(metadata) AND json_extract(metadata,'$.scope_hash')=?)`,
+			uuid.New().String(), targetID, "bounty_scope_change", "Bug bounty scope changed", body, "/targets/"+url.PathEscape(targetID), "medium", meta,
+			targetID, p.ScopeHash)
+		if err != nil {
 			return err
 		}
-		if cb := s.scopeNotificationCallback(); cb != nil {
-			cb(targetID, "bounty_scope_change", "medium")
+		if inserted, _ := res.RowsAffected(); inserted > 0 {
+			if cb := s.scopeNotificationCallback(); cb != nil {
+				cb(targetID, "bounty_scope_change", "medium")
+			}
 		}
 	}
 	return nil

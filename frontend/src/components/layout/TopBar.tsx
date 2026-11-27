@@ -221,6 +221,7 @@ export const TopBar = () => {
       ws.on('bounty_scope_change', scheduleLoad),
       ws.on('new_vuln_finding', scheduleLoad),
       ws.on('reconnected', loadImmediate),
+      ws.on('open', loadImmediate),
       ws.on('open', syncFallbackPoll),
       ws.on('close', syncFallbackPoll),
       onNotificationsChanged(src => { if (src !== 'topbar') scheduleLoad() }),

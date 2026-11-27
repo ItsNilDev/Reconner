@@ -70,6 +70,11 @@ func targetListPagination(r *http.Request, defaultLimit, maxLimit int) (page, li
 	if rawOffset := strings.TrimSpace(q.Get("offset")); rawOffset != "" {
 		if parsed, err := strconv.Atoi(rawOffset); err == nil && parsed >= 0 {
 			offset = parsed
+			if strings.TrimSpace(q.Get("page")) == "" {
+				// The offset is authoritative; report the page the client is
+				// actually looking at instead of a misleading page=1.
+				page = offset/limit + 1
+			}
 		}
 	}
 	return page, limit, offset
@@ -100,7 +105,7 @@ func (h *Handler) handleListSubdomains(w http.ResponseWriter, r *http.Request) {
 		where += " AND is_alive = 0"
 	}
 	if newOnly {
-		where += " AND created_at >= datetime('now', '-24 hours')"
+		where += " AND created_at >= datetime('now', '-24 hours') AND created_at <= datetime('now')"
 	}
 	if search != "" {
 		like := escapeFindingLike(search)
@@ -215,7 +220,7 @@ func (h *Handler) handleListHTTPServices(w http.ResponseWriter, r *http.Request)
 		args = append(args, 500, 599)
 	}
 	if newOnly {
-		where += " AND created_at >= datetime('now', '-24 hours')"
+		where += " AND created_at >= datetime('now', '-24 hours') AND created_at <= datetime('now')"
 	}
 
 	dir := "ASC"
