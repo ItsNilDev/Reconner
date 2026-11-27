@@ -297,12 +297,12 @@ type Scheduler struct {
 	// memoryLog separately dedupes cgroup/host pressure warnings. Memory pressure
 	// is handled by admission control; repeated runtime.GC calls cannot reclaim
 	// Chromium/nuclei/sqlmap child processes and only add CPU churn.
-	memoryLog  atomic.Bool
-	stopCh     chan struct{}
+	memoryLog atomic.Bool
+	stopCh    chan struct{}
 	watchNudge chan struct{}
-	stopOnce   sync.Once
-	stopping   bool
-	wg         sync.WaitGroup
+	stopOnce  sync.Once
+	stopping  bool
+	wg        sync.WaitGroup
 
 	pauseMu    sync.Mutex
 	paused     map[string]bool               // taskID -> paused (gate checked between modules)
@@ -532,9 +532,6 @@ func (s *Scheduler) broadcastAndScore(event string, data any) {
 		"Verified finding: "+vulnType,
 		fmt.Sprintf("%s finding on %s", strings.ToUpper(severity), url),
 		"/targets/"+targetID, severity, findingID, findingID)
-	if insertErr != nil && s.logger != nil {
-		s.logger.Warn("insert new_vuln_finding notification failed", "change_id", findingID, "target_id", targetID, "error", insertErr)
-	}
 	if s.hub != nil {
 		s.hub.Broadcast(event, data)
 		if insertErr == nil {

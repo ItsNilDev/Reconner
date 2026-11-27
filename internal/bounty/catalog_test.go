@@ -1094,12 +1094,12 @@ func TestSchemePrefixedWildcardNormalization(t *testing.T) {
 
 func TestResolveScopeEventWatchOnlyMonitorAndScheduleNudge(t *testing.T) {
 	cases := []struct {
-		name         string
-		setupSQL     string
-		wantNudged   bool
-		wantNextRun  string // exact expected value when non-empty
-		wantNextNull bool
-		wantPaused   int
+		name           string
+		setupSQL       string
+		wantNudged     bool
+		wantNextRun    string // exact expected value when non-empty
+		wantNextNull   bool
+		wantPaused     int
 	}{
 		{
 			name:       "future watch_next_run pulled forward",

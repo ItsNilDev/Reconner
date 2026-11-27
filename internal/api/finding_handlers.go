@@ -70,11 +70,6 @@ func targetListPagination(r *http.Request, defaultLimit, maxLimit int) (page, li
 	if rawOffset := strings.TrimSpace(q.Get("offset")); rawOffset != "" {
 		if parsed, err := strconv.Atoi(rawOffset); err == nil && parsed >= 0 {
 			offset = parsed
-			// Keep the reported page in sync when a client paginates by raw
-			// offset instead of page number.
-			if q.Get("page") == "" {
-				page = (offset / limit) + 1
-			}
 		}
 	}
 	return page, limit, offset

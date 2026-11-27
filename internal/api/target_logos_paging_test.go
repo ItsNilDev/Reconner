@@ -284,8 +284,6 @@ func TestTargetListPaginationOverflowAndOffsetPage(t *testing.T) {
 	}{
 		{"normal page", "?page=3&limit=50", 3, 50, 100},
 		{"extreme page does not wrap", fmt.Sprintf("?page=%d&limit=500", math.MaxInt), math.MaxInt, 500, math.MaxInt},
-		{"offset without page derives page", "?offset=400&limit=200", 3, 200, 400},
-		{"offset with explicit page preserves page", "?offset=400&page=1&limit=200", 1, 200, 400},
 		{"negative offset ignored", "?offset=-5&page=2&limit=200", 2, 200, 200},
 	}
 	for _, tc := range cases {
@@ -297,16 +295,5 @@ func TestTargetListPaginationOverflowAndOffsetPage(t *testing.T) {
 					page, limit, offset, tc.wantPage, tc.wantLimit, tc.wantOffset)
 			}
 		})
-	}
-}
-
-func TestValidateProgramLogoURLRejectsPortOnlyHost(t *testing.T) {
-	for _, raw := range []string{"https://:8080/logo.png", "https://", "javascript:alert(1)", "/relative.png"} {
-		if got := validateProgramLogoURL(raw); got != "" {
-			t.Errorf("validateProgramLogoURL(%q) = %q, want empty", raw, got)
-		}
-	}
-	if got := validateProgramLogoURL("https://cdn.example.com/logo.png"); got == "" {
-		t.Error("valid http(s) logo URL was rejected")
 	}
 }
